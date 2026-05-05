@@ -80,6 +80,8 @@ pub fn register(ctx: &mut RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
 
+oxideav_core::register!("icer", register);
+
 /// Register the `.icer` file extension so the container registry can
 /// resolve the codec identifier from a filename hint.
 ///
