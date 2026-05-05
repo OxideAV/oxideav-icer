@@ -10,7 +10,8 @@
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
+    VideoFrame,
 };
 
 use crate::encoder::EncodeOptions;
@@ -65,6 +66,17 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Register the `.icer` file extension so the container registry can
+/// resolve the codec identifier from a filename hint.
+///
+/// ICER has no separate container format — the on-the-wire byte stream
+/// (see [`crate::header::SegmentHeader`]) is also the file format — so
+/// only the extension hook is wired up here. No demuxer or muxer is
+/// registered.
+pub fn register_containers(reg: &mut ContainerRegistry) {
+    reg.register_extension("icer", "icer");
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
@@ -200,5 +212,20 @@ impl Encoder for IcerEncoder {
 
     fn flush(&mut self) -> oxideav_core::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_containers_resolves_icer_extension_case_insensitive() {
+        let mut reg = ContainerRegistry::new();
+        register_containers(&mut reg);
+        assert_eq!(reg.container_for_extension("icer"), Some("icer"));
+        assert_eq!(reg.container_for_extension("ICER"), Some("icer"));
+        assert_eq!(reg.container_for_extension("Icer"), Some("icer"));
+        assert_eq!(reg.container_for_extension("png"), None);
     }
 }
