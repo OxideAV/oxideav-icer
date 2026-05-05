@@ -40,6 +40,31 @@ pub struct EncodeOptions {
     /// single segment. Larger values split the image into
     /// `segment_count` horizontal strips per IPN 42-155 §III.E.
     pub segment_count: u16,
+    /// Hard byte budget for the entire output stream. The encoder
+    /// finalises each packet and, before starting the next packet,
+    /// checks whether the running output size plus the segment-header
+    /// overhead would exceed this limit. If so, it stops emitting
+    /// packets and returns what has been written so far.
+    ///
+    /// Mid-packet truncation is not performed; the encoder always
+    /// finishes the in-progress packet cleanly. The output will be
+    /// ≤ `byte_budget` bytes (plus the segment header that was already
+    /// committed before the first packet).
+    ///
+    /// `None` (the default) disables the hard cap.
+    pub byte_budget: Option<u64>,
+    /// Soft byte target. When set, the encoder finishes the current
+    /// bit-plane's packet pair (significance + refinement) even if the
+    /// running output has already exceeded `target_bytes`, then stops.
+    ///
+    /// When used together with `byte_budget`, the semantics are
+    /// "keep going until `target_bytes` is reached, then finish the
+    /// current bit-plane pair, but never exceed `byte_budget`". The
+    /// hard cap is always honoured.
+    ///
+    /// `None` (the default) falls back to the hard-cap behaviour (stop
+    /// immediately after any packet that exceeds `byte_budget`).
+    pub target_bytes: Option<u64>,
 }
 
 impl Default for EncodeOptions {
@@ -56,6 +81,8 @@ impl Default for EncodeOptions {
             // EncodeOptions::compressed().
             uncompressed: true,
             segment_count: 1,
+            byte_budget: None,
+            target_bytes: None,
         }
     }
 }
@@ -68,6 +95,24 @@ impl EncodeOptions {
             uncompressed: false,
             ..Self::default()
         }
+    }
+
+    /// Set a hard byte budget. The encoder will not exceed this many
+    /// bytes in the output (excluding any partially-committed segment
+    /// header). See [`EncodeOptions::byte_budget`].
+    #[must_use]
+    pub fn with_byte_budget(mut self, n: u64) -> Self {
+        self.byte_budget = Some(n);
+        self
+    }
+
+    /// Set a soft byte target. The encoder finishes the current
+    /// bit-plane's packet pair once the running total has reached
+    /// `n` bytes, then stops. See [`EncodeOptions::target_bytes`].
+    #[must_use]
+    pub fn with_target_bytes(mut self, n: u64) -> Self {
+        self.target_bytes = Some(n);
+        self
     }
 }
 
@@ -205,31 +250,98 @@ fn encode_one_segment_compressed(
         q,
     })?;
 
-    // Serialise the per-bit-plane packets and build the segment.
-    // The segment body is the concatenation of all packet headers +
-    // bodies in priority order (MSB-down, significance before
-    // refinement per §IV).
+    // Quota-controlled serialisation: walk packets in priority order
+    // (MSB-down, significance before refinement per §IV), stopping
+    // when the byte budget / soft target is exceeded.
+    //
+    // The segment header is SegmentHeader::ENCODED_BYTES bytes long and
+    // is committed unconditionally; the budget covers the body (packet
+    // headers + bodies only).
+    //
+    // Hard cap: before appending a packet, check if the current body
+    // size + PacketHeader::ENCODED_BYTES + packet body would push the
+    // total output (segment header + body) over byte_budget. If so,
+    // drop the packet and all subsequent ones.
+    //
+    // Soft target: once the body size has met or exceeded target_bytes
+    // (accounting for the segment header), finish the current
+    // bit-plane's pair (the remainder of the current significance +
+    // its matching refinement packet), then stop.
+    //
+    // The two options are composable: soft target controls when the
+    // encoder *decides* to wrap up the current bit-plane pair; hard
+    // cap enforces the absolute ceiling even within that pair.
+    let seg_hdr_bytes = SegmentHeader::ENCODED_BYTES as u64;
     let mut body: Vec<u8> = Vec::new();
-    for pkt in &packets {
-        let pass = if pkt.is_significance {
-            BitPlanePass::Significance
-        } else {
-            BitPlanePass::Refinement
-        };
-        let ph = PacketHeader {
-            bit_plane: pkt.bit_plane,
-            pass,
-            body_length: pkt.body.len() as u16,
-        };
-        // Guard against individual packet body overflowing u16.
-        if pkt.body.len() > u16::MAX as usize {
-            return Err(IcerError::Unsupported(format!(
-                "packet body {} exceeds u16 limit",
-                pkt.body.len()
-            )));
+    // Whether the encoder has decided to stop after the current
+    // bit-plane pair (triggered by soft target).
+    let mut soft_stop_after_bp: Option<u8> = None;
+
+    // Walk packets in order: they arrive as (sig_0, ref_0, sig_1, ref_1, ...)
+    // from encode_bitplanes. We process them two at a time (by bit_plane)
+    // to implement the soft-target "finish this bit-plane pair" semantic.
+    let q_usize = q as usize;
+    'bp_loop: for bp_idx in 0..q_usize {
+        // Check if soft-target stop was requested for a previous bit-plane.
+        if let Some(stop_bp) = soft_stop_after_bp {
+            if bp_idx as u8 > stop_bp {
+                break 'bp_loop;
+            }
         }
-        body.extend_from_slice(&ph.encode());
-        body.extend_from_slice(&pkt.body);
+
+        for &is_sig in &[true, false] {
+            let pkt = packets
+                .iter()
+                .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig);
+            let pkt = match pkt {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Guard against individual packet body overflowing u16.
+            if pkt.body.len() > u16::MAX as usize {
+                return Err(IcerError::Unsupported(format!(
+                    "packet body {} exceeds u16 limit",
+                    pkt.body.len()
+                )));
+            }
+
+            let pkt_wire_len = PacketHeader::ENCODED_BYTES as u64 + pkt.body.len() as u64;
+            let new_body_len = body.len() as u64 + pkt_wire_len;
+            let new_total = seg_hdr_bytes + new_body_len;
+
+            // Hard cap check: if adding this packet would exceed the
+            // budget, stop immediately (do not emit the packet).
+            if let Some(budget) = opts.byte_budget {
+                if new_total > budget {
+                    break 'bp_loop;
+                }
+            }
+
+            // Emit the packet.
+            let pass = if pkt.is_significance {
+                BitPlanePass::Significance
+            } else {
+                BitPlanePass::Refinement
+            };
+            let ph = PacketHeader {
+                bit_plane: pkt.bit_plane,
+                pass,
+                body_length: pkt.body.len() as u16,
+            };
+            body.extend_from_slice(&ph.encode());
+            body.extend_from_slice(&pkt.body);
+
+            // Soft target check: once the running total meets or
+            // exceeds target_bytes, request a stop after the current
+            // bit-plane pair finishes (i.e. after the refinement
+            // packet for this bit-plane index).
+            if let Some(target) = opts.target_bytes {
+                if (seg_hdr_bytes + body.len() as u64) >= target && soft_stop_after_bp.is_none() {
+                    soft_stop_after_bp = Some(bp_idx as u8);
+                }
+            }
+        }
     }
 
     if body.len() > u16::MAX as usize {

@@ -12,7 +12,7 @@ Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
 No JPL flight code, no DSN ground software, no `qccPack`, no third-party
 ICER re-implementation was consulted, paraphrased, or cross-checked.
 
-## Round-3 status
+## Round-4 status
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -28,6 +28,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
+| Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
@@ -133,41 +134,48 @@ to "the implementation":
 
 ## Roadmap
 
-Two pieces are deliberately not in the current rounds — both are core
+One piece is deliberately not in the current rounds — it is core
 to ICER's value proposition for deep-space imaging:
 
-### Quota-controlled encoding (next round)
+### ✅ Quota-controlled encoding (landed in round 4)
 
-`encode_icer(image, &opts)` currently runs every bit-plane to
-completion. ICER's signature feature is **truncation to a caller-
-specified byte budget**: the encoder emits progressive packets MSB-
-down and stops once the running output size hits the quota. Anything
-not yet emitted simply isn't transmitted; the decoder reconstructs at
-whatever quality the truncation point allows. This is exactly how
-the Mars rovers compress every image — bandwidth is the constraint,
-not target PSNR.
-
-Planned API shape (subject to change):
+`encode_icer(image, &opts)` now supports truncation to a caller-
+specified byte budget. ICER's signature feature — **emitting
+progressive packets MSB-down and stopping once the quota is
+exhausted** — is fully implemented. Anything not yet emitted simply
+isn't transmitted; the decoder reconstructs at whatever quality the
+truncation point allows. This is exactly how the Mars rovers compress
+every image.
 
 ```rust
 let opts = EncodeOptions::compressed()
     .with_byte_budget(8192);          // hard cap
-// or
-let opts = EncodeOptions::compressed()
-    .with_target_bytes(8192)          // soft target — finish current packet
-    .with_byte_budget(9000);          // hard cap
-
 let bytes = encode_icer(&image, &opts)?;
-assert!(bytes.len() <= 9000);
+assert!(bytes.len() <= 8192);
+
+// Soft target + hard cap:
+let opts = EncodeOptions::compressed()
+    .with_target_bytes(8192)          // soft target — finish current bit-plane pair
+    .with_byte_budget(10_000);        // hard cap — never exceeded
+let bytes = encode_icer(&image, &opts)?;
+assert!(bytes.len() <= 10_000);
 ```
 
-The packet layout already shipped in round 3 (one significance + one
-refinement packet per bit-plane per IPN 42-155 §IV, each independently
-arithmetic-coded) makes this clean: the encoder walks bit-planes from
-MSB down, finalises each packet, and stops when the running budget is
-exceeded. Mid-packet truncation is also possible per §IV but the
-clean-room interpretation of "where in a packet to truncate" needs the
-[13] reference tables.
+Semantics:
+
+* **Hard cap** (`with_byte_budget(n)`): before starting each packet the
+  encoder checks whether the total output (segment header + all packets
+  so far + next packet) would exceed `n`. If so, it stops immediately.
+  The output is strictly ≤ `n` bytes.
+* **Soft target** (`with_target_bytes(n)`): once the running output
+  meets or exceeds `n`, the encoder finishes the current bit-plane's
+  packet pair (significance + refinement), then stops. Output may be
+  slightly above `n`.
+* **Combined**: soft target controls *when* to decide to stop; hard cap
+  enforces the absolute ceiling even within the finishing pair.
+
+Mid-packet truncation is deferred (needs the IPN 42-155 supplemental
+[13] reference tables — see "Documentation gaps" below).
 
 ### ICER 3D
 

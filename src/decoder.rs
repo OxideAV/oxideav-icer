@@ -165,24 +165,29 @@ fn decode_compressed_segment_into(
 ) -> Result<()> {
     let q = walked.header.bit_plane_count;
     let levels = walked.header.decomp_levels;
-    if walked.packets.is_empty() {
-        return Err(IcerError::invalid("compressed segment has no packets"));
-    }
 
-    // Reconstruct the EncodedPacket list from the walked packet headers.
-    // Each WalkedPacket's header has bit_plane + pass fields that map
-    // directly to EncodedPacket's bit_plane + is_significance.
-    let encoded_packets: Vec<EncodedPacket> = walked
-        .packets
-        .iter()
-        .map(|wp| EncodedPacket {
-            bit_plane: wp.header.bit_plane,
-            is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
-            body: wp.body.to_vec(),
-        })
-        .collect();
-
-    let mut coeffs = decode_bitplanes_multi(&encoded_packets, width, height, q)?;
+    // A zero-packet compressed segment is valid: it means the encoder
+    // stopped before emitting any bit-plane data (e.g. due to a very
+    // tight byte budget). Reconstruct as all-zero coefficients — after
+    // the inverse DWT and level-shift this yields all-128 pixels.
+    let mut coeffs = if walked.packets.is_empty() {
+        vec![0i32; width * height]
+    } else {
+        // Reconstruct the EncodedPacket list from the walked packet
+        // headers. Each WalkedPacket's header has bit_plane + pass
+        // fields that map directly to EncodedPacket's bit_plane +
+        // is_significance.
+        let encoded_packets: Vec<EncodedPacket> = walked
+            .packets
+            .iter()
+            .map(|wp| EncodedPacket {
+                bit_plane: wp.header.bit_plane,
+                is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
+                body: wp.body.to_vec(),
+            })
+            .collect();
+        decode_bitplanes_multi(&encoded_packets, width, height, q)?
+    };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
     // Inverse level-shift + clamp to 0..=255.
     for y in 0..height {

@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 4: quota-controlled encoding. `EncodeOptions` gains two new
+  builder methods:
+  - `with_byte_budget(n: u64)` — hard byte cap. Before starting each
+    packet the encoder checks whether the total output (segment header
+    + body so far + next packet) would exceed `n`; if so, encoding
+    stops. Output is strictly ≤ `n` bytes.
+  - `with_target_bytes(n: u64)` — soft byte target. Once the running
+    total meets or exceeds `n`, the encoder finishes the current
+    bit-plane's packet pair (significance + refinement), then stops.
+    Output may be slightly above `n`. Composable with `with_byte_budget`
+    as a "soft target with hard cap" semantic.
+- Decoder now handles zero-packet compressed segments gracefully:
+  a segment header with no following packets decodes to an all-128
+  (level-shifted zero-coefficient) image rather than returning an
+  error. This is the correct behaviour when a very tight byte budget
+  allows only the 12-byte segment header.
+- New integration test file `tests/quota_encode.rs` covering:
+  - `budget_respected_and_decodable`: four budgets (1024, 4096, 16384,
+    65536 B) on a 256×256 gray gradient; asserts output ≤ budget,
+    decodes successfully, and PSNR is monotonically non-decreasing.
+  - `budget_psnr_thresholds`: minimum PSNR bounds per budget level.
+  - `soft_target_with_hard_cap`: combined soft target (8192 B) + hard
+    cap (10 000 B) produces output in that range.
+  - `soft_target_only`: soft target alone finishes within 2× the
+    target.
+  - `budget_header_only_decodes`: budget of 12 bytes (header only)
+    decodes to all-128 pixels.
+  - `no_budget_full_roundtrip`: no quota → full lossless round-trip
+    (filter Q).
+
+### Added (round 3)
+
 - Round 3: Filter G (Le Gall 5/3 float variant, IPN 42-155 §III.A).
   Same predict/update coefficients as filter Q (alpha=-0.5, beta=0.25)
   applied in floating point with orthonormal post-scale zeta=sqrt(2)/2.
