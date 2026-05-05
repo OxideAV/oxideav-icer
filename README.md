@@ -131,6 +131,60 @@ to "the implementation":
   in `docs/image/icer/`.
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
 
+## Roadmap
+
+Two pieces are deliberately not in the current rounds — both are core
+to ICER's value proposition for deep-space imaging:
+
+### Quota-controlled encoding (next round)
+
+`encode_icer(image, &opts)` currently runs every bit-plane to
+completion. ICER's signature feature is **truncation to a caller-
+specified byte budget**: the encoder emits progressive packets MSB-
+down and stops once the running output size hits the quota. Anything
+not yet emitted simply isn't transmitted; the decoder reconstructs at
+whatever quality the truncation point allows. This is exactly how
+the Mars rovers compress every image — bandwidth is the constraint,
+not target PSNR.
+
+Planned API shape (subject to change):
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_byte_budget(8192);          // hard cap
+// or
+let opts = EncodeOptions::compressed()
+    .with_target_bytes(8192)          // soft target — finish current packet
+    .with_byte_budget(9000);          // hard cap
+
+let bytes = encode_icer(&image, &opts)?;
+assert!(bytes.len() <= 9000);
+```
+
+The packet layout already shipped in round 3 (one significance + one
+refinement packet per bit-plane per IPN 42-155 §IV, each independently
+arithmetic-coded) makes this clean: the encoder walks bit-planes from
+MSB down, finalises each packet, and stops when the running budget is
+exceeded. Mid-packet truncation is also possible per §IV but the
+clean-room interpretation of "where in a packet to truncate" needs the
+[13] reference tables.
+
+### ICER 3D
+
+The 2009 follow-on paper Kiely *et al.*, "ICER-3D: A Progressive
+Wavelet-Based Compressor for Hyperspectral Images" (IPN Progress
+Report 42-178) extends the same coder to a 3-D wavelet transform for
+hyperspectral cubes (HiRISE-style data with N spectral bands stacked).
+The 2-D 5/3 + float A-G filters become a 3-D separable transform; the
+context model gains a band-axis dimension. The encoder + decoder
+machinery already in this crate (segment framing, packet ordering,
+arithmetic coder, context model) carry over largely unchanged — the
+delta is the 3-D DWT + extended context indexing.
+
+This is the natural follow-on once the 2-D path is at JPL-interop
+parity (i.e. once the [13] reference tables are transcribed and the
+quota-controlled encoder is in place).
+
 ## Standalone vs registry build
 
 The default `registry` feature wires up the `oxideav-core`
