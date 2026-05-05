@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-icer/releases/tag/v0.0.1) - 2026-05-05
+
+### Other
+
+- Round 1: scaffold + spec coverage map (clean-room from IPN 42-155)
+- Initial commit: MIT LICENSE (Karpelès Lab Inc.)
+
 ### Added
 
 - Round-1 scaffold for ICER (JPL's progressive wavelet image compressor,
