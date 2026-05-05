@@ -1,0 +1,30 @@
+[package]
+name = "oxideav-icer"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-icer"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust ICER (JPL wavelet image compressor, Mars rover heritage) — clean-room from Kiely & Klimesh IPN PR 42-155 (2003)"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-icer"
+keywords = ["multimedia", "image", "wavelet", "icer", "spaceflight"]
+categories = ["multimedia::encoding", "multimedia::images"]
+
+[dependencies]
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-icer` with
+# `default-features = false` and avoid the framework dep tree entirely.
+# Without `registry` the crate exposes a free-standing
+# `parse_icer_metadata` / `decode_icer_subbands` / `encode_icer` API
+# plus crate-local `IcerImage` / `IcerError` types using std primitives.
+oxideav-core = { version = "0.1", optional = true }
+
+[features]
+default = ["registry"]
+# Wires up the `Decoder` / `Encoder` trait impls + the framework
+# `register()` entry point against `oxideav-core`. Default-on; turn
+# off for image-library use-cases that just want the standalone API.
+registry = ["dep:oxideav-core"]
