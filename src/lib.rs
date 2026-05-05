@@ -1,30 +1,37 @@
-//! Pure-Rust ICER — JPL's progressive wavelet image compressor used
+//! Pure-Rust ICER -- JPL's progressive wavelet image compressor used
 //! by every Mars surface mission since the 2003 Mars Exploration
 //! Rovers (Spirit, Opportunity), continued on Mars Science Laboratory
 //! (Curiosity), Mars 2020 (Perseverance), and follow-ons.
 //!
-//! Round-2 status:
+//! Round-3 status:
 //!
-//! * **Framing parser** — segment + packet header walk over the
+//! * **Framing parser** -- segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
 //!   See [`header::SegmentHeader`] / [`header::PacketHeader`].
-//! * **Integer 5/3 wavelet transform** — forward + inverse, 1-D + 2-D
+//! * **Integer 5/3 wavelet transform** -- forward + inverse, 1-D + 2-D
 //!   one-level + dyadic D-level. Round-trip-bit-exact on signed i32
 //!   coefficients. (See [`wavelet`].)
-//! * **Float wavelet filters A-F** — round-trip to IEEE-754 tolerance
+//! * **Float wavelet filters A-G** -- round-trip to IEEE-754 tolerance
 //!   on the 1-D + 2-D + dyadic paths; integer/float dispatch helper
 //!   in [`wavelet_float::forward_2d`] / [`wavelet_float::inverse_2d`].
-//! * **Binary arithmetic coder + context model** — registers, range
+//!   Filter G (Le Gall 5/3 float variant) completes the full A-G set.
+//! * **Binary arithmetic coder + context model** -- registers, range
 //!   renormalisation, follow-bit handling, adaptive Laplace-windowed
 //!   probability estimator. (See [`arith`] + [`context`].)
-//! * **Bit-plane scanner** — significance + sign + refinement passes,
-//!   MSB-down, raster scan inside each pass; drives the arithmetic
-//!   coder for the compressed-segment path. (See [`bitplane`].)
-//! * **Decoder** — full pixel reconstruction for both the
+//! * **Real JPL significance context table** -- the IPN 42-155 §III.B
+//!   H/V/D neighbour-count classification (9 contexts) replaces the
+//!   round-2 popcount placeholder. Sign-flip convention per §III.B.
+//! * **Stripe-ordered scan** -- bit-plane scanner processes coefficients
+//!   in horizontal stripes of height `STRIPE_HEIGHT` (4 rows, IPN
+//!   42-155 §III.B) to maximise context-pattern locality.
+//! * **Multi-packet ordering** -- one packet pair (significance + sign,
+//!   then refinement) per bit-plane per IPN 42-155 §IV. Truncated
+//!   streams reconstruct at lower quality.
+//! * **Decoder** -- full pixel reconstruction for both the
 //!   IPN 42-155 §III.D "uncompressed" path *and* the compressed
 //!   wavelet + bit-plane path. Multi-segment images stitched in
 //!   `segment_index` order.
-//! * **Encoder** — emits the uncompressed path *and* the compressed
+//! * **Encoder** -- emits the uncompressed path *and* the compressed
 //!   path (`EncodeOptions::compressed()`). Multi-segment encode via
 //!   `EncodeOptions::segment_count`. Self-roundtrips byte-exactly.
 //!
@@ -74,6 +81,7 @@ pub mod wavelet_float;
 pub const CODEC_ID_STR: &str = "icer";
 
 // Standalone public surface — works whether or not `registry` is on.
+pub use bitplane::EncodedPacket;
 pub use decoder::{
     decode_uncompressed_icer, parse_icer, parse_icer_metadata, IcerMetadata, SegmentMetadata,
 };

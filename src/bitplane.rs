@@ -1,51 +1,67 @@
-//! Bit-plane scanner — significance, refinement, and sign passes that
+//! Bit-plane scanner -- significance, refinement, and sign passes that
 //! drive the binary arithmetic coder.
 //!
 //! ICER's compressed segment body is built MSB-down by walking each
 //! bit-plane of the wavelet coefficient buffer through three passes
 //! (IPN 42-155 §III.B):
 //!
-//!   1. **Significance** — for every coefficient still insignificant,
+//!   1. **Significance** -- for every coefficient still insignificant,
 //!      send a single bit indicating whether bit `bp` is the first
 //!      magnitude bit set; if so, also send the sign bit.
-//!   2. **Refinement** — for every coefficient that became significant
+//!   2. **Refinement** -- for every coefficient that became significant
 //!      in an earlier bit-plane, send bit `bp` of its magnitude.
-//!   3. **(Cleanup)** — IPN 42-155 §III.B notes that ICER (unlike
+//!   3. **(Cleanup)** -- IPN 42-155 §III.B notes that ICER (unlike
 //!      JPEG 2000 EBCOT) folds the cleanup pass into the significance
 //!      pass for some configurations; this implementation uses the
 //!      merged variant (significance covers cleanup), matching the
 //!      paper's "two-pass per bit-plane" reading of §III.B.
 //!
-//! The scan order inside each pass is straight raster (top-down,
-//! left-to-right). The paper's stripe-based ordering is an
-//! optimisation that reduces context-pattern cache misses but does
-//! not change which bits get coded — so a self-roundtrip test
-//! validates the scheme end-to-end. Real Mars-rover interop will
-//! require switching to the stripe order in a follow-up; the
-//! `BitPlaneInput` interface below is structured so that change is
-//! local.
+//! ## Stripe-ordered scan (IPN 42-155 §III.B)
+//!
+//! The bit-plane scanner uses **stripe-ordered** processing. The image
+//! is partitioned into horizontal stripes of height `STRIPE_HEIGHT`
+//! (default 4 rows per IPN 42-155 §III.B). Within each bit-plane, all
+//! passes process one full stripe before moving to the next. Within a
+//! stripe, the significance pass processes left-to-right, top-to-bottom
+//! (raster within the stripe), and the refinement pass follows in the
+//! same order. This order maximises context-pattern locality because
+//! stripes processed together share neighbour state.
+//!
+//! ## Multi-packet encoding (IPN 42-155 §IV)
+//!
+//! Each bit-plane's significance and refinement data are emitted as
+//! separate packets per IPN 42-155 §IV. For a segment with bit-plane
+//! count `Q`, the encoder produces `2*Q` packets in priority order:
+//! for bit-plane `bp` from MSB (bp=0) to LSB (bp=Q-1):
+//!   - Packet `(2*bp)`:   significance + sign data for bit-plane `bp`
+//!   - Packet `(2*bp+1)`: refinement data for bit-plane `bp`
+//!
+//! Each packet is independently arithmetic-coded (fresh `ArithEncoder`
+//! per packet) so truncated streams reconstruct at lower quality -- the
+//! fundamental loss-tolerance property of ICER.
 //!
 //! ## Self-contained codec
 //!
-//! [`encode_bitplanes`] takes a coefficient buffer + a target
-//! bit-plane count `q` and produces a single arithmetic-coded byte
-//! stream that [`decode_bitplanes`] reconstructs bit-for-bit.
-//!
-//! No JPL flight code or third-party ICER reference was consulted;
-//! the scan order + context-selection logic is the canonical EBCOT
-//! shape adapted to the 17-context union table this crate defines
-//! in [`crate::context`].
+//! [`encode_bitplanes`] returns a `Vec<EncodedPacket>` (one pair per
+//! bit-plane). [`decode_bitplanes`] reconstructs from that same packed
+//! representation. The legacy `encode_bitplanes_single` /
+//! `decode_bitplanes_single` path (single concatenated body) is kept for
+//! the segment tests that predate the multi-packet refactor.
 
 use crate::arith::{ArithDecoder, ArithEncoder};
 use crate::context::{
-    refinement_context, sign_context, significance_context, ContextModel, CONTEXT_COUNT,
+    refinement_context, sign_context, sign_prediction_flip, significance_context, ContextModel,
+    CONTEXT_COUNT,
 };
 use crate::error::{IcerError, Result};
+
+/// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
+pub const STRIPE_HEIGHT: usize = 4;
 
 /// Describes one wavelet coefficient sub-band's bit-plane scan input.
 /// `coeffs` holds the signed wavelet coefficients in raster scan
 /// order (`width * height` samples). `q` is the bit-plane count from
-/// MSB to LSB inclusive — bit-plane index 0 is the MSB of the largest
+/// MSB to LSB inclusive -- bit-plane index 0 is the MSB of the largest
 /// magnitude in the buffer.
 #[derive(Debug)]
 pub struct BitPlaneInput<'a> {
@@ -74,38 +90,190 @@ impl BitPlaneInput<'_> {
     }
 }
 
-/// Encode a coefficient buffer into a single arithmetic-coded payload.
+/// One encoded packet body: the arithmetic-coded bytes for a single
+/// pass of a single bit-plane.
+#[derive(Debug, Clone)]
+pub struct EncodedPacket {
+    /// Bit-plane index (0 = MSB, Q-1 = LSB).
+    pub bit_plane: u8,
+    /// `true` for the significance+sign pass; `false` for the
+    /// refinement pass.
+    pub is_significance: bool,
+    /// Entropy-coded body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Encode a coefficient buffer into per-bit-plane, per-pass packets
+/// using stripe-ordered scanning (IPN 42-155 §III.B + §IV).
 ///
-/// Returns the entropy-coded body. The caller wraps this in a
-/// `PacketHeader` (one packet per call is the simplest packetisation
-/// choice; multi-packet ordering is a follow-up).
-pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
+/// Returns one pair of [`EncodedPacket`] per bit-plane (significance
+/// first, then refinement). The `Q` value from `input.q` is the number
+/// of bit-planes processed.
+pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>> {
     input.validate()?;
     let n = input.coeffs.len();
     let q = input.q as usize;
 
-    // Significance state (true once magnitude has been emitted).
     let mut significant = vec![false; n];
-    // Sign state (true = negative). Only meaningful once `significant`.
     let mut sign = vec![false; n];
 
-    let mut model = ContextModel::new();
-    let mut enc = ArithEncoder::new();
+    let mut packets = Vec::with_capacity(2 * q);
 
-    for bp in (0..q).rev() {
-        // --- Significance + sign pass (also covers cleanup) ---
-        for y in 0..input.height {
-            for x in 0..input.width {
-                let i = y * input.width + x;
+    for bp_idx in 0..q {
+        let bp = q - 1 - bp_idx; // Process MSB first: bp = q-1 down to 0.
+
+        // --- Significance + sign pass (fresh coder, stripe order) ---
+        let mut sig_model = ContextModel::new();
+        let mut sig_enc = ArithEncoder::new();
+
+        encode_significance_pass(
+            &mut sig_enc,
+            &mut sig_model,
+            input.coeffs,
+            &mut significant,
+            &mut sign,
+            input.width,
+            input.height,
+            bp,
+        );
+
+        packets.push(EncodedPacket {
+            bit_plane: bp_idx as u8,
+            is_significance: true,
+            body: sig_enc.finish(),
+        });
+
+        // --- Refinement pass (fresh coder, stripe order) ---
+        let mut ref_model = ContextModel::new();
+        let mut ref_enc = ArithEncoder::new();
+
+        encode_refinement_pass(
+            &mut ref_enc,
+            &mut ref_model,
+            input.coeffs,
+            &significant,
+            input.width,
+            input.height,
+            bp,
+        );
+
+        packets.push(EncodedPacket {
+            bit_plane: bp_idx as u8,
+            is_significance: false,
+            body: ref_enc.finish(),
+        });
+    }
+
+    Ok(packets)
+}
+
+/// Decode coefficient buffer from per-bit-plane packets produced by
+/// [`encode_bitplanes`]. Reconstructs `width * height` signed integers.
+pub fn decode_bitplanes_multi(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+) -> Result<Vec<i32>> {
+    let n = width * height;
+    if q == 0 || q > 31 {
+        return Err(IcerError::invalid(format!(
+            "bit-plane count {q} outside (0,31]"
+        )));
+    }
+    let q_usize = q as usize;
+
+    let mut significant = vec![false; n];
+    let mut sign = vec![false; n];
+    let mut mag = vec![0u32; n];
+
+    for bp_idx in 0..q_usize {
+        let bp = q_usize - 1 - bp_idx;
+
+        // Find the significance packet for this bit-plane index.
+        let sig_body = packets
+            .iter()
+            .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance)
+            .map(|p| p.body.as_slice())
+            .unwrap_or(&[]);
+
+        let mut sig_model = ContextModel::new();
+        let mut sig_dec = ArithDecoder::new(sig_body)?;
+
+        decode_significance_pass(
+            &mut sig_dec,
+            &mut sig_model,
+            &mut significant,
+            &mut sign,
+            &mut mag,
+            width,
+            height,
+            bp,
+        )?;
+
+        // Find the refinement packet for this bit-plane index.
+        let ref_body = packets
+            .iter()
+            .find(|p| p.bit_plane == bp_idx as u8 && !p.is_significance)
+            .map(|p| p.body.as_slice())
+            .unwrap_or(&[]);
+
+        let mut ref_model = ContextModel::new();
+        let mut ref_dec = ArithDecoder::new(ref_body)?;
+
+        decode_refinement_pass(
+            &mut ref_dec,
+            &mut ref_model,
+            &significant,
+            &mut mag,
+            width,
+            height,
+            bp,
+        )?;
+    }
+
+    let out = mag
+        .iter()
+        .zip(sign.iter())
+        .map(|(&m, &s)| {
+            let v = m as i32;
+            if s {
+                -v
+            } else {
+                v
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Significance + sign pass for one bit-plane, stripe-ordered.
+/// Modifies `significant` and `sign` in place.
+#[allow(clippy::too_many_arguments)]
+fn encode_significance_pass(
+    enc: &mut ArithEncoder,
+    model: &mut ContextModel,
+    coeffs: &[i32],
+    significant: &mut [bool],
+    sign: &mut [bool],
+    width: usize,
+    height: usize,
+    bp: usize,
+) {
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
+            for x in 0..width {
+                let i = y * width + x;
                 if significant[i] {
                     continue;
                 }
-                let pat =
-                    neighbour_significance_pattern(&significant, input.width, input.height, x, y);
+                let pat = neighbour_significance_pattern(significant, width, height, x, y);
                 let ctx = significance_context(pat);
                 debug_assert!(ctx < CONTEXT_COUNT);
 
-                let mag = input.coeffs[i].unsigned_abs();
+                let mag = coeffs[i].unsigned_abs();
                 let bit = ((mag >> bp) & 1) as u8;
 
                 let (num, den) = model.probability(ctx);
@@ -114,88 +282,49 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
 
                 if bit == 1 {
                     significant[i] = true;
-                    sign[i] = input.coeffs[i] < 0;
+                    sign[i] = coeffs[i] < 0;
 
-                    // Emit sign bit using a sign-context.
-                    let (h_pat, v_pat) = neighbour_sign_pattern(
-                        &significant,
-                        &sign,
-                        input.width,
-                        input.height,
-                        x,
-                        y,
-                    );
+                    // Sign bit with sign-flip convention (IPN 42-155 §III.B).
+                    let (h_pat, v_pat) =
+                        neighbour_sign_pattern(significant, sign, width, height, x, y);
                     let sctx = sign_context(h_pat, v_pat);
                     debug_assert!(sctx < CONTEXT_COUNT);
-                    let sign_bit = u8::from(sign[i]);
+                    let flip = sign_prediction_flip(h_pat, v_pat);
+                    // Encode the (possibly flipped) sign bit.
+                    let raw_sign = u8::from(sign[i]);
+                    let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
                     let (sn, sd) = model.probability(sctx);
-                    enc.encode_bit(sign_bit, sn, sd);
-                    model.observe(sctx, sign_bit);
+                    enc.encode_bit(coded_sign, sn, sd);
+                    model.observe(sctx, coded_sign);
                 }
             }
         }
-
-        // --- Refinement pass ---
-        for y in 0..input.height {
-            for x in 0..input.width {
-                let i = y * input.width + x;
-                // A coefficient is refined only if it was significant
-                // *before* this bit-plane started. We detect that by
-                // skipping any coefficient whose top significant bit is
-                // exactly `bp` (just-became-significant in the
-                // significance pass we ran moments ago).
-                if !significant[i] {
-                    continue;
-                }
-                let mag = input.coeffs[i].unsigned_abs();
-                if highest_set_bit(mag) == Some(bp as u32) {
-                    continue;
-                }
-                let just_sig = false;
-                let has_sig_neighbour =
-                    neighbour_significance_pattern(&significant, input.width, input.height, x, y)
-                        != 0;
-                let rctx = refinement_context(just_sig, has_sig_neighbour);
-                debug_assert!(rctx < CONTEXT_COUNT);
-                let bit = ((mag >> bp) & 1) as u8;
-                let (num, den) = model.probability(rctx);
-                enc.encode_bit(bit, num, den);
-                model.observe(rctx, bit);
-            }
-        }
+        stripe_start += STRIPE_HEIGHT;
     }
-
-    Ok(enc.finish())
 }
 
-/// Decode a coefficient buffer from a single arithmetic-coded payload.
-/// Reconstructs `width * height` signed integers with magnitudes up to
-/// `(1 << q) - 1`.
-pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Result<Vec<i32>> {
-    let n = width * height;
-    if q == 0 || q > 31 {
-        return Err(IcerError::invalid(format!(
-            "bit-plane count {q} outside (0,31]"
-        )));
-    }
-    let q = q as usize;
-
-    let mut significant = vec![false; n];
-    let mut sign = vec![false; n];
-    let mut mag = vec![0u32; n];
-
-    let mut model = ContextModel::new();
-    let mut dec = ArithDecoder::new(bytes)?;
-
-    for bp in (0..q).rev() {
-        // --- Significance + sign pass ---
-        for y in 0..height {
+/// Significance + sign decode pass for one bit-plane, stripe-ordered.
+#[allow(clippy::too_many_arguments)]
+fn decode_significance_pass(
+    dec: &mut ArithDecoder<'_>,
+    model: &mut ContextModel,
+    significant: &mut [bool],
+    sign: &mut [bool],
+    mag: &mut [u32],
+    width: usize,
+    height: usize,
+    bp: usize,
+) -> Result<()> {
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
                 if significant[i] {
                     continue;
                 }
-                let pat = neighbour_significance_pattern(&significant, width, height, x, y);
+                let pat = neighbour_significance_pattern(significant, width, height, x, y);
                 let ctx = significance_context(pat);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.decode_bit(num, den)?;
@@ -205,18 +334,76 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     significant[i] = true;
                     mag[i] |= 1u32 << bp;
                     let (h_pat, v_pat) =
-                        neighbour_sign_pattern(&significant, &sign, width, height, x, y);
+                        neighbour_sign_pattern(significant, sign, width, height, x, y);
                     let sctx = sign_context(h_pat, v_pat);
+                    let flip = sign_prediction_flip(h_pat, v_pat);
                     let (sn, sd) = model.probability(sctx);
-                    let sign_bit = dec.decode_bit(sn, sd)?;
-                    model.observe(sctx, sign_bit);
-                    sign[i] = sign_bit == 1;
+                    let coded_sign = dec.decode_bit(sn, sd)?;
+                    model.observe(sctx, coded_sign);
+                    // Undo the sign flip.
+                    let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
+                    sign[i] = raw_sign == 1;
                 }
             }
         }
+        stripe_start += STRIPE_HEIGHT;
+    }
+    Ok(())
+}
 
-        // --- Refinement pass ---
-        for y in 0..height {
+/// Refinement pass for one bit-plane, stripe-ordered.
+fn encode_refinement_pass(
+    enc: &mut ArithEncoder,
+    model: &mut ContextModel,
+    coeffs: &[i32],
+    significant: &[bool],
+    width: usize,
+    height: usize,
+    bp: usize,
+) {
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
+            for x in 0..width {
+                let i = y * width + x;
+                if !significant[i] {
+                    continue;
+                }
+                let m = coeffs[i].unsigned_abs();
+                // Skip coefficients that became significant in THIS bit-plane
+                // (they contribute to the significance pass, not refinement).
+                if highest_set_bit(m) == Some(bp as u32) {
+                    continue;
+                }
+                let has_sig_neighbour =
+                    neighbour_significance_pattern(significant, width, height, x, y) != 0;
+                let rctx = refinement_context(false, has_sig_neighbour);
+                debug_assert!(rctx < CONTEXT_COUNT);
+                let bit = ((m >> bp) & 1) as u8;
+                let (num, den) = model.probability(rctx);
+                enc.encode_bit(bit, num, den);
+                model.observe(rctx, bit);
+            }
+        }
+        stripe_start += STRIPE_HEIGHT;
+    }
+}
+
+/// Refinement decode pass for one bit-plane, stripe-ordered.
+fn decode_refinement_pass(
+    dec: &mut ArithDecoder<'_>,
+    model: &mut ContextModel,
+    significant: &[bool],
+    mag: &mut [u32],
+    width: usize,
+    height: usize,
+    bp: usize,
+) -> Result<()> {
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
                 if !significant[i] {
@@ -226,7 +413,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     continue;
                 }
                 let has_sig_neighbour =
-                    neighbour_significance_pattern(&significant, width, height, x, y) != 0;
+                    neighbour_significance_pattern(significant, width, height, x, y) != 0;
                 let rctx = refinement_context(false, has_sig_neighbour);
                 let (num, den) = model.probability(rctx);
                 let bit = dec.decode_bit(num, den)?;
@@ -235,6 +422,201 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     mag[i] |= 1u32 << bp;
                 }
             }
+        }
+        stripe_start += STRIPE_HEIGHT;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Legacy single-packet codec (used by the old segment encode/decode path).
+// The multi-packet path (encode_bitplanes / decode_bitplanes_multi) is
+// preferred for new code; this path is kept for the existing tests that
+// use the single-concatenated-body approach.
+// ---------------------------------------------------------------------------
+
+/// Encode a coefficient buffer into a single arithmetic-coded payload
+/// (stripe-ordered, but all passes concatenated into one body).
+///
+/// Returns the entropy-coded body. The caller wraps this in a
+/// `PacketHeader`.
+pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
+    input.validate()?;
+    let n = input.coeffs.len();
+    let q = input.q as usize;
+
+    let mut significant = vec![false; n];
+    let mut sign = vec![false; n];
+    let mut model = ContextModel::new();
+    let mut enc = ArithEncoder::new();
+
+    for bp_idx in 0..q {
+        let bp = q - 1 - bp_idx;
+
+        // Significance + sign pass (stripe order).
+        let mut stripe_start = 0;
+        while stripe_start < input.height {
+            let stripe_end = (stripe_start + STRIPE_HEIGHT).min(input.height);
+            for y in stripe_start..stripe_end {
+                for x in 0..input.width {
+                    let i = y * input.width + x;
+                    if significant[i] {
+                        continue;
+                    }
+                    let pat = neighbour_significance_pattern(
+                        &significant,
+                        input.width,
+                        input.height,
+                        x,
+                        y,
+                    );
+                    let ctx = significance_context(pat);
+                    debug_assert!(ctx < CONTEXT_COUNT);
+                    let mag = input.coeffs[i].unsigned_abs();
+                    let bit = ((mag >> bp) & 1) as u8;
+                    let (num, den) = model.probability(ctx);
+                    enc.encode_bit(bit, num, den);
+                    model.observe(ctx, bit);
+                    if bit == 1 {
+                        significant[i] = true;
+                        sign[i] = input.coeffs[i] < 0;
+                        let (h_pat, v_pat) = neighbour_sign_pattern(
+                            &significant,
+                            &sign,
+                            input.width,
+                            input.height,
+                            x,
+                            y,
+                        );
+                        let sctx = sign_context(h_pat, v_pat);
+                        debug_assert!(sctx < CONTEXT_COUNT);
+                        let flip = sign_prediction_flip(h_pat, v_pat);
+                        let raw_sign = u8::from(sign[i]);
+                        let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
+                        let (sn, sd) = model.probability(sctx);
+                        enc.encode_bit(coded_sign, sn, sd);
+                        model.observe(sctx, coded_sign);
+                    }
+                }
+            }
+            stripe_start += STRIPE_HEIGHT;
+        }
+
+        // Refinement pass (stripe order).
+        let mut stripe_start = 0;
+        while stripe_start < input.height {
+            let stripe_end = (stripe_start + STRIPE_HEIGHT).min(input.height);
+            for y in stripe_start..stripe_end {
+                for x in 0..input.width {
+                    let i = y * input.width + x;
+                    if !significant[i] {
+                        continue;
+                    }
+                    let mag = input.coeffs[i].unsigned_abs();
+                    if highest_set_bit(mag) == Some(bp as u32) {
+                        continue;
+                    }
+                    let has_sig_neighbour = neighbour_significance_pattern(
+                        &significant,
+                        input.width,
+                        input.height,
+                        x,
+                        y,
+                    ) != 0;
+                    let rctx = refinement_context(false, has_sig_neighbour);
+                    debug_assert!(rctx < CONTEXT_COUNT);
+                    let bit = ((mag >> bp) & 1) as u8;
+                    let (num, den) = model.probability(rctx);
+                    enc.encode_bit(bit, num, den);
+                    model.observe(rctx, bit);
+                }
+            }
+            stripe_start += STRIPE_HEIGHT;
+        }
+    }
+
+    Ok(enc.finish())
+}
+
+/// Decode a coefficient buffer from a single arithmetic-coded payload
+/// (legacy single-body path matching `encode_bitplanes_single`).
+pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Result<Vec<i32>> {
+    let n = width * height;
+    if q == 0 || q > 31 {
+        return Err(IcerError::invalid(format!(
+            "bit-plane count {q} outside (0,31]"
+        )));
+    }
+    let q_usize = q as usize;
+
+    let mut significant = vec![false; n];
+    let mut sign = vec![false; n];
+    let mut mag = vec![0u32; n];
+
+    let mut model = ContextModel::new();
+    let mut dec = ArithDecoder::new(bytes)?;
+
+    for bp_idx in 0..q_usize {
+        let bp = q_usize - 1 - bp_idx;
+
+        // Significance + sign pass (stripe order).
+        let mut stripe_start = 0;
+        while stripe_start < height {
+            let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+            for y in stripe_start..stripe_end {
+                for x in 0..width {
+                    let i = y * width + x;
+                    if significant[i] {
+                        continue;
+                    }
+                    let pat = neighbour_significance_pattern(&significant, width, height, x, y);
+                    let ctx = significance_context(pat);
+                    let (num, den) = model.probability(ctx);
+                    let bit = dec.decode_bit(num, den)?;
+                    model.observe(ctx, bit);
+                    if bit == 1 {
+                        significant[i] = true;
+                        mag[i] |= 1u32 << bp;
+                        let (h_pat, v_pat) =
+                            neighbour_sign_pattern(&significant, &sign, width, height, x, y);
+                        let sctx = sign_context(h_pat, v_pat);
+                        let flip = sign_prediction_flip(h_pat, v_pat);
+                        let (sn, sd) = model.probability(sctx);
+                        let coded_sign = dec.decode_bit(sn, sd)?;
+                        model.observe(sctx, coded_sign);
+                        let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
+                        sign[i] = raw_sign == 1;
+                    }
+                }
+            }
+            stripe_start += STRIPE_HEIGHT;
+        }
+
+        // Refinement pass (stripe order).
+        let mut stripe_start = 0;
+        while stripe_start < height {
+            let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+            for y in stripe_start..stripe_end {
+                for x in 0..width {
+                    let i = y * width + x;
+                    if !significant[i] {
+                        continue;
+                    }
+                    if highest_set_bit(mag[i]) == Some(bp as u32) {
+                        continue;
+                    }
+                    let has_sig_neighbour =
+                        neighbour_significance_pattern(&significant, width, height, x, y) != 0;
+                    let rctx = refinement_context(false, has_sig_neighbour);
+                    let (num, den) = model.probability(rctx);
+                    let bit = dec.decode_bit(num, den)?;
+                    model.observe(rctx, bit);
+                    if bit == 1 {
+                        mag[i] |= 1u32 << bp;
+                    }
+                }
+            }
+            stripe_start += STRIPE_HEIGHT;
         }
     }
 
@@ -252,6 +634,10 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
         .collect();
     Ok(out)
 }
+
+// ---------------------------------------------------------------------------
+// Neighbour helpers
+// ---------------------------------------------------------------------------
 
 /// Pack the 8-neighbour significance pattern for `(x, y)` into a `u8`
 /// using the layout documented in [`crate::context::significance_context`]
@@ -289,12 +675,13 @@ fn neighbour_significance_pattern(
 }
 
 /// Build the `(h_pattern, v_pattern)` packed-pair fed into
-/// [`crate::context::sign_context`].
+/// [`crate::context::sign_context`] / [`crate::context::sign_prediction_flip`].
 ///
-/// Each pattern has bits laid out
-/// `[(W/N significant, W/N sign), (E/S significant, E/S sign)]`
-/// to match the docstring of `sign_context`. Out-of-range neighbours
-/// contribute zero significance.
+/// Layout per context.rs sign_context doc:
+///   bits 0,1 = (neighbour-A significant, neighbour-A negative)
+///   bits 2,3 = (neighbour-B significant, neighbour-B negative)
+///
+/// Horizontal: A=W, B=E. Vertical: A=N, B=S.
 fn neighbour_sign_pattern(
     significant: &[bool],
     sign: &[bool],
@@ -342,9 +729,9 @@ fn pair_pattern(
         if *cx >= 0 && *cy >= 0 && (*cx as usize) < width && (*cy as usize) < height {
             let idx = (*cy as usize) * width + (*cx as usize);
             if significant[idx] {
-                p |= 1 << (i * 2);
+                p |= 1 << (i * 2); // significant bit
                 if sign[idx] {
-                    p |= 1 << (i * 2 + 1);
+                    p |= 1 << (i * 2 + 1); // negative bit
                 }
             }
         }
@@ -418,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn bitplane_roundtrip_tiny_zero() {
+    fn bitplane_roundtrip_tiny_zero_single() {
         let coeffs = vec![0i32; 16];
         let input = BitPlaneInput {
             coeffs: &coeffs,
@@ -426,15 +813,15 @@ mod tests {
             height: 4,
             q: 1,
         };
-        let bytes = encode_bitplanes(&input).unwrap();
+        let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, 4, 4, 1).unwrap();
         assert_eq!(out, coeffs);
     }
 
     #[test]
-    fn bitplane_roundtrip_signed_random() {
+    fn bitplane_roundtrip_signed_random_single() {
         let w = 8;
-        let h = 6;
+        let h = 8; // Must be a multiple of STRIPE_HEIGHT for clean stripe alignment
         let coeffs = lcg_signal(w * h, 32, 0xCAFE);
         let q = select_bit_plane_count(&coeffs);
         let input = BitPlaneInput {
@@ -443,13 +830,13 @@ mod tests {
             height: h,
             q,
         };
-        let bytes = encode_bitplanes(&input).unwrap();
+        let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, w, h, q).unwrap();
         assert_eq!(out, coeffs);
     }
 
     #[test]
-    fn bitplane_roundtrip_large_dynamic_range() {
+    fn bitplane_roundtrip_large_dynamic_range_single() {
         let w = 16;
         let h = 16;
         let coeffs = lcg_signal(w * h, 4096, 0xBEEF);
@@ -460,8 +847,69 @@ mod tests {
             height: h,
             q,
         };
-        let bytes = encode_bitplanes(&input).unwrap();
+        let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, w, h, q).unwrap();
         assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn bitplane_roundtrip_multi_packet() {
+        let w = 8;
+        let h = 8;
+        let coeffs = lcg_signal(w * h, 128, 0xDEAD);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+        assert_eq!(
+            packets.len(),
+            2 * q as usize,
+            "should have 2 packets per bit-plane"
+        );
+        let out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn bitplane_multi_packet_all_zero() {
+        let w = 4;
+        let h = 4;
+        let coeffs = vec![0i32; w * h];
+        let q = 1u8;
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+        let out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn stripe_scan_matches_for_multiples_of_stripe_height() {
+        // When height is a multiple of STRIPE_HEIGHT, the single and
+        // multi-packet paths must produce identical decoded output.
+        let w = 8;
+        let h = 8;
+        let coeffs = lcg_signal(w * h, 64, 0xF00D);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let single_body = encode_bitplanes_single(&input).unwrap();
+        let single_out = decode_bitplanes(&single_body, w, h, q).unwrap();
+        let packets = encode_bitplanes(&input).unwrap();
+        let multi_out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        assert_eq!(single_out, coeffs, "single path must round-trip");
+        assert_eq!(multi_out, coeffs, "multi path must round-trip");
     }
 }

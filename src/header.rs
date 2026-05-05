@@ -42,35 +42,39 @@
 
 use crate::error::{IcerError, Result};
 
-/// Wavelet filter identifier — IPN 42-155 §III.A enumerates seven
-/// alternatives labelled `A` through `G`. The deployed Mars rover
-/// configurations use filter `Q` (the integer 5/3 lifting filter) for
-/// lossless and filter `A` (a 9/7-style float lifting filter) for
-/// lossy.  The field is 4 bits wide in the segment header — values
-/// 0..=6 enumerate the seven filters, 7..=15 are reserved.
+/// Wavelet filter identifier -- IPN 42-155 §III.A enumerates eight
+/// candidates: filters `A` through `G` (float lifting variants) plus
+/// filter `Q` (the integer 5/3). The field is 4 bits wide in the
+/// segment header; values 0..=7 cover the eight filter ids, 8..=15
+/// are reserved.
 ///
-/// Round 1 only implements `Reversible53`. Other variants parse but
-/// the inverse-transform stage refuses with `IcerError::Unsupported`.
+/// The deployed Mars rover configurations use filter `Q` for lossless
+/// and filter `A` (a 9/7-style float lifting filter) for lossy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WaveletFilter {
-    /// Filter `Q` (IPN 42-155 §III.A bullet 7) — integer 5/3 lifting,
+    /// Filter `Q` (IPN 42-155 §III.A bullet 7) -- integer 5/3 lifting,
     /// reversible. Matches the JPEG 2000 5/3 reversible filter
     /// modulo notation (well-known in the wavelet literature; not a
     /// JPL invention).
     Reversible53 = 0,
-    /// Filter `A` — float 9/7-style lifting, lossy.
+    /// Filter `A` -- float 9/7-style CDF lifting, lossy.
     NineSevenA = 1,
     FilterB = 2,
     FilterC = 3,
     FilterD = 4,
     FilterE = 5,
     FilterF = 6,
+    /// Filter `G` (IPN 42-155 §III.A) -- Le Gall 5/3 float lifting
+    /// variant with a post-scale zeta derived from the filter's
+    /// polyphase matrix norms. Encodes and decodes; self-roundtrips
+    /// to IEEE-754 tolerance. This completes the full A-G filter set.
+    FilterG = 7,
 }
 
 impl WaveletFilter {
     /// Parse the 4-bit filter id from the segment header. Returns
-    /// `InvalidData` for the reserved range 7..=15 to fail-fast on
+    /// `InvalidData` for the reserved range 8..=15 to fail-fast on
     /// truncation / corruption rather than silently aliasing.
     pub fn from_bits(v: u8) -> Result<Self> {
         match v {
@@ -81,6 +85,7 @@ impl WaveletFilter {
             4 => Ok(WaveletFilter::FilterD),
             5 => Ok(WaveletFilter::FilterE),
             6 => Ok(WaveletFilter::FilterF),
+            7 => Ok(WaveletFilter::FilterG),
             _ => Err(IcerError::invalid(format!(
                 "reserved wavelet filter id {v}"
             ))),

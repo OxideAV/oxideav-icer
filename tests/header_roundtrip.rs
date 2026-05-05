@@ -12,6 +12,7 @@ fn segment_header_roundtrip_all_filters() {
         WaveletFilter::FilterD,
         WaveletFilter::FilterE,
         WaveletFilter::FilterF,
+        WaveletFilter::FilterG,
     ] {
         for levels in 1..=6 {
             for uncompressed in [false, true] {

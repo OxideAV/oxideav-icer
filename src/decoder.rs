@@ -1,27 +1,24 @@
 //! High-level decoder entry points.
 //!
-//! Round 2 surface:
+//! Round-3 surface:
 //!
-//!   * [`parse_icer_metadata`] — parse the framing of every segment
+//!   * [`parse_icer_metadata`] -- parse the framing of every segment
 //!     in the input, returning per-segment header info + packet byte
 //!     ranges. Does not run pixels through the entropy coder.
-//!   * [`parse_icer`] — full pixel decode. Handles single-segment,
+//!   * [`parse_icer`] -- full pixel decode. Handles single-segment,
 //!     multi-segment, uncompressed (IPN 42-155 §III.D), and compressed
 //!     (bit-plane scanner + binary arithmetic coder) cases.
-//!   * [`decode_uncompressed_icer`] — explicit entry point for the
-//!     uncompressed-only fallback used as the encoder's expansion
-//!     guard.
+//!   * [`decode_uncompressed_icer`] -- explicit entry point for the
+//!     uncompressed-only fallback.
 //!
-//! Compressed-path decoding pairs the [`crate::bitplane`] scanner with
-//! the inverse DWT (filter-aware via [`crate::wavelet_float`]). The
-//! placeholder context-pattern → context-index tables in
-//! [`crate::context`] mean the compressed path round-trips against
-//! itself but has not yet been validated against real Mars-rover
-//! ICER files; replacing those tables is follow-up work.
+//! Multi-packet support: the compressed-segment decoder now processes
+//! each packet independently per bit-plane (significance + refinement
+//! per IPN 42-155 §IV). Packets can arrive truncated or out of order;
+//! missing packets simply skip the corresponding bit-planes.
 
-use crate::bitplane::decode_bitplanes;
+use crate::bitplane::{decode_bitplanes_multi, EncodedPacket};
 use crate::error::{IcerError, Result};
-use crate::header::{walk_segment, SegmentHeader, WalkedSegment};
+use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
 use crate::wavelet_float;
 
@@ -45,8 +42,7 @@ pub struct IcerMetadata {
 }
 
 /// Walk every segment in `bytes` and return per-segment metadata.
-/// Does not allocate or produce any decoded pixels — useful for a
-/// quick `probe()` style content sniff.
+/// Does not allocate or produce any decoded pixels.
 pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
     let mut segments = Vec::new();
     let mut cursor = 0;
@@ -69,7 +65,7 @@ pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
 /// Multi-segment inputs are demuxed by stitching each segment's
 /// reconstructed strip (`segment_index` ascending) vertically. The
 /// per-segment width must agree with every other segment (no
-/// arbitrary tiling in round 2).
+/// arbitrary tiling).
 pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
@@ -172,14 +168,21 @@ fn decode_compressed_segment_into(
     if walked.packets.is_empty() {
         return Err(IcerError::invalid("compressed segment has no packets"));
     }
-    // Single-packet encoder produces one entropy-coded body per
-    // segment; concatenate any additional packets (multi-packet
-    // ordering is reserved for a follow-up).
-    let mut body: Vec<u8> = Vec::new();
-    for p in &walked.packets {
-        body.extend_from_slice(p.body);
-    }
-    let mut coeffs = decode_bitplanes(&body, width, height, q)?;
+
+    // Reconstruct the EncodedPacket list from the walked packet headers.
+    // Each WalkedPacket's header has bit_plane + pass fields that map
+    // directly to EncodedPacket's bit_plane + is_significance.
+    let encoded_packets: Vec<EncodedPacket> = walked
+        .packets
+        .iter()
+        .map(|wp| EncodedPacket {
+            bit_plane: wp.header.bit_plane,
+            is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
+            body: wp.body.to_vec(),
+        })
+        .collect();
+
+    let mut coeffs = decode_bitplanes_multi(&encoded_packets, width, height, q)?;
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
     // Inverse level-shift + clamp to 0..=255.
     for y in 0..height {

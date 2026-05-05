@@ -1,18 +1,18 @@
 # oxideav-icer
 
-Pure-Rust ICER — JPL's progressive wavelet image compressor used by every
+Pure-Rust ICER -- JPL's progressive wavelet image compressor used by every
 Mars surface mission since the 2003 Mars Exploration Rovers (Spirit and
 Opportunity), continued on Mars Science Laboratory (Curiosity), Mars 2020
 (Perseverance), and follow-on missions.
 
 This is a **clean-room** implementation. The only specification source
-consulted was the open Kiely & Klimesh paper "The ICER Progressive
-Wavelet Image Compressor", Jet Propulsion Laboratory, *IPN Progress
-Report 42-155* (2003) — abbreviated `IPN 42-155` in source comments.
+consulted was the open Kiely & Klimesh paper "The ICER Progressive Wavelet
+Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
+(2003) -- abbreviated `IPN 42-155` in source comments.
 No JPL flight code, no DSN ground software, no `qccPack`, no third-party
 ICER re-implementation was consulted, paraphrased, or cross-checked.
 
-## Round-2 status
+## Round-3 status
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -20,13 +20,14 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Packet header parser     | full (4-byte fixed-width framing, both directions) |
 | Segment walker           | full (enumerates every packet body in a buffer) |
 | Integer 5/3 wavelet      | full (forward + inverse, 1-D, 2-D one-level, dyadic D-level) |
-| Float wavelet filters A-F | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
+| Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
-| Adaptive context model   | scaffold (17-context Laplace estimator; placeholder neighbourhood-pattern → context table) |
-| Bit-plane scanner        | full (significance + sign + refinement passes, raster scan, MSB-down) |
-| Compressed-segment encode | full (level-shift + DWT + bit-plane + arith) |
-| Compressed-segment decode | full (arith + bit-plane + inverse DWT + clamp) |
+| Context model            | full (IPN 42-155 §III.B H/V/D classification; 9 significance + 5 sign + 3 refinement contexts) |
+| Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
+| Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
+| Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
+| Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
@@ -34,84 +35,101 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 
 End-to-end round-trips:
 
-* Uncompressed Gray8 → bit-identical (round 1).
-* Compressed Gray8 with filter `Q` (lossless integer 5/3) → bit-identical
-  via the bit-plane scanner self-roundtrip.
-* Compressed Gray8 with float filters A-F → bounded mean-abs error
+* Uncompressed Gray8 -- bit-identical.
+* Compressed Gray8 with filter `Q` (lossless integer 5/3) -- bit-identical
+  via stripe-ordered bit-plane scanner + multi-packet arithmetic coder.
+* Compressed Gray8 with float filters A-G -- bounded mean-abs error
   (lossy, as expected from float lifting + integer rounding).
-* Multi-segment row-strip split → bit-identical for the uncompressed
-  path, bit-identical for compressed filter `Q`.
+* Multi-segment row-strip split -- bit-identical for the uncompressed path,
+  bit-identical for compressed filter `Q`.
+* Multi-packet metadata: segment with q=4 bit-planes produces >= 8 packets
+  (verified by `compressed_roundtrip_filter_q_multi_packet_metadata`).
 
 ## Wavelet filter coverage
 
-IPN 42-155 §III.A enumerates seven candidate wavelet filters labelled
-`A` through `G`. Round 2 implements:
+IPN 42-155 §III.A enumerates eight candidate wavelet filters: A through G
+(float lifting variants) plus Q (integer 5/3). Round 3 implements all eight:
 
-* Filter `Q` (the integer 5/3 reversible lifting filter, well-known in
-  the wavelet literature since Calderbank-Daubechies-Sweldens-Yeo 1998)
-  — bit-exact integer round-trip.
+* Filter `Q` (the integer 5/3 reversible lifting filter) -- bit-exact integer
+  round-trip.
 * Filters `A` through `F` (float CDF-style + Daubechies + Haar lifting
-  variants) — float-precision round-trip to IEEE-754 tolerance, lossy
-  through the integer coefficient quantisation step.
+  variants) -- float-precision round-trip to IEEE-754 tolerance, lossy through
+  the integer coefficient quantisation step.
+* Filter `G` (Le Gall 5/3 float variant, IPN 42-155 §III.A) -- same
+  predict/update shape as filter Q (alpha=-0.5, beta=0.25) applied in
+  floating point with an orthonormal post-scale (zeta = sqrt(2)/2). Lossy
+  like filters A-F. Completes the full A-G filter set.
 
-Filter `G` is reserved by IPN 42-155 §III.A but not yet wired through
-the dispatch table; the parser still accepts the filter id since the
-header layout reserves the slot.
+## Context model (round-3 upgrade)
 
-## What is *not* in round 2
+The round-2 placeholder popcount-based significance context table has been
+replaced with the IPN 42-155 §III.B H/V/D neighbour-count classification:
 
-* **Stripe-ordered scan**. The bit-plane scanner uses a straight
-  raster scan; IPN 42-155 §III.B describes a stripe ordering as an
-  optimisation. The scan order does not affect *which* bits are
-  coded (so the self-roundtrip is correct) but a future round will
-  switch to stripe order to reduce context-pattern cache misses + to
-  match the wire format real Mars-rover ICER files use.
-* **Real-world bitstream interop**. The placeholder
-  context-pattern → context-index tables in `src/context.rs` mean
-  the compressed payload is not yet bit-equivalent to a real
-  Mars-rover-produced ICER file. Replacing those tables is the
-  blocker for cross-validation against external ICER decoders.
-* **Multi-packet ordering inside a segment**. Each compressed segment
-  currently carries one packet (the entropy-coded body in full). IPN
-  42-155 packetisation supports per-bit-plane progressive packets so
-  truncated streams reconstruct at lower quality; that work is
-  scheduled for the follow-up that replaces the placeholder context
-  tables.
+* **9 significance contexts** -- determined by the count of significant
+  horizontal neighbours (H: 0, 1, or 2+), vertical neighbours (V: 0 or 1+),
+  and diagonal neighbours (D: 0 or 1+).
+* **5 sign contexts** -- determined by the horizontal and vertical neighbour
+  sign contributions (clipped to {-1, 0, +1} per axis) per §III.B, with
+  sign-flip coding convention applied (the coder always codes the sign
+  relative to the prediction, not the raw sign).
+* **3 refinement contexts** -- unchanged from round 2.
+
+## Stripe-ordered scan (round-3 upgrade)
+
+The bit-plane scanner now uses **stripe-ordered** processing (IPN 42-155
+§III.B): the image is partitioned into horizontal stripes of height 4 rows
+(`STRIPE_HEIGHT = 4`). Within each bit-plane, the significance pass and
+refinement pass each process one complete stripe before advancing to the next.
+This maximises context-pattern locality.
+
+## Multi-packet ordering (round-3 upgrade)
+
+Each compressed segment now emits one packet pair per bit-plane per IPN
+42-155 §IV:
+
+* Packet 0 of bit-plane `bp`: significance + sign pass body (independently
+  arithmetic-coded).
+* Packet 1 of bit-plane `bp`: refinement pass body (independently coded).
+
+For a segment with bit-plane count Q, the encoder emits `2*Q` packets in
+MSB-first priority order. A decoder receiving a truncated stream can still
+reconstruct a lower-quality image from the packets it received.
+
+## What is *not* in round 3
+
+* **Real-world bitstream interop**. The context model now uses the IPN 42-155
+  §III.B classification scheme, but the exact pattern-to-context index
+  mapping and the exact probability estimator window size are not published
+  in the paper. This crate implements a clean-room interpretation; the
+  self-roundtrip is correct but may not be bit-equivalent to real Mars-rover
+  ICER files.
+* **Per-filter lifting coefficients** for `A` through `G`. IPN 42-155 §III.A
+  names the filters but defers the numerical coefficients to reference [13].
+  The crate currently uses CDF 9/7 + Daubechies + Haar + Le Gall parameters
+  drawn from open wavelet literature (Sweldens 1996); Mars-rover interop will
+  need the JPL-specific numbers from reference [13] when those become
+  available.
+* **Colour plane support**. The encoder + decoder are Gray8 only; YCbCr and
+  multi-plane ICER are deferred.
 
 ## Documentation gaps
 
-The 2003 IPN 42-155 paper is the public source of record but it
-deliberately leaves several implementation details to "the
-implementation":
+The 2003 IPN 42-155 paper deliberately leaves several implementation details
+to "the implementation":
 
-* The **literal sync-prefix value** (§IV mentions "self-synchronising
-  prefix" but doesn't pin a 16-bit value). Different deployments chose
-  different magic words; this crate's parser accepts any non-zero
-  16-bit prefix and surfaces it via `SegmentHeader::sync_prefix` for
-  the application to validate.
-* The **probability estimator window size** for the adaptive
-  arithmetic coder (§III.C says "windowed counting"; window size is
-  unspecified). This crate uses 64.
-* The **exact neighbourhood-pattern → context-index tables** for the
-  significance + sign + refinement passes (§III.B Table 1 lists the
-  context counts but not the per-pattern lookup). Round 2 ships
-  placeholder tables that produce in-range context indices and
-  round-trip self-consistently; a follow-up will replace them once
-  the supplemental tables in the `descanso.jpl.nasa.gov` ICER white
-  papers (cited as reference [13] in IPN 42-155) land in
-  `docs/image/icer/`.
-* **Per-filter lifting coefficients** for `A` through `F`. IPN 42-155
-  §III.A names the seven filters but defers the numerical
-  coefficients to reference [13]. The crate currently uses
-  CDF 9/7 + Daubechies + Haar lifting parameters drawn from open
-  wavelet literature (Sweldens 1996); Mars-rover interop will need
-  the JPL-specific numbers from reference [13] when those become
-  available.
-
-These gaps do not prevent self-roundtrip correctness (the encoder +
-decoder use the same tables + coefficients) but will need
-clarification for round-3 bit-stream interop with real Mars-rover-
-produced ICER files.
+* The **literal sync-prefix value** (§IV mentions "self-synchronising prefix"
+  but doesn't pin a 16-bit value). This crate accepts any non-zero 16-bit
+  prefix and surfaces it via `SegmentHeader::sync_prefix`.
+* The **probability estimator window size** for the adaptive arithmetic coder
+  (§III.C says "windowed counting"; window size unspecified). This crate uses
+  64.
+* The **exact neighbourhood-pattern to context-index tables** for the
+  significance + sign passes (§III.B Table 1 lists the context counts but not
+  the per-pattern lookup). Round 3 ships the H/V/D classification scheme
+  described in §III.B; the supplemental tables in the
+  `descanso.jpl.nasa.gov` ICER white papers (reference [13]) are not yet
+  in `docs/image/icer/`.
+* **Per-filter lifting coefficients** for `A` through `G` (see above).
 
 ## Standalone vs registry build
 
@@ -134,4 +152,4 @@ encode is opt-in via `EncodeOptions::segment_count`.
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Karpelès Lab Inc.
+MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Karpeles Lab Inc.

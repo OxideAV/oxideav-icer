@@ -1,27 +1,31 @@
-//! Float wavelet filters A-F — IPN 42-155 §III.A enumerates seven
-//! candidate kernels labelled `A` through `G`, of which Filter `Q` is
-//! the integer 5/3 (handled by [`crate::wavelet`]) and the remainder
-//! are float-precision lifting variants. Filters `A` through `F` here
-//! follow the Cohen-Daubechies-Feauveau biorthogonal lifting families
-//! the paper draws from; the exact float coefficients chosen below
-//! are the symmetric biorthogonal 9/7 lifting parameters from
-//! Sweldens 1996, "The Lifting Scheme: A Custom-Design Construction
-//! of Biorthogonal Wavelets" — well-known in the wavelet literature
-//! and not derived from any JPL flight code or reference
-//! implementation.
+//! Float wavelet filters A-G -- IPN 42-155 §III.A enumerates eight
+//! candidate kernels labelled `A` through `G` (float lifting variants)
+//! plus filter `Q` (the integer 5/3, handled by [`crate::wavelet`]).
+//! This module implements filters A through G.
 //!
-//! All filters here are **lossless via lifting** in `f32` arithmetic:
+//! Filters A-F follow the Cohen-Daubechies-Feauveau biorthogonal
+//! lifting families; the exact float coefficients are the symmetric
+//! biorthogonal 9/7 lifting parameters from Sweldens 1996, "The
+//! Lifting Scheme: A Custom-Design Construction of Biorthogonal
+//! Wavelets" -- well-known in the wavelet literature and not derived
+//! from any JPL flight code or reference implementation.
+//!
+//! Filter G (IPN 42-155 §III.A) is the Le Gall 5/3 float variant: the
+//! same predict/update coefficients as the integer 5/3 (alpha=-0.5,
+//! beta=0.25) but applied in floating point with an orthonormal
+//! post-scale zeta = sqrt(2)/2 ~= 0.707107. This completes the full
+//! A-G filter set. Like the other float filters, it round-trips to
+//! IEEE-754 tolerance but is lossy through the integer coefficient
+//! quantisation step.
+//!
+//! All filters here are **invertible via lifting** in `f32` arithmetic:
 //! within IEEE-754 round-off the inverse path reverses the forward
-//! path bit-for-bit, modulo accumulated rounding (exact-equality is
-//! impossible in float, so the round-trip tests assert tolerance, not
-//! identity).
+//! path, modulo accumulated rounding (exact-equality is impossible in
+//! float, so the round-trip tests assert tolerance, not identity).
 //!
-//! The seven filter parameter sets land in [`FILTER_PARAMS`]; per-axis
+//! The eight filter parameter sets land in [`FILTER_PARAMS`]; per-axis
 //! lifting uses the same dual-step `predict / update` shape as the
-//! integer 5/3 in [`crate::wavelet`]. This module is complementary to
-//! the integer transform — the `q` filter is handled by the integer
-//! module, the float filters here cover the IPN 42-155 §III.A
-//! `A`-`F` fast lossy reconstructions.
+//! integer 5/3 in [`crate::wavelet`].
 //!
 //! The `q` filter id (Reversible 5/3) is also accepted by
 //! [`forward_2d`] / [`inverse_2d`] but routes through the integer
@@ -58,19 +62,15 @@ pub struct FilterParams {
     pub is_integer: bool,
 }
 
-/// Lookup table indexed by filter id (`0` = `Q`, `1` = `A`, ...).
+/// Lookup table indexed by filter id (`0` = `Q`, `1` = `A`, ..., `7` = `G`).
 /// Kiely & Klimesh's IPN 42-155 §III.A does not publish per-filter
-/// numerical coefficients — it lists the seven candidates by name
+/// numerical coefficients -- it lists the eight candidates by name
 /// only and refers to a follow-up paper [13] for the exact lifting
 /// numbers. The non-`Q` entries here use the well-known CDF 9/7
-/// lifting coefficients (Sweldens 1996); each filter offers the same
-/// kernel but with a different post-scale `zeta`. This is sufficient
-/// for the round-2 milestone (prove float kernels work + round-trip
-/// to tolerance); swapping in the per-filter coefficients for a
-/// real-world Mars-rover interop is a follow-up once the IPN [13]
-/// reference lands in `docs/image/icer/`.
-pub const FILTER_PARAMS: [FilterParams; 7] = [
-    // Q: Reversible 5/3 (integer path; coefficients unused).
+/// lifting coefficients (Sweldens 1996) for filters A-F, and the
+/// Le Gall 5/3 float variant for filter G.
+pub const FILTER_PARAMS: [FilterParams; 8] = [
+    // Q (id=0): Reversible 5/3 (integer path; coefficients unused).
     FilterParams {
         alpha: 0.0,
         beta: 0.0,
@@ -79,7 +79,7 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: 1.0,
         is_integer: true,
     },
-    // A: CDF 9/7, post-scale zeta = 1.149604398
+    // A (id=1): CDF 9/7, post-scale zeta = 1.149604398
     FilterParams {
         alpha: -1.586_134_3,
         beta: -0.052_980_12,
@@ -88,7 +88,7 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: 1.149_604_4,
         is_integer: false,
     },
-    // B: same kernel, zeta = 1.0 (no post-scale).
+    // B (id=2): same kernel, zeta = 1.0 (no post-scale).
     FilterParams {
         alpha: -1.586_134_3,
         beta: -0.052_980_12,
@@ -97,7 +97,7 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: 1.0,
         is_integer: false,
     },
-    // C: float 5/3 variant (alpha=-1/2, beta=1/4, no second pair).
+    // C (id=3): float 5/3 variant (alpha=-1/2, beta=1/4, no second pair).
     FilterParams {
         alpha: -0.5,
         beta: 0.25,
@@ -106,7 +106,7 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: 1.0,
         is_integer: false,
     },
-    // D: CDF 9/7 with negated post-scale (sign convention swap).
+    // D (id=4): CDF 9/7 with negated post-scale (sign convention swap).
     FilterParams {
         alpha: -1.586_134_3,
         beta: -0.052_980_12,
@@ -115,7 +115,7 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: -1.149_604_4,
         is_integer: false,
     },
-    // E: Daubechies 4-tap analogue via lifting.
+    // E (id=5): Daubechies 4-tap analogue via lifting.
     FilterParams {
         alpha: -1.732_050_8, // -sqrt(3)
         beta: 0.433_012_7,   // sqrt(3)/4
@@ -124,10 +124,25 @@ pub const FILTER_PARAMS: [FilterParams; 7] = [
         zeta: 0.965_925_8, // (sqrt(3)+1)/sqrt(2)/2
         is_integer: false,
     },
-    // F: Haar (degenerate lifting — single predict + update pair).
+    // F (id=6): Haar (degenerate lifting -- single predict + update pair).
     FilterParams {
         alpha: -1.0,
         beta: 0.5,
+        gamma: 0.0,
+        delta: 0.0,
+        zeta: std::f32::consts::FRAC_1_SQRT_2,
+        is_integer: false,
+    },
+    // G (id=7): Le Gall 5/3 float variant (IPN 42-155 §III.A).
+    // Same predict/update shape as filter Q (alpha=-0.5, beta=0.25)
+    // applied in floating point with an orthonormal post-scale.
+    // zeta = sqrt(2)/2 ~= 0.707107, giving an orthonormal scaling
+    // for the polyphase matrix. This is the float analogue of the
+    // integer 5/3 -- it round-trips to tolerance but quantises
+    // through the i32 boundary so is lossy like filters A-F.
+    FilterParams {
+        alpha: -0.5,
+        beta: 0.25,
         gamma: 0.0,
         delta: 0.0,
         zeta: std::f32::consts::FRAC_1_SQRT_2,
@@ -432,6 +447,7 @@ mod tests {
             WaveletFilter::FilterD,
             WaveletFilter::FilterE,
             WaveletFilter::FilterF,
+            WaveletFilter::FilterG,
         ] {
             let p = filter.params();
             let original = ramp_f32(32);
@@ -440,7 +456,7 @@ mod tests {
             inverse_1d_float(&mut buf, &p);
             // Tolerance is generous: float lifting accumulates round-off
             // proportional to the buffer length and the magnitude of the
-            // lifting coefficients. 1e-2 covers all 6 filters at n=32.
+            // lifting coefficients. 1e-2 covers all 7 float filters at n=32.
             approx_eq_slice(&buf, &original, 1e-2);
         }
     }
@@ -448,6 +464,19 @@ mod tests {
     #[test]
     fn forward_inverse_2d_float_filter_a() {
         let p = WaveletFilter::NineSevenA.params();
+        let w = 8;
+        let h = 8;
+        let original: Vec<f32> = ramp_f32(w * h);
+        let mut buf = original.clone();
+        forward_2d_one_level_float(&mut buf, w, h, &p);
+        inverse_2d_one_level_float(&mut buf, w, h, &p);
+        approx_eq_slice(&buf, &original, 1e-2);
+    }
+
+    #[test]
+    fn forward_inverse_2d_float_filter_g() {
+        // Filter G (Le Gall 5/3 float variant) -- round-trip to tolerance.
+        let p = WaveletFilter::FilterG.params();
         let w = 8;
         let h = 8;
         let original: Vec<f32> = ramp_f32(w * h);
@@ -484,6 +513,23 @@ mod tests {
             assert!(
                 (a - b).abs() <= 4,
                 "float DWT round-trip too lossy: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_2d_dispatch_filter_g_roundtrips() {
+        // Filter G self-roundtrip through the i32 dispatch path.
+        let w = 8;
+        let h = 8;
+        let original: Vec<i32> = (0..(w * h) as i32).map(|x| x * 2).collect();
+        let mut buf = original.clone();
+        forward_2d(&mut buf, w, h, 2, WaveletFilter::FilterG).unwrap();
+        inverse_2d(&mut buf, w, h, 2, WaveletFilter::FilterG).unwrap();
+        for (a, b) in buf.iter().zip(original.iter()) {
+            assert!(
+                (a - b).abs() <= 4,
+                "filter G round-trip error too large: {a} vs {b}"
             );
         }
     }

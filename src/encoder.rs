@@ -1,21 +1,24 @@
 //! Encoder entry points.
 //!
-//! Round 2 surface:
+//! Round-3 surface:
 //!
-//!   * **Uncompressed path** (IPN 42-155 §III.D) — bypass the entropy
+//!   * **Uncompressed path** (IPN 42-155 §III.D) -- bypass the entropy
 //!     stage and ship raw 8-bit pixels in a single packet. This is
 //!     the fallback Mars-rover deployments use when the entropy
 //!     coder would *expand* the payload.
-//!   * **Compressed path** — wavelet transform (filter `Q` integer
-//!     5/3 by default; float filters A-F also accepted) followed by
-//!     the bit-plane scanner in [`crate::bitplane`] feeding the
-//!     binary arithmetic coder. Self-roundtrips with the matching
-//!     decoder; not yet bit-exact against real Mars-rover ICER files
-//!     (the context-pattern → context-index tables are placeholders
-//!     pending IPN 42-155 reference [13] supplemental docs).
-//!   * **Multi-segment** — large images split into `segment_count`
+//!   * **Compressed path** -- wavelet transform (filter `Q` integer
+//!     5/3 by default; float filters A-G also accepted) followed by
+//!     the stripe-ordered bit-plane scanner in [`crate::bitplane`]
+//!     feeding the binary arithmetic coder. Self-roundtrips with the
+//!     matching decoder.
+//!   * **Multi-packet ordering** -- the compressed path now emits one
+//!     packet pair per bit-plane (significance + refinement) per IPN
+//!     42-155 §IV. Truncated streams reconstruct at lower quality.
+//!   * **Multi-segment** -- large images split into `segment_count`
 //!     row-strip segments, each carrying an independently-decodable
 //!     coefficient buffer per IPN 42-155 §III.E.
+//!   * **Filter G** -- Le Gall 5/3 float variant; wired through both
+//!     encode and decode dispatch paths.
 
 use crate::bitplane::{encode_bitplanes, select_bit_plane_count, BitPlaneInput};
 use crate::error::{IcerError, Result};
@@ -49,9 +52,8 @@ impl Default for EncodeOptions {
             wavelet_levels: 3,
             bit_plane_count: 8,
             // Default to uncompressed so the round-1 self-roundtrip
-            // covers the baseline. Compressed mode is opt-in for now;
-            // a follow-up will flip the default once the placeholder
-            // context tables are replaced with the IPN [13] reference.
+            // covers the baseline. Compressed mode is opt-in via
+            // EncodeOptions::compressed().
             uncompressed: true,
             segment_count: 1,
         }
@@ -73,9 +75,7 @@ impl EncodeOptions {
 /// multiple segments depending on `opts.segment_count`.
 pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     if image.pixel_format != IcerPixelFormat::Gray8 {
-        return Err(IcerError::Unsupported(
-            "round 2 encoder only supports Gray8".into(),
-        ));
+        return Err(IcerError::Unsupported("encoder only supports Gray8".into()));
     }
     let plane = image
         .planes
@@ -96,7 +96,7 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
 
     // Multi-segment: split into `segment_count` row strips. Each strip
     // is at least 2 rows so the wavelet step has room. Strips may be
-    // unequal — the trailing strip absorbs the remainder.
+    // unequal -- the trailing strip absorbs the remainder.
     let strip_h = h.div_ceil(segment_count as usize);
     if strip_h < 2 {
         return Err(IcerError::Unsupported(format!(
@@ -180,7 +180,7 @@ fn encode_one_segment_compressed(
         )));
     }
     // Build signed coefficient buffer (shift by 128 so the centre of
-    // the unsigned 8-bit range maps to 0 — IPN 42-155 §III.A
+    // the unsigned 8-bit range maps to 0 -- IPN 42-155 §III.A
     // "level-shift").
     let mut coeffs: Vec<i32> = Vec::with_capacity(img_w * strip_h);
     for y in 0..strip_h {
@@ -196,26 +196,90 @@ fn encode_one_segment_compressed(
     // than the caller-requested floor.
     let needed = select_bit_plane_count(&coeffs);
     let q = needed.max(opts.bit_plane_count.min(31)).min(31);
-    let body = encode_bitplanes(&BitPlaneInput {
+
+    // Encode as per-bit-plane packets (IPN 42-155 §IV multi-packet ordering).
+    let packets = encode_bitplanes(&BitPlaneInput {
         coeffs: &coeffs,
         width: img_w,
         height: strip_h,
         q,
     })?;
+
+    // Serialise the per-bit-plane packets and build the segment.
+    // The segment body is the concatenation of all packet headers +
+    // bodies in priority order (MSB-down, significance before
+    // refinement per §IV).
+    let mut body: Vec<u8> = Vec::new();
+    for pkt in &packets {
+        let pass = if pkt.is_significance {
+            BitPlanePass::Significance
+        } else {
+            BitPlanePass::Refinement
+        };
+        let ph = PacketHeader {
+            bit_plane: pkt.bit_plane,
+            pass,
+            body_length: pkt.body.len() as u16,
+        };
+        // Guard against individual packet body overflowing u16.
+        if pkt.body.len() > u16::MAX as usize {
+            return Err(IcerError::Unsupported(format!(
+                "packet body {} exceeds u16 limit",
+                pkt.body.len()
+            )));
+        }
+        body.extend_from_slice(&ph.encode());
+        body.extend_from_slice(&pkt.body);
+    }
+
     if body.len() > u16::MAX as usize {
         return Err(IcerError::Unsupported(format!(
             "compressed segment body {} exceeds u16 limit",
             body.len()
         )));
     }
-    let packet = PacketHeader {
-        bit_plane: 0, // Single-packet encoding for the round-2 milestone.
-        pass: BitPlanePass::Significance,
-        body_length: body.len() as u16,
+
+    // The segment header segment_length covers the multi-packet body.
+    // We need a dummy PacketHeader for the finish_segment call -- but
+    // finish_segment's API assumes a single packet. For multi-packet
+    // segments we embed all the packet headers+bodies directly into
+    // `body` above, so we emit the SegmentHeader manually here.
+    let mut opts_copy = *opts;
+    opts_copy.bit_plane_count = q;
+    emit_segment_header_and_body(&body, segment_index, img_w, strip_h, &opts_copy, false)
+}
+
+/// Emit a segment header followed by a pre-assembled body (which may
+/// contain multiple packet headers + bodies) for the compressed path.
+fn emit_segment_header_and_body(
+    body: &[u8],
+    segment_index: u16,
+    width: usize,
+    height: usize,
+    opts: &EncodeOptions,
+    uncompressed: bool,
+) -> Result<Vec<u8>> {
+    let segment_length = body.len();
+    if segment_length > u16::MAX as usize {
+        return Err(IcerError::Unsupported(format!(
+            "segment length {segment_length} exceeds u16 limit"
+        )));
+    }
+    let segment = SegmentHeader {
+        sync_prefix: opts.sync_prefix,
+        filter: opts.filter,
+        decomp_levels: opts.wavelet_levels.clamp(1, 6),
+        uncompressed,
+        width: width as u16,
+        height: height as u16,
+        bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+        segment_length: segment_length as u16,
+        segment_index,
     };
-    let mut opts = *opts;
-    opts.bit_plane_count = q;
-    finish_segment(&packet, &body, segment_index, img_w, strip_h, &opts, false)
+    let mut out = Vec::with_capacity(SegmentHeader::ENCODED_BYTES + segment_length);
+    out.extend_from_slice(&segment.encode());
+    out.extend_from_slice(body);
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,11 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Round 2: bit-plane scanner (`bitplane` module) — significance + sign
+- Round 3: Filter G (Le Gall 5/3 float variant, IPN 42-155 §III.A).
+  Same predict/update coefficients as filter Q (alpha=-0.5, beta=0.25)
+  applied in floating point with orthonormal post-scale zeta=sqrt(2)/2.
+  Completes the full A-G filter set; encoder + decoder dispatch updated;
+  header parser accepts filter id 7 (previously reserved-rejected).
+- Round 3: real IPN 42-155 §III.B significance context classification.
+  Replaces the round-2 popcount placeholder with the H/V/D neighbour-count
+  scheme (9 significance contexts; H: 0/1/2+ horizontal, V: 0/1+ vertical,
+  D: 0/1+ diagonal). Sign coding uses the §III.B sign-flip convention
+  (coded bit = raw sign XOR prediction from neighbour contributions).
+- Round 3: stripe-ordered bit-plane scan (IPN 42-155 §III.B). The scanner
+  now processes coefficients in horizontal stripes of height 4 rows
+  (`STRIPE_HEIGHT = 4`), matching the paper's context-locality optimisation.
+  Both significance and refinement passes are stripe-ordered.
+- Round 3: multi-packet ordering per IPN 42-155 §IV. Each compressed segment
+  now emits one significance packet + one refinement packet per bit-plane
+  (2*Q packets total), each independently arithmetic-coded. A decoder
+  receiving a truncated stream reconstructs at lower quality. Decoder updated
+  to reconstruct coefficient buffer from per-bit-plane `EncodedPacket` slices.
+- New `EncodedPacket` struct exported from `bitplane` module; new
+  `encode_bitplanes` (multi-packet) + `decode_bitplanes_multi` API.
+  Legacy `encode_bitplanes_single` / `decode_bitplanes` kept for backward
+  compat with the single-body test path.
+- New tests: `compressed_roundtrip_filter_g_within_tolerance`,
+  `compressed_roundtrip_filter_q_multi_packet_metadata`,
+  `compressed_roundtrip_all_filters` (filters A-G end-to-end),
+  `multi_segment_compressed_all_filters`, filter G header roundtrip.
+
+### Changed
+
+- Round 2: bit-plane scanner (`bitplane` module) -- significance + sign
   + refinement passes, MSB-down, raster scan inside each pass; drives
   the binary arithmetic coder for the compressed-segment path.
 - Round 2: float wavelet filters A through F (`wavelet_float` module)
-  — CDF 9/7-style + Daubechies + Haar lifting kernels; 1-D + 2-D + dyadic
+  -- CDF 9/7-style + Daubechies + Haar lifting kernels; 1-D + 2-D + dyadic
   paths round-trip to IEEE-754 tolerance. Filter-aware dispatch helper
   `wavelet_float::forward_2d` / `inverse_2d` selects integer (filter `Q`)
   vs float (filters A-F) automatically.
