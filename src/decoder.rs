@@ -1,23 +1,29 @@
 //! High-level decoder entry points.
 //!
-//! Round 1 surface:
+//! Round 2 surface:
 //!
 //!   * [`parse_icer_metadata`] — parse the framing of every segment
 //!     in the input, returning per-segment header info + packet byte
 //!     ranges. Does not run pixels through the entropy coder.
-//!   * [`decode_uncompressed_icer`] — full pixel decode for the
-//!     "uncompressed" path (IPN 42-155 §III.D), where the encoder
-//!     bypassed entropy coding and the segment body is raw 8-bit
-//!     pixels in scan order. This is the path Mars rover ICER
-//!     deployments use as a fallback when the arithmetic coder would
-//!     have *expanded* the segment instead of compressing it.
+//!   * [`parse_icer`] — full pixel decode. Handles single-segment,
+//!     multi-segment, uncompressed (IPN 42-155 §III.D), and compressed
+//!     (bit-plane scanner + binary arithmetic coder) cases.
+//!   * [`decode_uncompressed_icer`] — explicit entry point for the
+//!     uncompressed-only fallback used as the encoder's expansion
+//!     guard.
 //!
-//! Full entropy-decode for compressed segments is round-2 work — see
-//! the README for what's deferred.
+//! Compressed-path decoding pairs the [`crate::bitplane`] scanner with
+//! the inverse DWT (filter-aware via [`crate::wavelet_float`]). The
+//! placeholder context-pattern → context-index tables in
+//! [`crate::context`] mean the compressed path round-trips against
+//! itself but has not yet been validated against real Mars-rover
+//! ICER files; replacing those tables is follow-up work.
 
+use crate::bitplane::decode_bitplanes;
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
+use crate::wavelet_float;
 
 /// Per-segment metadata returned by [`parse_icer_metadata`].
 #[derive(Debug, Clone)]
@@ -40,9 +46,7 @@ pub struct IcerMetadata {
 
 /// Walk every segment in `bytes` and return per-segment metadata.
 /// Does not allocate or produce any decoded pixels — useful for a
-/// quick `probe()` style content sniff and for callers that want to
-/// route only the "uncompressed" segments through this crate while
-/// shipping the entropy-coded ones to a different decoder.
+/// quick `probe()` style content sniff.
 pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
     let mut segments = Vec::new();
     let mut cursor = 0;
@@ -60,42 +64,139 @@ pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
     Ok(IcerMetadata { segments })
 }
 
-/// Public entry point matching the "round 1 minimum" from the
-/// dispatch brief: parse + reconstruct any segment whose
-/// `uncompressed` flag is set. Compressed segments still parse
-/// correctly (their headers are walked) but their pixels reconstruct
-/// to zero — the entropy decoder lands in round 2.
+/// Decode the full ICER bytestream into an image.
 ///
-/// On a single-segment, uncompressed input this returns a fully
-/// decoded image. On a mixed input it returns the image with
-/// compressed regions left at zero.
+/// Multi-segment inputs are demuxed by stitching each segment's
+/// reconstructed strip (`segment_index` ascending) vertically. The
+/// per-segment width must agree with every other segment (no
+/// arbitrary tiling in round 2).
 pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
-    let walked = walk_segment(bytes)?;
-    if walked.header.segment_index != 0 {
-        return Err(IcerError::Unsupported(format!(
-            "round 1 only supports segment_index = 0; got {}",
-            walked.header.segment_index
-        )));
+
+    // Walk every segment first so we know the total height + canonical
+    // width up-front.
+    let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let walked = walk_segment(&bytes[cursor..])?;
+        cursor += walked.consumed;
+        walked_all.push(walked);
     }
+    if walked_all.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+
+    // Sort by segment_index so out-of-order delivery still composes.
+    walked_all.sort_by_key(|w| w.header.segment_index);
+
+    // Verify width agreement + monotonic-by-1 segment indexing.
+    let canonical_width = walked_all[0].header.width as usize;
+    let mut total_height = 0usize;
+    for (expect_idx, w) in walked_all.iter().enumerate() {
+        if w.header.width as usize != canonical_width {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment width mismatch: segment {} is {}, expected {}",
+                w.header.segment_index, w.header.width, canonical_width
+            )));
+        }
+        if w.header.segment_index as usize != expect_idx {
+            return Err(IcerError::invalid(format!(
+                "non-contiguous segment indices: got {} at position {}",
+                w.header.segment_index, expect_idx
+            )));
+        }
+        total_height = total_height
+            .checked_add(w.header.height as usize)
+            .ok_or_else(|| IcerError::invalid("multi-segment height overflow"))?;
+    }
+    if total_height > u32::MAX as usize {
+        return Err(IcerError::invalid("multi-segment height overflow"));
+    }
+
+    let mut img = IcerImage::zeros(
+        canonical_width as u32,
+        total_height as u32,
+        IcerPixelFormat::Gray8,
+    );
+    let mut y_cursor = 0usize;
+    for walked in &walked_all {
+        let strip_h = walked.header.height as usize;
+        decode_segment_into(walked, &mut img.planes[0], y_cursor, canonical_width)?;
+        y_cursor += strip_h;
+    }
+    Ok(img)
+}
+
+fn decode_segment_into(
+    walked: &WalkedSegment<'_>,
+    plane: &mut IcerPlane,
+    y_offset: usize,
+    canonical_width: usize,
+) -> Result<()> {
+    let strip_h = walked.header.height as usize;
     if walked.header.uncompressed {
-        decode_uncompressed_icer(&walked)
+        // Concatenate every packet body, then copy at most w*h bytes.
+        let mut concat: Vec<u8> = Vec::with_capacity(canonical_width * strip_h);
+        for p in &walked.packets {
+            concat.extend_from_slice(p.body);
+            if concat.len() >= canonical_width * strip_h {
+                break;
+            }
+        }
+        if concat.len() < canonical_width * strip_h {
+            return Err(IcerError::Truncated);
+        }
+        for y in 0..strip_h {
+            let dst = &mut plane.data
+                [(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + canonical_width];
+            let src = &concat[y * canonical_width..y * canonical_width + canonical_width];
+            dst.copy_from_slice(src);
+        }
+        Ok(())
     } else {
-        // Compressed path is round-2; for now return an image-shaped
-        // zeros buffer so callers can still inspect geometry.
-        Ok(IcerImage::zeros(
-            walked.header.width as u32,
-            walked.header.height as u32,
-            IcerPixelFormat::Gray8,
-        ))
+        decode_compressed_segment_into(walked, plane, y_offset, canonical_width, strip_h)
     }
 }
 
-/// Decode the IPN 42-155 §III.D "uncompressed" path. Each packet's
-/// body is treated as raw 8-bit luma in scan order. Round 1 only
-/// implements the single-plane Gray8 case.
+fn decode_compressed_segment_into(
+    walked: &WalkedSegment<'_>,
+    plane: &mut IcerPlane,
+    y_offset: usize,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let q = walked.header.bit_plane_count;
+    let levels = walked.header.decomp_levels;
+    if walked.packets.is_empty() {
+        return Err(IcerError::invalid("compressed segment has no packets"));
+    }
+    // Single-packet encoder produces one entropy-coded body per
+    // segment; concatenate any additional packets (multi-packet
+    // ordering is reserved for a follow-up).
+    let mut body: Vec<u8> = Vec::new();
+    for p in &walked.packets {
+        body.extend_from_slice(p.body);
+    }
+    let mut coeffs = decode_bitplanes(&body, width, height, q)?;
+    wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
+    // Inverse level-shift + clamp to 0..=255.
+    for y in 0..height {
+        let dst =
+            &mut plane.data[(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + width];
+        for x in 0..width {
+            let v = coeffs[y * width + x] + 128;
+            dst[x] = v.clamp(0, 255) as u8;
+        }
+    }
+    Ok(())
+}
+
+/// Decode the IPN 42-155 §III.D "uncompressed" path explicitly. The
+/// generic [`parse_icer`] entry point also handles this case, but the
+/// dedicated function is kept for callers that want to assert the
+/// uncompressed-only invariant.
 pub fn decode_uncompressed_icer(walked: &WalkedSegment<'_>) -> Result<IcerImage> {
     if !walked.header.uncompressed {
         return Err(IcerError::invalid(
@@ -105,8 +206,6 @@ pub fn decode_uncompressed_icer(walked: &WalkedSegment<'_>) -> Result<IcerImage>
     let w = walked.header.width as usize;
     let h = walked.header.height as usize;
     let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
-    // Concatenate every packet body, then copy at most w*h bytes
-    // into the image plane.
     let mut concat: Vec<u8> = Vec::with_capacity(w * h);
     for p in &walked.packets {
         concat.extend_from_slice(p.body);

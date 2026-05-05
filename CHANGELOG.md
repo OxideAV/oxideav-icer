@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 2: bit-plane scanner (`bitplane` module) — significance + sign
+  + refinement passes, MSB-down, raster scan inside each pass; drives
+  the binary arithmetic coder for the compressed-segment path.
+- Round 2: float wavelet filters A through F (`wavelet_float` module)
+  — CDF 9/7-style + Daubechies + Haar lifting kernels; 1-D + 2-D + dyadic
+  paths round-trip to IEEE-754 tolerance. Filter-aware dispatch helper
+  `wavelet_float::forward_2d` / `inverse_2d` selects integer (filter `Q`)
+  vs float (filters A-F) automatically.
+- Round 2: compressed-segment encode + decode wired through `encode_icer`
+  / `parse_icer`. New `EncodeOptions::compressed()` constructor + the
+  existing `uncompressed: bool` field flips between paths. Filter `Q`
+  self-roundtrips bit-exactly; filters A-F self-roundtrip to bounded
+  mean-abs error (lossy through float DWT + integer rounding).
+- Round 2: multi-segment images via `EncodeOptions::segment_count`. The
+  encoder splits the image into row-strips per IPN 42-155 §III.E; the
+  decoder stitches segments back in `segment_index` order, validating
+  width agreement + contiguous indexing.
+- New tests in `tests/compressed_roundtrip.rs` cover all four new sub-
+  features; new unit tests in `bitplane` + `wavelet_float` modules cover
+  the building blocks.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-icer/releases/tag/v0.0.1) - 2026-05-05
 
 ### Other

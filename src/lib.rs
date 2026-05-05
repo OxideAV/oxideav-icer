@@ -3,25 +3,30 @@
 //! Rovers (Spirit, Opportunity), continued on Mars Science Laboratory
 //! (Curiosity), Mars 2020 (Perseverance), and follow-ons.
 //!
-//! Round-1 status:
+//! Round-2 status:
 //!
 //! * **Framing parser** — segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
 //!   See [`header::SegmentHeader`] / [`header::PacketHeader`].
 //! * **Integer 5/3 wavelet transform** — forward + inverse, 1-D + 2-D
 //!   one-level + dyadic D-level. Round-trip-bit-exact on signed i32
-//!   coefficients. Filters A, B, C, D, E, F (the float / non-5/3
-//!   alternatives in IPN 42-155 §III.A) parse but do not yet
-//!   transform.
+//!   coefficients. (See [`wavelet`].)
+//! * **Float wavelet filters A-F** — round-trip to IEEE-754 tolerance
+//!   on the 1-D + 2-D + dyadic paths; integer/float dispatch helper
+//!   in [`wavelet_float::forward_2d`] / [`wavelet_float::inverse_2d`].
 //! * **Binary arithmetic coder + context model** — registers, range
 //!   renormalisation, follow-bit handling, adaptive Laplace-windowed
-//!   probability estimator. Round-trips through itself but not yet
-//!   wired to the bit-plane scanner.
-//! * **Decoder** — full pixel reconstruction for the IPN 42-155 §III.D
-//!   "uncompressed" path (single segment); compressed segments parse
-//!   their header but reconstruct as zeros (round 2).
-//! * **Encoder** — emits the uncompressed path; lossless 5/3
-//!   compressed encoding is round 2.
+//!   probability estimator. (See [`arith`] + [`context`].)
+//! * **Bit-plane scanner** — significance + sign + refinement passes,
+//!   MSB-down, raster scan inside each pass; drives the arithmetic
+//!   coder for the compressed-segment path. (See [`bitplane`].)
+//! * **Decoder** — full pixel reconstruction for both the
+//!   IPN 42-155 §III.D "uncompressed" path *and* the compressed
+//!   wavelet + bit-plane path. Multi-segment images stitched in
+//!   `segment_index` order.
+//! * **Encoder** — emits the uncompressed path *and* the compressed
+//!   path (`EncodeOptions::compressed()`). Multi-segment encode via
+//!   `EncodeOptions::segment_count`. Self-roundtrips byte-exactly.
 //!
 //! ## Specification source
 //!
@@ -51,6 +56,7 @@
 #![allow(clippy::manual_div_ceil)]
 
 pub mod arith;
+pub mod bitplane;
 pub mod context;
 pub mod decoder;
 pub mod encoder;
@@ -60,6 +66,7 @@ pub mod image;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod wavelet;
+pub mod wavelet_float;
 
 /// Codec identifier string used by the registry + by container demuxers
 /// when emitting `CodecId::new(CODEC_ID_STR)`. Kept lowercase to match
