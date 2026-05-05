@@ -20,7 +20,7 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # Without `registry` the crate exposes a free-standing
 # `parse_icer_metadata` / `decode_icer_subbands` / `encode_icer` API
 # plus crate-local `IcerImage` / `IcerError` types using std primitives.
-oxideav-core = { version = "0.1.21", optional = true }
+oxideav-core = { version = "0.1", optional = true }
 # Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
 # via the `oxideav_core::register!` macro. Tiny crate, no transitive
 # deps; works on every target including wasm. Optional + gated behind
