@@ -250,7 +250,7 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
         let dec = ctx
             .codecs
-            .make_decoder(&params)
+            .first_decoder(&params)
             .expect("icer decoder factory");
         assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
         // The unified entry point also wires the .icer extension hint
