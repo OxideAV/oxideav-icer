@@ -10,8 +10,8 @@
 
 use oxideav_core::{
     frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame,
+    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, RuntimeContext,
+    TimeBase, VideoFrame,
 };
 
 use crate::encoder::EncodeOptions;
@@ -56,7 +56,7 @@ impl From<IcerImage> for Frame {
 }
 
 /// Register the ICER decoder + encoder factories.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video(CODEC_ID_STR)
         .with_lossy(false)
         .with_intra_only(true);
@@ -66,6 +66,18 @@ pub fn register(reg: &mut CodecRegistry) {
             .decoder(make_decoder)
             .encoder(make_encoder),
     );
+}
+
+/// Unified registration entry point: install both the ICER codec
+/// factories and the `.icer` extension hint into a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that
+/// only need one of the two sub-registries can keep using
+/// [`register_codecs`] / [`register_containers`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 /// Register the `.icer` file extension so the container registry can
@@ -227,5 +239,20 @@ mod tests {
         assert_eq!(reg.container_for_extension("ICER"), Some("icer"));
         assert_eq!(reg.container_for_extension("Icer"), Some("icer"));
         assert_eq!(reg.container_for_extension("png"), None);
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("icer decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+        // The unified entry point also wires the .icer extension hint
+        // through the same call.
+        assert_eq!(ctx.containers.container_for_extension("icer"), Some("icer"),);
     }
 }
