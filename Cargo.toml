@@ -21,16 +21,10 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # `parse_icer_metadata` / `decode_icer_subbands` / `encode_icer` API
 # plus crate-local `IcerImage` / `IcerError` types using std primitives.
 oxideav-core = { version = "0.1", optional = true }
-# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
-# via the `oxideav_core::register!` macro. Tiny crate, no transitive
-# deps; works on every target including wasm. Optional + gated behind
-# the `registry` feature so standalone image-library callers don't pull
-# it in.
-linkme = { version = "0.3", optional = true }
 
 [features]
 default = ["registry"]
 # Wires up the `Decoder` / `Encoder` trait impls + the framework
 # `register()` entry point against `oxideav-core`. Default-on; turn
 # off for image-library use-cases that just want the standalone API.
-registry = ["dep:oxideav-core", "dep:linkme"]
+registry = ["dep:oxideav-core"]
