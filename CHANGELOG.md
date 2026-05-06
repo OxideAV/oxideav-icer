@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-icer/compare/v0.0.1...v0.0.2) - 2026-05-06
+
+### Other
+
+- rustfmt the `__oxideav_entry` re-export line
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+- icer round 4: quota-controlled encoding (with_byte_budget + with_target_bytes)
+- drop committed Cargo.lock + relax oxideav-core to "0.1"
+- roadmap — quota-controlled encoding + ICER 3D
+- bump oxideav-core 0.1.18 -> 0.1.21 for first_decoder
+- Round 3: filter G + real context tables + stripe scan + multi-packet ordering
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- bump oxideav-core 0.1.16 -> 0.1.18 for register! macro
+- Round 2: bit-plane scanner + compressed segments + multi-segment + float filters A-F
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-icer/pull/502))
+- add register_containers for .icer extension lookup
+- release v0.0.1
+
 ### Added
 
 - Round 4: quota-controlled encoding. `EncodeOptions` gains two new
