@@ -95,4 +95,6 @@ pub use image::{IcerImage, IcerPixelFormat, IcerPlane};
 
 // Registry-gated public surface.
 #[cfg(feature = "registry")]
-pub use registry::{__oxideav_entry, register, register_codecs, register_containers, IcerDecoder, IcerEncoder};
+pub use registry::{
+    __oxideav_entry, register, register_codecs, register_containers, IcerDecoder, IcerEncoder,
+};
