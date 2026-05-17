@@ -65,6 +65,23 @@ pub struct EncodeOptions {
     /// `None` (the default) falls back to the hard-cap behaviour (stop
     /// immediately after any packet that exceeds `byte_budget`).
     pub target_bytes: Option<u64>,
+    /// Automatic filter selection (round 5). When `true`, the encoder
+    /// runs [`crate::analyze::ImageStats::from_image`] over the input,
+    /// then either:
+    ///   * picks a filter via [`crate::analyze::recommend_filter`] (fast
+    ///     heuristic, single encode pass), or
+    ///   * if [`Self::auto_filter_rd`] is also `true`, runs the
+    ///     [`crate::analyze::pick_filter_by_rate_distortion`] trial
+    ///     loop (N encode passes, picks the smallest output).
+    ///
+    /// The explicitly-set [`Self::filter`] is **overridden** when this
+    /// flag is on. `false` (the default) keeps the existing behaviour:
+    /// the caller's chosen `filter` is used as-is.
+    pub auto_filter: bool,
+    /// When [`Self::auto_filter`] is on, this flag selects the
+    /// rate-distortion (true minimum-byte-count) variant over the cheap
+    /// heuristic. `false` (the default) uses the heuristic.
+    pub auto_filter_rd: bool,
 }
 
 impl Default for EncodeOptions {
@@ -83,6 +100,8 @@ impl Default for EncodeOptions {
             segment_count: 1,
             byte_budget: None,
             target_bytes: None,
+            auto_filter: false,
+            auto_filter_rd: false,
         }
     }
 }
@@ -114,6 +133,30 @@ impl EncodeOptions {
         self.target_bytes = Some(n);
         self
     }
+
+    /// Enable automatic filter selection using the cheap
+    /// [`crate::analyze::recommend_filter`] heuristic. Overrides any
+    /// previously-set `filter` value on the call to [`encode_icer`].
+    /// See [`EncodeOptions::auto_filter`].
+    #[must_use]
+    pub fn with_auto_filter(mut self) -> Self {
+        self.auto_filter = true;
+        self.auto_filter_rd = false;
+        self
+    }
+
+    /// Enable rate-distortion-driven automatic filter selection. The
+    /// encoder will trial-encode the image with each filter in
+    /// [`crate::analyze::DEFAULT_RD_CANDIDATES`] and use the one that
+    /// produces the smallest output. See
+    /// [`EncodeOptions::auto_filter_rd`]. Costs roughly N x a single
+    /// encode pass.
+    #[must_use]
+    pub fn with_auto_filter_rd(mut self) -> Self {
+        self.auto_filter = true;
+        self.auto_filter_rd = true;
+        self
+    }
 }
 
 /// Encode `image` into the on-the-wire ICER byte stream. Single or
@@ -131,6 +174,33 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     if w == 0 || h == 0 {
         return Err(IcerError::invalid("image has zero dimension"));
     }
+
+    // Round 5: automatic filter selection. Resolve the effective filter
+    // once at the top of encode, then proceed with a `resolved_opts`
+    // that has `auto_filter` cleared so downstream paths see a
+    // concrete filter id.
+    let resolved_opts = if opts.auto_filter && !opts.uncompressed {
+        let chosen = if opts.auto_filter_rd {
+            let (filter, _bytes) = crate::analyze::pick_filter_by_rate_distortion(
+                image,
+                opts,
+                crate::analyze::DEFAULT_RD_CANDIDATES,
+            )?;
+            filter
+        } else {
+            let stats = crate::analyze::ImageStats::from_image(image);
+            crate::analyze::recommend_filter(&stats)
+        };
+        EncodeOptions {
+            filter: chosen,
+            auto_filter: false,
+            auto_filter_rd: false,
+            ..*opts
+        }
+    } else {
+        *opts
+    };
+    let opts = &resolved_opts;
 
     let segment_count = opts.segment_count.max(1);
     let levels = opts.wavelet_levels.clamp(1, 6);

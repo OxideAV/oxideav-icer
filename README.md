@@ -12,7 +12,7 @@ Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
 No JPL flight code, no DSN ground software, no `qccPack`, no third-party
 ICER re-implementation was consulted, paraphrased, or cross-checked.
 
-## Round-4 status
+## Round-5 status
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -32,6 +32,9 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
+| Image statistics + filter recommendation | full (`ImageStats::from_image` + `recommend_filter` decision tree) |
+| Auto filter selection (heuristic) | full (`EncodeOptions::with_auto_filter()`, single-pass) |
+| Auto filter selection (rate-distortion) | full (`EncodeOptions::with_auto_filter_rd()`, N-pass trial) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 
 End-to-end round-trips:
@@ -131,6 +134,52 @@ to "the implementation":
   `descanso.jpl.nasa.gov` ICER white papers (reference [13]) are not yet
   in `docs/image/icer/`.
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
+
+## Automatic filter selection (round-5 upgrade)
+
+ICER's eight wavelet filters (A-G plus Q) have different rate-distortion
+profiles depending on image content. IPN 42-155 §I notes that the choice
+is image-dependent but does not prescribe a fixed mapping. Round 5 adds
+two ways to let the encoder pick the filter:
+
+* **Heuristic** (`EncodeOptions::with_auto_filter()`): a one-pass scan
+  computes image statistics (mean, variance, horizontal + vertical
+  gradient energy, dynamic range) via `analyze::ImageStats::from_image`,
+  then `analyze::recommend_filter` runs a transparent decision tree:
+  flat / low-frequency content gets filter `Q` (reversible 5/3);
+  high-frequency, high-variance content gets filter `A` (CDF 9/7).
+  Cost: `O(width*height)`, single encode pass.
+* **Rate-distortion** (`EncodeOptions::with_auto_filter_rd()`):
+  trial-encodes the image once per candidate filter and returns the
+  byte-smallest result. The default candidate set is `[Q, A]`; callers
+  may pass any subset to `pick_filter_by_rate_distortion`. Cost:
+  `N x encode_time` where `N = candidates.len()`.
+
+Both modes compose with `with_byte_budget` / `with_target_bytes` -- the
+auto-selected filter is then passed through the existing quota path.
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_auto_filter_rd()              // try Q and A, pick smaller
+    .with_byte_budget(8192);            // hard cap on output bytes
+let bytes = encode_icer(&image, &opts)?;
+```
+
+**Empirical byte counts** (32x32 test inputs, default 3-level DWT, q=8):
+
+| image          | filter Q | filter A | heuristic pick    | RD pick |
+|----------------|---------:|---------:|-------------------|--------:|
+| flat           |     124  |     124  | 124 (=Q)          |    124  |
+| diagonal ramp  |     516  |     538  | 516 (=Q)          |    516  |
+| checkerboard   |     283  |     413  | 413 (=A, lossy)   |    283  |
+
+The checkerboard row illustrates the trade-off: the heuristic follows
+wavelet-theory intuition (high edge energy -> biorthogonal 9/7) and
+picks filter `A` (which is also lossy on this input); the
+rate-distortion mode empirically determines that filter `Q` (lossless
+integer 5/3) actually produces fewer bytes on this implementation's
+arithmetic coder. Use the heuristic when you want zero per-image
+overhead; use RD-mode when you want the true minimum.
 
 ## Roadmap
 

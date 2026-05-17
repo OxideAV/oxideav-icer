@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 5: automatic wavelet-filter selection. New `analyze` module
+  exposes `ImageStats::from_image` (one-pass mean / variance /
+  horizontal + vertical gradient energy / dynamic range scan),
+  `recommend_filter` (transparent decision tree mapping stats to a
+  `WaveletFilter`), `pick_filter_by_rate_distortion` (trial-encode
+  each candidate, pick smallest), and the `DEFAULT_RD_CANDIDATES`
+  constant (currently `[Q, A]`). Also adds the `analyze` convenience
+  helper that returns both stats and recommendation.
+- New `EncodeOptions` fields + builders:
+  - `with_auto_filter()` -- enable heuristic selection.
+  - `with_auto_filter_rd()` -- enable rate-distortion-driven trial
+    selection.
+  Both override any explicitly-set `filter` value and compose with the
+  existing `with_byte_budget` / `with_target_bytes` quota options.
+- New integration test file `tests/auto_filter.rs` with 11 tests
+  covering: heuristic correctness on flat / smooth / high-frequency
+  inputs, override semantics over explicit filter, RD-mode picking
+  the byte-minimum candidate, RD interaction with byte budget,
+  determinism, edge cases (empty candidate slice).
+- 8 new unit tests in `src/analyze.rs` covering `ImageStats` extraction
+  + decision-tree branches.
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-icer/compare/v0.0.1...v0.0.2) - 2026-05-06
 
 ### Other

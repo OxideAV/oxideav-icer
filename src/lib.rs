@@ -3,7 +3,7 @@
 //! Rovers (Spirit, Opportunity), continued on Mars Science Laboratory
 //! (Curiosity), Mars 2020 (Perseverance), and follow-ons.
 //!
-//! Round-3 status:
+//! Round-5 status:
 //!
 //! * **Framing parser** -- segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
@@ -33,7 +33,15 @@
 //!   `segment_index` order.
 //! * **Encoder** -- emits the uncompressed path *and* the compressed
 //!   path (`EncodeOptions::compressed()`). Multi-segment encode via
-//!   `EncodeOptions::segment_count`. Self-roundtrips byte-exactly.
+//!   `EncodeOptions::segment_count`. Quota-controlled output via
+//!   `with_byte_budget` / `with_target_bytes`. Self-roundtrips
+//!   byte-exactly on filter Q.
+//! * **Automatic filter selection** (round 5) -- `with_auto_filter()`
+//!   runs a one-pass [`analyze::ImageStats`] scan and picks a filter
+//!   via the [`analyze::recommend_filter`] decision tree;
+//!   `with_auto_filter_rd()` trials every candidate filter and picks
+//!   the byte-smallest output via [`analyze::pick_filter_by_rate_distortion`].
+//!   Both compose with the quota options.
 //!
 //! ## Specification source
 //!
@@ -62,6 +70,7 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::manual_div_ceil)]
 
+pub mod analyze;
 pub mod arith;
 pub mod bitplane;
 pub mod context;
@@ -81,6 +90,10 @@ pub mod wavelet_float;
 pub const CODEC_ID_STR: &str = "icer";
 
 // Standalone public surface — works whether or not `registry` is on.
+pub use analyze::{
+    analyze, pick_filter_by_rate_distortion, recommend_filter, supported_for_analysis, ImageStats,
+    DEFAULT_RD_CANDIDATES,
+};
 pub use bitplane::EncodedPacket;
 pub use decoder::{
     decode_uncompressed_icer, parse_icer, parse_icer_metadata, IcerMetadata, SegmentMetadata,
