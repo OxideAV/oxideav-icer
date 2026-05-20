@@ -12,7 +12,7 @@ Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
 No JPL flight code, no DSN ground software, no `qccPack`, no third-party
 ICER re-implementation was consulted, paraphrased, or cross-checked.
 
-## Round-5 status
+## Round-6 status
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -30,11 +30,12 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
 | Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
-| Uncompressed-segment decode | full (IPN 42-155 §III.D) |
+| Uncompressed-segment decode | full (IPN 42-155 §III.D; placeholder-segment tolerant) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
 | Image statistics + filter recommendation | full (`ImageStats::from_image` + `recommend_filter` decision tree) |
 | Auto filter selection (heuristic) | full (`EncodeOptions::with_auto_filter()`, single-pass) |
 | Auto filter selection (rate-distortion) | full (`EncodeOptions::with_auto_filter_rd()`, N-pass trial) |
+| ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 
 End-to-end round-trips:
@@ -164,6 +165,62 @@ let opts = EncodeOptions::compressed()
     .with_byte_budget(8192);            // hard cap on output bytes
 let bytes = encode_icer(&image, &opts)?;
 ```
+
+## ROI segment prioritisation (round-6 upgrade)
+
+IPN 42-155 §III.E specifies that ICER's image partitioning (the
+`segment_count` row-strip split) gives the encoder freedom to
+*schedule* segments independently. The Mars rover deployments use this
+to save the centre of a Pancam frame -- where the science target sits
+-- ahead of the periphery (sky / rover hardware at the edges) when the
+downlink budget is tight.
+
+Round 6 surfaces that freedom as two new `EncodeOptions` builders:
+
+* **`with_segment_priorities(Vec<u16>)`** -- supply a per-segment
+  priority vector. Entry `prios[seg_idx] = rank` means segment
+  `seg_idx` is emitted in `rank`-ascending order on the wire (rank 0
+  first). The vector must be a permutation of `0..segment_count`.
+
+* **`with_center_roi()`** -- convenience builder that constructs a
+  centre-out permutation for the current `segment_count`: the middle
+  segment is rank 0, then alternating outward (mid-1, mid+1, mid-2,
+  mid+2, ...). For 5 segments the priority vector is `[3, 1, 0, 2,
+  4]`; for 4 segments it is `[1, 0, 2, 3]`.
+
+The on-the-wire byte stream contains every segment in priority order
+*plus* zero-body placeholder headers for any segment the byte budget
+forced the encoder to drop. The decoder (`parse_icer`) already sorts
+segments by `segment_index` before stitching, so the priority ordering
+is transparent on decode; dropped segments reconstruct as flat 128
+(level-shifted zero coefficients).
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_byte_budget(220)              // very tight budget
+    .with_center_roi();                 // centre-first emission
+let bytes = encode_icer(&image, &opts)?;
+// Decode: dropped strips materialise as flat 128, centre strips
+// keep their fidelity.
+let decoded = parse_icer(&bytes)?;
+```
+
+**Empirical measurement** (128-row image, 4 segments, 220-byte budget,
+centre + periphery mean-absolute error vs. original):
+
+| metric          | value |
+|-----------------|------:|
+| centre band MAE | 63.98 |
+| periphery MAE   | 84.00 |
+
+The centre strip's MAE is ~24% lower than the periphery's; under
+index-order emission the same budget would distribute the loss
+uniformly (or worse, drop the centre while saving the unimportant
+edges).
+
+The priority vector is validated at encode-time (length match,
+permutation property); a malformed vector returns
+`IcerError::Unsupported`.
 
 **Empirical byte counts** (32x32 test inputs, default 3-level DWT, q=8):
 

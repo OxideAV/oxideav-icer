@@ -215,7 +215,7 @@ pub fn pick_filter_by_rate_distortion(
     let mut best: Option<(WaveletFilter, usize)> = None;
     let mut last_err: Option<crate::error::IcerError> = None;
     for &candidate in candidates {
-        let mut trial_opts = *opts;
+        let mut trial_opts = opts.clone();
         trial_opts.filter = candidate;
         // Disable auto_filter on the trial pass so we don't recurse.
         trial_opts.auto_filter = false;

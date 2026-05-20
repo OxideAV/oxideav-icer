@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 6: ROI (region-of-interest) segment prioritisation per IPN
+  42-155 §III.E independent-segment scheduling. New `EncodeOptions`
+  field + builders:
+  - `segment_priorities: Option<Vec<u16>>` -- per-segment priority
+    vector. When `Some(v)`, segments are emitted on the wire in
+    `v[seg_idx]`-ascending order (rank 0 first).
+  - `with_segment_priorities(prios: Vec<u16>)` -- attach a priority
+    vector. Permutation validation happens at `encode_icer` time.
+  - `with_center_roi()` -- convenience that constructs a centre-out
+    permutation matching the current `segment_count` (Mars Pancam
+    use-case: science target at frame centre).
+- Combined with `with_byte_budget`, the centre-priority encode keeps
+  the highest-priority strips fully encoded while dropping
+  lower-priority strips when the budget runs out. Dropped strips
+  are emitted as zero-body placeholder segment headers (12 B each)
+  so the decoder knows the image height + reconstructs the missing
+  strip as flat 128 (level-shifted zero).
+- Decoder uncompressed-segment path now tolerates zero-packet
+  segments (round 4 already handled zero-packet compressed segments;
+  round 6 extends the same tolerance to uncompressed).
+- New integration test file `tests/roi_priority.rs` with 10 tests
+  covering: `with_center_roi` permutation correctness for various
+  segment counts; permuted emission round-tripping bit-exactly for
+  filter Q; on-the-wire ordering verification via metadata;
+  centre-priority under tight budget yielding lower centre-band MAE
+  than periphery MAE (measured 63.98 vs. 84.00 on a 128-row test
+  image at 220-byte budget); priority + uncompressed-path
+  composition; and rejection of malformed priority vectors (wrong
+  length / out-of-range entry / duplicate rank).
+- `EncodeOptions` is now `Clone` (no longer `Copy`) because of the
+  `Vec<u16>` priorities field. All call sites updated to use
+  `.clone()` instead of deref-copy.
+
+### Added (round 5)
+
 - Round 5: automatic wavelet-filter selection. New `analyze` module
   exposes `ImageStats::from_image` (one-pass mean / variance /
   horizontal + vertical gradient energy / dynamic range scan),

@@ -27,7 +27,11 @@ use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
 use crate::wavelet_float;
 
 /// Encoder options.
-#[derive(Debug, Clone, Copy)]
+///
+/// Note: this type is `Clone` (not `Copy`) because the
+/// [`Self::segment_priorities`] field carries an owned `Vec<u16>` when
+/// region-of-interest prioritisation is in use (round 6).
+#[derive(Debug, Clone)]
 pub struct EncodeOptions {
     pub sync_prefix: u16,
     pub filter: WaveletFilter,
@@ -82,6 +86,39 @@ pub struct EncodeOptions {
     /// rate-distortion (true minimum-byte-count) variant over the cheap
     /// heuristic. `false` (the default) uses the heuristic.
     pub auto_filter_rd: bool,
+    /// Region-of-interest (ROI) segment-priority vector (round 6).
+    ///
+    /// When `Some(v)`, multi-segment encoding (i.e. `segment_count >
+    /// 1`) walks segments in order of ascending priority value: rank
+    /// `0` is encoded first, rank `1` second, and so on. The vector
+    /// length must equal `segment_count` and the vector must be a
+    /// permutation of `0..segment_count` (each rank appears exactly
+    /// once).
+    ///
+    /// The output byte stream is the per-segment encoded blobs
+    /// concatenated **in priority order**, not in segment-index
+    /// order. The decoder (`parse_icer`) already sorts segments by
+    /// their on-the-wire `segment_index` field before stitching the
+    /// strips, so out-of-priority emission is transparent on the
+    /// decode side.
+    ///
+    /// When combined with [`Self::byte_budget`], the practical effect
+    /// is that the highest-priority segments are written to the
+    /// stream before the budget is exhausted, so the highest-priority
+    /// regions of the image keep their fidelity while the
+    /// lower-priority regions are truncated. This is the spaceflight
+    /// equivalent of JPEG 2000's ROI coding: Mars Pancam imagery
+    /// typically prioritises the centre of the frame (where the
+    /// science target sits) over the periphery (sky / rover hardware
+    /// at the edges).
+    ///
+    /// `None` (the default) keeps the existing behaviour: segments
+    /// are emitted in `segment_index` order.
+    ///
+    /// IPN 42-155 §III.E notes that the segment partitioning gives
+    /// the encoder the freedom to schedule segments independently;
+    /// this field is the realisation of that property.
+    pub segment_priorities: Option<Vec<u16>>,
 }
 
 impl Default for EncodeOptions {
@@ -102,6 +139,7 @@ impl Default for EncodeOptions {
             target_bytes: None,
             auto_filter: false,
             auto_filter_rd: false,
+            segment_priorities: None,
         }
     }
 }
@@ -157,6 +195,76 @@ impl EncodeOptions {
         self.auto_filter_rd = true;
         self
     }
+
+    /// Attach an ROI segment-priority vector (round 6). See
+    /// [`EncodeOptions::segment_priorities`] for the contract.
+    ///
+    /// The vector length must equal [`Self::segment_count`] and the
+    /// values must form a permutation of `0..segment_count`. Validation
+    /// happens at [`encode_icer`] time (so the builder remains
+    /// infallible); a malformed vector returns an
+    /// [`crate::error::IcerError::Unsupported`] error at encode.
+    #[must_use]
+    pub fn with_segment_priorities(mut self, priorities: Vec<u16>) -> Self {
+        self.segment_priorities = Some(priorities);
+        self
+    }
+
+    /// Convenience: assign segment priorities so the centre of the
+    /// image (in row order) is encoded first, and the top/bottom edges
+    /// last (round 6 ROI prioritisation).
+    ///
+    /// The mapping is:
+    ///
+    ///   * Segment `mid` (closest to the centre row) -> priority `0`.
+    ///   * Then alternating outward (mid-1, mid+1, mid-2, mid+2, ...)
+    ///     get priorities 1, 2, 3, ...
+    ///
+    /// For a segment_count of 5 the priority vector is `[3, 1, 0, 2,
+    /// 4]`; for 4 segments it is `[3, 1, 0, 2]` (the lower of the two
+    /// centre segments is selected as the absolute centre).
+    ///
+    /// Combined with [`Self::with_byte_budget`], this yields a
+    /// "save the centre first" emission order useful for Mars rover
+    /// Pancam imagery where the science target sits at the frame's
+    /// centre. `segment_count == 1` is a no-op; the priorities vector
+    /// is set to `[0]`.
+    #[must_use]
+    pub fn with_center_roi(mut self) -> Self {
+        let n = self.segment_count.max(1) as usize;
+        if n == 1 {
+            self.segment_priorities = Some(vec![0]);
+            return self;
+        }
+        let mid = (n - 1) / 2;
+        // priorities[seg_idx] = rank; rank starts at 0 for `mid`, then
+        // alternates outward (mid-1, mid+1, mid-2, mid+2, ...).
+        let mut priorities = vec![0u16; n];
+        let mut rank: u16 = 0;
+        priorities[mid] = rank;
+        rank = rank.saturating_add(1);
+        let mut step: isize = 1;
+        loop {
+            // Try mid - step.
+            let lo = mid as isize - step;
+            if lo >= 0 {
+                priorities[lo as usize] = rank;
+                rank = rank.saturating_add(1);
+            }
+            // Try mid + step.
+            let hi = mid as isize + step;
+            if (hi as usize) < n {
+                priorities[hi as usize] = rank;
+                rank = rank.saturating_add(1);
+            }
+            if (lo < 0) && ((hi as usize) >= n) {
+                break;
+            }
+            step += 1;
+        }
+        self.segment_priorities = Some(priorities);
+        self
+    }
 }
 
 /// Encode `image` into the on-the-wire ICER byte stream. Single or
@@ -195,10 +303,10 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
             filter: chosen,
             auto_filter: false,
             auto_filter_rd: false,
-            ..*opts
+            ..opts.clone()
         }
     } else {
-        *opts
+        opts.clone()
     };
     let opts = &resolved_opts;
 
@@ -219,15 +327,163 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
         )));
     }
 
+    // Compute the per-segment row offsets (in segment_index order).
+    let n_segs = segment_count as usize;
+    let mut starts_heights: Vec<(usize, usize)> = Vec::with_capacity(n_segs);
+    {
+        let mut y_cursor = 0usize;
+        while y_cursor < h {
+            let this_h = (h - y_cursor).min(strip_h);
+            starts_heights.push((y_cursor, this_h));
+            y_cursor += this_h;
+        }
+    }
+    if starts_heights.len() != n_segs {
+        return Err(IcerError::Unsupported(format!(
+            "segment_count {segment_count} would produce {} strips for height {h}",
+            starts_heights.len()
+        )));
+    }
+
+    // Round 6: build the emission order. By default it is
+    // 0..segment_count (segment_index order). When
+    // `opts.segment_priorities` is supplied the emission order is the
+    // permutation that lists segment indices in ascending rank.
+    let emission_order: Vec<u16> = match &opts.segment_priorities {
+        None => (0..segment_count).collect(),
+        Some(prios) => {
+            if prios.len() != n_segs {
+                return Err(IcerError::Unsupported(format!(
+                    "segment_priorities length {} != segment_count {}",
+                    prios.len(),
+                    segment_count
+                )));
+            }
+            // Validate that prios is a permutation of 0..n_segs.
+            let mut seen = vec![false; n_segs];
+            for &r in prios {
+                let r_us = r as usize;
+                if r_us >= n_segs {
+                    return Err(IcerError::Unsupported(format!(
+                        "segment_priorities entry {r} out of range 0..{n_segs}"
+                    )));
+                }
+                if seen[r_us] {
+                    return Err(IcerError::Unsupported(format!(
+                        "segment_priorities entry {r} appears more than once"
+                    )));
+                }
+                seen[r_us] = true;
+            }
+            // Invert: position_of_rank[rank] = segment_index that holds it.
+            let mut position_of_rank = vec![0u16; n_segs];
+            for (seg_idx, &rank) in prios.iter().enumerate() {
+                position_of_rank[rank as usize] = seg_idx as u16;
+            }
+            position_of_rank
+        }
+    };
+
+    // Round 6: when ROI priorities are in use AND we have a byte
+    // budget, the budgeting strategy is different:
+    //   * we encode each segment's *full* output into a per-segment
+    //     `Vec<u8>` first;
+    //   * then walk the emission order picking entire segments while
+    //     budget allows;
+    //   * for segments that don't fit, emit a 12-byte "placeholder
+    //     header" (segment_length = 0, no packets) so the decoder
+    //     can still account for the missing strip at the correct
+    //     y_offset.
+    //
+    // Without priorities (the legacy path) we keep the original
+    // index-order streaming behaviour, which also requires a
+    // contiguous segment_index sequence for the decoder.
     let mut out = Vec::new();
-    let mut y_cursor = 0usize;
-    let mut idx = 0u16;
-    while y_cursor < h {
-        let this_h = (h - y_cursor).min(strip_h);
-        let bytes = encode_one_segment(plane, w, y_cursor, this_h, idx, opts, levels)?;
-        out.extend_from_slice(&bytes);
-        y_cursor += this_h;
-        idx += 1;
+    let priorities_active = opts.segment_priorities.is_some();
+
+    if !priorities_active {
+        // Legacy path: encode + emit in index order, respect the budget
+        // strip-by-strip via per-segment budget propagation.
+        for &seg_idx in &emission_order {
+            let (y_start, this_h) = starts_heights[seg_idx as usize];
+
+            if let Some(budget) = opts.byte_budget {
+                if out.len() as u64 >= budget {
+                    break;
+                }
+            }
+            let inner_opts = if let Some(budget) = opts.byte_budget {
+                let remaining = budget.saturating_sub(out.len() as u64);
+                let mut o = opts.clone();
+                o.byte_budget = Some(remaining);
+                o
+            } else {
+                opts.clone()
+            };
+            let bytes =
+                encode_one_segment(plane, w, y_start, this_h, seg_idx, &inner_opts, levels)?;
+            if let Some(budget) = opts.byte_budget {
+                if out.len() as u64 + bytes.len() as u64 > budget {
+                    break;
+                }
+            }
+            out.extend_from_slice(&bytes);
+        }
+        return Ok(out);
+    }
+
+    // ROI-priority path. Encode all segments first, then schedule.
+    let mut encoded_segments: Vec<Vec<u8>> = Vec::with_capacity(n_segs);
+    for seg_idx in 0..n_segs {
+        let (y_start, this_h) = starts_heights[seg_idx];
+        let bytes = encode_one_segment(plane, w, y_start, this_h, seg_idx as u16, opts, levels)?;
+        encoded_segments.push(bytes);
+    }
+    // First pass: walk emission order, greedily include whole encoded
+    // segments while the budget allows.
+    let mut kept = vec![false; n_segs];
+    for &seg_idx in &emission_order {
+        let candidate_len = encoded_segments[seg_idx as usize].len() as u64;
+        if let Some(budget) = opts.byte_budget {
+            // Reserve 12 bytes for every later not-yet-kept segment so
+            // the placeholder headers fit. (Including the current
+            // segment in the not-yet-decided list.)
+            let not_decided = (0..n_segs)
+                .filter(|&i| !kept[i] && i != seg_idx as usize)
+                .count();
+            let reserve = (not_decided as u64) * (SegmentHeader::ENCODED_BYTES as u64);
+            if (out.len() as u64) + candidate_len + reserve > budget {
+                // Skip this segment; a 12-byte placeholder will be
+                // emitted at the end.
+                continue;
+            }
+        }
+        out.extend_from_slice(&encoded_segments[seg_idx as usize]);
+        kept[seg_idx as usize] = true;
+    }
+    // Second pass: emit placeholder headers for every segment that was
+    // skipped, in segment_index order. The header carries the strip's
+    // width + height so the decoder knows the row offset; segment_length
+    // is zero so no packets follow.
+    for (seg_idx, &was_kept) in kept.iter().enumerate() {
+        if was_kept {
+            continue;
+        }
+        let (_y_start, this_h) = starts_heights[seg_idx];
+        // A placeholder uses bit_plane_count=1 so the field validates,
+        // and the compressed flag matches the rest of the segments.
+        let placeholder = SegmentHeader {
+            sync_prefix: opts.sync_prefix,
+            filter: opts.filter,
+            decomp_levels: levels.clamp(1, 6),
+            uncompressed: opts.uncompressed,
+            width: w as u16,
+            height: this_h as u16,
+            bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+            segment_length: 0,
+            segment_index: seg_idx as u16,
+        };
+        out.extend_from_slice(&placeholder.encode());
     }
     Ok(out)
 }
@@ -426,7 +682,7 @@ fn encode_one_segment_compressed(
     // finish_segment's API assumes a single packet. For multi-packet
     // segments we embed all the packet headers+bodies directly into
     // `body` above, so we emit the SegmentHeader manually here.
-    let mut opts_copy = *opts;
+    let mut opts_copy = opts.clone();
     opts_copy.bit_plane_count = q;
     emit_segment_header_and_body(&body, segment_index, img_w, strip_h, &opts_copy, false)
 }

@@ -3,7 +3,7 @@
 //! Rovers (Spirit, Opportunity), continued on Mars Science Laboratory
 //! (Curiosity), Mars 2020 (Perseverance), and follow-ons.
 //!
-//! Round-5 status:
+//! Round-6 status:
 //!
 //! * **Framing parser** -- segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
@@ -42,6 +42,14 @@
 //!   `with_auto_filter_rd()` trials every candidate filter and picks
 //!   the byte-smallest output via [`analyze::pick_filter_by_rate_distortion`].
 //!   Both compose with the quota options.
+//! * **ROI segment prioritisation** (round 6) --
+//!   `with_segment_priorities(Vec<u16>)` attaches a per-segment priority
+//!   permutation; `with_center_roi()` builds a centre-out priority
+//!   permutation for the current `segment_count`. Combined with
+//!   `with_byte_budget`, high-priority strips keep full fidelity while
+//!   low-priority strips can be dropped to zero-body placeholders. The
+//!   decoder reconstructs dropped strips as flat 128 (IPN 42-155
+//!   §III.E independent-segment scheduling).
 //!
 //! ## Specification source
 //!

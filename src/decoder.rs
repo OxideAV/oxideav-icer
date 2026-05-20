@@ -133,6 +133,17 @@ fn decode_segment_into(
 ) -> Result<()> {
     let strip_h = walked.header.height as usize;
     if walked.header.uncompressed {
+        // A zero-packet (or zero-body) uncompressed segment is a
+        // ROI-priority placeholder (round 6): no pixel data shipped,
+        // strip is reconstructed as all-128 (level-shifted zero).
+        if walked.packets.is_empty() {
+            for y in 0..strip_h {
+                let dst = &mut plane.data[(y_offset + y) * plane.stride
+                    ..(y_offset + y) * plane.stride + canonical_width];
+                dst.fill(128);
+            }
+            return Ok(());
+        }
         // Concatenate every packet body, then copy at most w*h bytes.
         let mut concat: Vec<u8> = Vec::with_capacity(canonical_width * strip_h);
         for p in &walked.packets {
