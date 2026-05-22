@@ -195,6 +195,8 @@ fn decode_compressed_segment_into(
                 bit_plane: wp.header.bit_plane,
                 is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
                 body: wp.body.to_vec(),
+                // Decoder side does not need the R-D estimate; default to 0.0.
+                delta_distortion: 0.0,
             })
             .collect();
         decode_bitplanes_multi(&encoded_packets, width, height, q)?

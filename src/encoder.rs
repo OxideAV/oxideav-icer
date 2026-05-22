@@ -20,7 +20,7 @@
 //!   * **Filter G** -- Le Gall 5/3 float variant; wired through both
 //!     encode and decode dispatch paths.
 
-use crate::bitplane::{encode_bitplanes, select_bit_plane_count, BitPlaneInput};
+use crate::bitplane::{encode_bitplanes, select_bit_plane_count, BitPlaneInput, EncodedPacket};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
@@ -119,6 +119,37 @@ pub struct EncodeOptions {
     /// the encoder the freedom to schedule segments independently;
     /// this field is the realisation of that property.
     pub segment_priorities: Option<Vec<u16>>,
+    /// Rate-distortion (R-D) budget pruning (round 91, IPN 42-155
+    /// §IV.B rate-allocation principle).
+    ///
+    /// When `true` AND [`Self::byte_budget`] is set AND the
+    /// compressed-path is in use, the compressed-segment encoder
+    /// no longer truncates packets in strict MSB-down emission
+    /// order. Instead it:
+    ///
+    /// 1. Encodes every `(bit-plane, pass)` packet into a candidate
+    ///    list with its byte size and per-packet distortion-reduction
+    ///    estimate (see [`crate::bitplane::EncodedPacket::delta_distortion`]).
+    /// 2. Greedily includes packets in descending `delta_distortion /
+    ///    byte_size` order (cost-per-byte ranking), subject to the
+    ///    decoding-dependency graph: significance at bit-plane `bp`
+    ///    requires significance at every higher bit-plane (MSB-down
+    ///    chain); refinement at `bp` requires significance at `bp`.
+    /// 3. Re-serialises the chosen subset in MSB-down on-the-wire order
+    ///    (the decoder expects that ordering — only the *set* of
+    ///    included packets changes, not the ordering of those that are
+    ///    kept).
+    ///
+    /// In practice this typically drops the lowest-bit-plane
+    /// refinement packets (low ΔD-per-byte) in favour of including
+    /// more significance packets in the budget, yielding higher PSNR
+    /// for the same byte budget than the strict-MSB-truncation
+    /// behaviour.
+    ///
+    /// `false` (the default) preserves the prior behaviour: packets
+    /// are emitted MSB-down sig-before-ref, truncated at the first
+    /// packet that would overflow `byte_budget`.
+    pub rd_pruning: bool,
 }
 
 impl Default for EncodeOptions {
@@ -140,6 +171,7 @@ impl Default for EncodeOptions {
             auto_filter: false,
             auto_filter_rd: false,
             segment_priorities: None,
+            rd_pruning: false,
         }
     }
 }
@@ -160,6 +192,29 @@ impl EncodeOptions {
     #[must_use]
     pub fn with_byte_budget(mut self, n: u64) -> Self {
         self.byte_budget = Some(n);
+        self
+    }
+
+    /// Set a hard byte budget AND enable rate-distortion-driven packet
+    /// selection (round 91, IPN 42-155 §IV.B). See
+    /// [`EncodeOptions::rd_pruning`] for the full contract. The encoder
+    /// will:
+    ///
+    /// * Compute every candidate `(bit-plane, pass)` packet up-front.
+    /// * Rank them by `delta_distortion / byte_size` (cost-per-byte).
+    /// * Greedily include packets in descending score order, subject to
+    ///   the MSB-down dependency graph.
+    /// * Emit the kept subset in MSB-down on-the-wire order.
+    ///
+    /// Equivalent to `.with_byte_budget(n)` followed by manually
+    /// setting `rd_pruning = true`. Combined with `with_target_bytes`
+    /// the soft-target stop is **disabled** (the R-D selection scans
+    /// the full packet list and the hard cap is honoured by the
+    /// greedy stage).
+    #[must_use]
+    pub fn with_rd_budget(mut self, n: u64) -> Self {
+        self.byte_budget = Some(n);
+        self.rd_pruning = true;
         self
     }
 
@@ -576,6 +631,20 @@ fn encode_one_segment_compressed(
         q,
     })?;
 
+    // Round 91: rate-distortion-driven packet selection (IPN 42-155
+    // §IV.B rate-allocation principle). When enabled, the packet
+    // *set* is chosen by greedy ΔD/byte ranking before serialisation,
+    // rather than walked MSB-down with a strict truncation cut-off.
+    // See `select_packets_by_rd` below for the algorithm.
+    let kept_mask: Option<Vec<bool>> = match (opts.rd_pruning, opts.byte_budget) {
+        (true, Some(budget)) => {
+            let seg_hdr_bytes = SegmentHeader::ENCODED_BYTES as u64;
+            let body_budget = budget.saturating_sub(seg_hdr_bytes);
+            Some(select_packets_by_rd(&packets, q, body_budget))
+        }
+        _ => None,
+    };
+
     // Quota-controlled serialisation: walk packets in priority order
     // (MSB-down, significance before refinement per §IV), stopping
     // when the byte budget / soft target is exceeded.
@@ -616,13 +685,25 @@ fn encode_one_segment_compressed(
         }
 
         for &is_sig in &[true, false] {
-            let pkt = packets
+            let pkt_index = packets
                 .iter()
-                .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig);
-            let pkt = match pkt {
-                Some(p) => p,
+                .position(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig);
+            let pkt_index = match pkt_index {
+                Some(i) => i,
                 None => continue,
             };
+            let pkt = &packets[pkt_index];
+
+            // Round 91: R-D pruning -- skip packets the greedy
+            // ΔD/byte selector did not pick. Skipping is safe because
+            // the dependency graph (sig(bp) depends on sig(bp-1);
+            // ref(bp) depends on sig(bp)) was enforced inside the
+            // selector.
+            if let Some(mask) = &kept_mask {
+                if !mask[pkt_index] {
+                    continue;
+                }
+            }
 
             // Guard against individual packet body overflowing u16.
             if pkt.body.len() > u16::MAX as usize {
@@ -638,8 +719,18 @@ fn encode_one_segment_compressed(
 
             // Hard cap check: if adding this packet would exceed the
             // budget, stop immediately (do not emit the packet).
+            // (When the R-D selector is in use it has already enforced
+            // the budget; this check remains as a defensive belt &
+            // braces.)
             if let Some(budget) = opts.byte_budget {
                 if new_total > budget {
+                    if kept_mask.is_some() {
+                        // R-D mode: selector should have prevented this,
+                        // but guard against floating-point or off-by-one
+                        // corner cases by simply skipping this packet
+                        // (do not break, later packets may still fit).
+                        continue;
+                    }
                     break 'bp_loop;
                 }
             }
@@ -718,6 +809,164 @@ fn emit_segment_header_and_body(
     out.extend_from_slice(&segment.encode());
     out.extend_from_slice(body);
     Ok(out)
+}
+
+/// Rate-distortion packet selector (round 91, IPN 42-155 §IV.B
+/// rate-allocation principle).
+///
+/// Returns a mask `kept[i] = true` for every packet in `packets` that
+/// should be emitted, given the body byte budget `body_budget` (the
+/// budget the body has after the segment-header overhead is
+/// subtracted) and the bit-plane count `q`.
+///
+/// ICER's per-packet dependency graph is a CHAIN: a significance
+/// packet at bit-plane index `bp` requires the significance packets
+/// at every higher-priority bit-plane (`0..bp`) to have been decoded
+/// first, otherwise the decoder's per-stripe iteration order drifts
+/// from the encoder's. Refinement packets at `bp` similarly require
+/// the full sig chain up to and including `bp` so the
+/// significant-coefficient set in the decoder matches the encoder's
+/// at refinement-decode time.
+///
+/// Given that chain, the optimisation reduces to two coupled
+/// decisions:
+///
+///   1. **Truncation depth K**: the highest bit-plane index whose
+///      significance packet is included. Sig packets `0..=K` are
+///      mandatory (skipping any would desync the decoder for every
+///      packet at higher bp).
+///   2. **Refinement subset**: among the refinement packets at
+///      `bp_idx ∈ 0..=K` (those whose sig prerequisites are present),
+///      which ones to include given the remaining byte budget.
+///
+/// Algorithm: for every candidate depth `K ∈ 0..q`, compute the cost
+/// of the mandatory sig chain `0..=K` and the residual budget
+/// `body_budget - mandatory_cost`. If the residual is non-negative,
+/// greedily fill it with the highest ΔD-per-byte refinement packets
+/// from `bp_idx ∈ 0..=K`, sorted by score descending (with a packet-
+/// index tie-break for determinism). The total `delta_distortion`
+/// collected at this depth is the sig chain's distortion plus the
+/// chosen refinements'.
+///
+/// The depth K that yields the highest total ΔD becomes the chosen
+/// plan; its mask is returned. Ties in total ΔD are broken in favour
+/// of the SHALLOWER depth (less bytes), keeping the output minimum-
+/// size at equal quality.
+///
+/// Complexity: O(q² + q log q) per call. For ICER segments q ≤ 31
+/// this is essentially constant.
+fn select_packets_by_rd(packets: &[EncodedPacket], q: u8, body_budget: u64) -> Vec<bool> {
+    let n = packets.len();
+    let q_usize = q as usize;
+    if n == 0 || body_budget == 0 {
+        return vec![false; n];
+    }
+
+    // Per-packet wire size (PacketHeader::ENCODED_BYTES + body bytes).
+    let wire_sizes: Vec<u64> = packets
+        .iter()
+        .map(|p| PacketHeader::ENCODED_BYTES as u64 + p.body.len() as u64)
+        .collect();
+
+    // Index lookup: sig_idx[bp] = index in `packets` of the sig packet
+    // for bit-plane index bp (or None if absent).
+    let mut sig_idx: Vec<Option<usize>> = vec![None; q_usize];
+    let mut ref_idx: Vec<Option<usize>> = vec![None; q_usize];
+    for (i, p) in packets.iter().enumerate() {
+        let bp = p.bit_plane as usize;
+        if bp >= q_usize {
+            continue;
+        }
+        if p.is_significance {
+            sig_idx[bp] = Some(i);
+        } else {
+            ref_idx[bp] = Some(i);
+        }
+    }
+
+    let mut best_mask = vec![false; n];
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_bytes = u64::MAX;
+
+    // Depth K = -1 (empty plan, zero distortion). Always a candidate
+    // (handles the body_budget-too-small-for-any-sig case).
+    if 0.0 > best_score {
+        best_score = 0.0;
+        best_bytes = 0;
+    }
+
+    // Try every depth K from 0..q (inclusive of the deepest possible
+    // sig). For each, compute the mandatory sig-chain cost.
+    let mut mandatory_cost: u64 = 0;
+    for k in 0..q_usize {
+        let s_idx = match sig_idx[k] {
+            Some(i) => i,
+            None => break, // chain breaks here; can't go deeper
+        };
+        let s_cost = wire_sizes[s_idx];
+        if mandatory_cost + s_cost > body_budget {
+            // Sig chain `0..=K` doesn't fit. Deeper K won't fit either.
+            break;
+        }
+        mandatory_cost += s_cost;
+        let mut plan_mask = vec![false; n];
+        let mut plan_score = 0.0f64;
+        for j in 0..=k {
+            if let Some(i) = sig_idx[j] {
+                plan_mask[i] = true;
+                plan_score += packets[i].delta_distortion;
+            }
+        }
+        let mut plan_bytes = mandatory_cost;
+
+        // Refinement candidates: ref(bp) for bp ∈ 0..=K, sorted by
+        // ΔD/byte descending, packet-index tie-break.
+        let mut ref_candidates: Vec<usize> = (0..=k).filter_map(|bp| ref_idx[bp]).collect();
+        ref_candidates.sort_by(|&a, &b| {
+            let sa = if wire_sizes[a] == 0 {
+                0.0
+            } else {
+                packets[a].delta_distortion / wire_sizes[a] as f64
+            };
+            let sb = if wire_sizes[b] == 0 {
+                0.0
+            } else {
+                packets[b].delta_distortion / wire_sizes[b] as f64
+            };
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+
+        // Greedy fill.
+        for ri in ref_candidates {
+            let w = wire_sizes[ri];
+            if plan_bytes + w > body_budget {
+                continue;
+            }
+            // Skip if it contributes nothing (don't waste bytes on
+            // zero-ΔD refinements when other options exist; harmless
+            // when none do).
+            if packets[ri].delta_distortion <= 0.0 {
+                continue;
+            }
+            plan_mask[ri] = true;
+            plan_bytes += w;
+            plan_score += packets[ri].delta_distortion;
+        }
+
+        // Pick the plan with the highest score; tie-break on smaller
+        // bytes (so we don't bloat output with no quality gain).
+        let better =
+            plan_score > best_score || (plan_score == best_score && plan_bytes < best_bytes);
+        if better {
+            best_score = plan_score;
+            best_bytes = plan_bytes;
+            best_mask = plan_mask;
+        }
+    }
+
+    best_mask
 }
 
 #[allow(clippy::too_many_arguments)]

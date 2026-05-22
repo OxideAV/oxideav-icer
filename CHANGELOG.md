@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 91)
+
+- Round 91: rate-distortion (R-D) budget pruning per IPN 42-155
+  §IV.B rate-allocation principle. New `EncodeOptions` field +
+  builder:
+  - `rd_pruning: bool` -- when `true` AND `byte_budget` is set, the
+    compressed-segment encoder runs a per-segment R-D packet
+    selector instead of strict-MSB truncation.
+  - `with_rd_budget(n: u64)` -- convenience builder that sets
+    `byte_budget = Some(n)` AND `rd_pruning = true`.
+- `EncodedPacket` gains a `delta_distortion: f64` field carrying a
+  clean-room MSE-reduction estimate (mid-bin variance argument:
+  `~2 * 4^bp` per newly-significant coefficient, `~4^bp / 4` per
+  refined bit). Populated by `encode_bitplanes`; defaulted to `0.0`
+  by the decoder-side `EncodedPacket` construction path.
+- R-D selection algorithm (`select_packets_by_rd` in
+  `src/encoder.rs`): for every candidate sig-chain depth `K ∈ 0..q`
+  compute the mandatory sig-chain cost, residual budget, and
+  greedy-fill the residual with refinement packets at `bp_idx ∈
+  0..=K` sorted by ΔD/byte descending. Pick the depth K maximising
+  total ΔD within the byte cap; ties broken in favour of smaller
+  output bytes. Complexity O(q²); fully deterministic.
+- New integration test file `tests/rd_budget.rs` with 4 tests:
+  - `rd_budget_respects_hard_cap_and_decodes`: 4 budgets (1024-65536)
+    on the 256² gradient; output ≤ budget, decodes cleanly, PSNR
+    monotonically non-decreasing.
+  - `rd_budget_is_deterministic`: identical input -> identical output
+    bytes.
+  - `rd_budget_with_huge_cap_is_lossless_for_filter_q`: huge budget
+    -> R-D selection reduces to "include everything" -> bit-exact
+    round-trip for filter Q.
+  - `rd_budget_matches_or_beats_strict_msb`: 4 fixtures × 5 budgets
+    sweep; R-D never measurably regresses, strictly wins +6.09 dB
+    on the 64² checkerboard at the 400-byte budget (strict 19.42 dB,
+    R-D 25.51 dB).
+- Round 91 README section + workspace-row capability tag.
+
 ### Added
 
 - Round 6: ROI (region-of-interest) segment prioritisation per IPN

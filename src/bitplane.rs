@@ -101,6 +101,39 @@ pub struct EncodedPacket {
     pub is_significance: bool,
     /// Entropy-coded body bytes.
     pub body: Vec<u8>,
+    /// Distortion-reduction estimate (round-91 rate-distortion budget
+    /// pruning, IPN 42-155 §IV.B rate-allocation principle).
+    ///
+    /// Computed during encoding as the per-packet contribution to the
+    /// mean-squared-error reduction the decoder gains when this packet
+    /// is included. Units are square-of-coefficient-units (i.e. the
+    /// reduction in `sum (coeff - reconstructed_coeff)^2` summed over
+    /// every coefficient touched in this packet).
+    ///
+    /// Model (clean-room from first principles, no IPN reference table):
+    ///
+    /// * **Significance pass** at bit-plane `bp`: every coefficient that
+    ///   becomes significant in this packet transitions its
+    ///   reconstruction from `0` to the mid-point of `[2^bp,
+    ///   2^(bp+1))`, i.e. `1.5 * 2^bp` in magnitude. The expected MSE
+    ///   reduction per newly-significant coefficient is `(1.5 *
+    ///   2^bp)^2 - (2^bp)^2 / 12` ≈ `2.17 * 4^bp` (the first term is
+    ///   the squared distance the reconstruction moves; the second is
+    ///   the residual quantisation variance over the
+    ///   bin). Approximated here as `2 * 4^bp` per coefficient.
+    /// * **Refinement pass** at bit-plane `bp`: each refined coefficient
+    ///   halves its quantisation-bin width from `2^(bp+1)` to `2^bp`,
+    ///   reducing the per-coefficient MSE by `3 * 4^bp / 12 = 4^bp /
+    ///   4`. We approximate as `4^bp / 4` per refined bit.
+    ///
+    /// Together with `body.len()`, the
+    /// [`crate::encoder::EncodeOptions::with_rd_budget`] path computes
+    /// `delta_distortion / body.len()` as the cost-per-byte score and
+    /// greedily includes packets in descending score order, subject to
+    /// the MSB-down decoding dependency graph (significance at bit-plane
+    /// `bp` requires significance at all higher bit-planes; refinement
+    /// at `bp` requires significance at `bp`).
+    pub delta_distortion: f64,
 }
 
 /// Encode a coefficient buffer into per-bit-plane, per-pass packets
@@ -121,10 +154,12 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
 
     for bp_idx in 0..q {
         let bp = q - 1 - bp_idx; // Process MSB first: bp = q-1 down to 0.
+        let bp_weight = 4f64.powi(bp as i32);
 
         // --- Significance + sign pass (fresh coder, stripe order) ---
         let mut sig_model = ContextModel::new();
         let mut sig_enc = ArithEncoder::new();
+        let sig_before = significant.iter().filter(|&&s| s).count();
 
         encode_significance_pass(
             &mut sig_enc,
@@ -137,15 +172,32 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
             bp,
         );
 
+        let sig_after = significant.iter().filter(|&&s| s).count();
+        let newly_sig = sig_after.saturating_sub(sig_before);
+        // Distortion-reduction model: each newly-significant coefficient
+        // moves reconstruction from 0 to mid-bin `1.5 * 2^bp`; per-coef
+        // MSE drop ≈ 2.17 * 4^bp (see EncodedPacket::delta_distortion
+        // docstring). We approximate by `2.0 * 4^bp`. Round-91 R-D
+        // pruning per IPN 42-155 §IV.B rate-allocation principle.
+        let sig_dist = (newly_sig as f64) * 2.0 * bp_weight;
+
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
             is_significance: true,
             body: sig_enc.finish(),
+            delta_distortion: sig_dist,
         });
 
         // --- Refinement pass (fresh coder, stripe order) ---
         let mut ref_model = ContextModel::new();
         let mut ref_enc = ArithEncoder::new();
+        let refined_count = count_refinement_coefficients(
+            input.coeffs,
+            &significant,
+            input.width,
+            input.height,
+            bp,
+        );
 
         encode_refinement_pass(
             &mut ref_enc,
@@ -157,14 +209,51 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
             bp,
         );
 
+        // Distortion-reduction model: each refined coefficient halves
+        // its quantisation bin, dropping per-coef MSE by `4^bp / 4`.
+        let ref_dist = (refined_count as f64) * 0.25 * bp_weight;
+
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
             is_significance: false,
             body: ref_enc.finish(),
+            delta_distortion: ref_dist,
         });
     }
 
     Ok(packets)
+}
+
+/// Count the coefficients that will be visited by the refinement pass at
+/// bit-plane `bp` (round 91 helper for the R-D distortion estimate).
+/// Matches the iteration inside [`encode_refinement_pass`] exactly.
+fn count_refinement_coefficients(
+    coeffs: &[i32],
+    significant: &[bool],
+    width: usize,
+    height: usize,
+    bp: usize,
+) -> usize {
+    let mut count = 0usize;
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
+            for x in 0..width {
+                let i = y * width + x;
+                if !significant[i] {
+                    continue;
+                }
+                let m = coeffs[i].unsigned_abs();
+                if highest_set_bit(m) == Some(bp as u32) {
+                    continue;
+                }
+                count += 1;
+            }
+        }
+        stripe_start += STRIPE_HEIGHT;
+    }
+    count
 }
 
 /// Decode coefficient buffer from per-bit-plane packets produced by

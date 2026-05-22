@@ -36,6 +36,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Auto filter selection (heuristic) | full (`EncodeOptions::with_auto_filter()`, single-pass) |
 | Auto filter selection (rate-distortion) | full (`EncodeOptions::with_auto_filter_rd()`, N-pass trial) |
 | ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
+| R-D budget pruning | full (round 91; `EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 
 End-to-end round-trips:
@@ -237,6 +238,76 @@ rate-distortion mode empirically determines that filter `Q` (lossless
 integer 5/3) actually produces fewer bytes on this implementation's
 arithmetic coder. Use the heuristic when you want zero per-image
 overhead; use RD-mode when you want the true minimum.
+
+## Rate-distortion budget pruning (round-91 upgrade)
+
+The round-4 quota-controlled encoder truncates packets in strict
+MSB-down emission order: it emits sig(0), ref(0), sig(1), ref(1),
+... and stops the moment the next packet would exceed the byte cap.
+That semantic is byte-honest but R-D-suboptimal: the truncation cut
+often falls on a refinement packet whose distortion-reduction-per-
+byte is poor compared to *other* packets later in the chain that
+would have fit individually but for the budget being already spent.
+
+Round 91 adds a true rate-distortion (R-D) packet selector
+(`EncodeOptions::with_rd_budget(n)`) per IPN 42-155 §IV.B
+rate-allocation principle. The selector:
+
+1. Encodes every `(bit-plane, pass)` packet in one shot, recording
+   each packet's `delta_distortion` -- a clean-room MSE-reduction
+   estimate (mid-bin variance argument; `~2 * 4^bp` per
+   newly-significant coefficient, `~4^bp / 4` per refined bit).
+2. For every candidate sig-chain depth K (0..q), computes the
+   mandatory cost of `sig(0..=K)` and the residual budget.
+3. Greedily fills the residual with refinement packets at bit-plane
+   indices `0..=K`, sorted by `delta_distortion / wire_size`
+   descending.
+4. Picks the depth K (and its refinement subset) that maximises
+   total distortion-reduction within the byte cap; ties broken in
+   favour of smaller output bytes.
+
+The selector enforces ICER's MSB-down decode dependency (sig at
+bp_idx N requires sig at every higher-priority bp_idx; ref at N
+requires the full sig chain up to N) so the kept subset always
+decodes correctly. The output is emitted in MSB-down on-the-wire
+order -- only the *set* of included packets changes vs. the strict
+mode, not the ordering of those kept.
+
+**Empirical wins** (single-segment compressed encode, filter Q,
+64×64 fixtures, 400-byte budget):
+
+| fixture        | strict-MSB byte_budget | R-D budget | strict PSNR | R-D PSNR |
+|----------------|-----------------------:|-----------:|------------:|---------:|
+| checkerboard   | 355 B / 19.42 dB       | 396 B      |    19.42 dB | **25.51 dB** |
+| sparse impulse | 398 B / 29.93 dB       | 393 B      |    29.93 dB |    29.93 dB |
+| 256² gradient  | 300 B / 10.78 dB       | 295 B      |    10.78 dB |    10.78 dB |
+
+The +6.09 dB checkerboard win comes from the selector recognising
+that the bit-plane-1 refinement packet (25 body bytes, ΔD ~4.2 M)
+is worth more per byte than the bit-plane-3 refinement packet
+(42 body bytes, ΔD ~459 k) the strict-MSB cut-off was forced to
+spend the trailing bytes on. R-D drops the heavy low-priority
+refinement and reallocates the bytes to the higher-priority one.
+
+For monotonically-ordered images (smooth gradients, natural
+textures) the R-D selector converges to strict-MSB plus trims the
+tail of zero-ΔD packets (5-bytes-per-packet savings only). R-D
+never regresses PSNR vs strict; the headline gains are on
+high-frequency content where the natural MSB-down order is
+score-non-monotonic.
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_rd_budget(400);                // hard cap + R-D selection
+let bytes = encode_icer(&image, &opts)?;
+assert!(bytes.len() <= 400);
+```
+
+The R-D mode composes with `with_auto_filter` and
+`with_segment_priorities`; the R-D selection runs *inside*
+`encode_one_segment_compressed`, after the wavelet transform and
+bit-plane encode, so per-segment dependencies are honoured
+naturally.
 
 ## Roadmap
 
