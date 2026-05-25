@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-icer/compare/v0.0.2...v0.0.3) - 2026-05-25
+
+### Other
+
+- cargo-fuzz harness for decode-side liveness
+- Round 91: rate-distortion budget pruning (IPN 42-155 §IV.B)
+- Round 6: ROI segment prioritisation (IPN 42-155 §III.E)
+- Round 5: automatic wavelet-filter selection
+
 ### Added (round 131)
 
 - Cargo-fuzz harness under `fuzz/` (single binary
