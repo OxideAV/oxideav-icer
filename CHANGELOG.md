@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 131)
+
+- Cargo-fuzz harness under `fuzz/` (single binary
+  `decode_segment`). The target drives arbitrary fuzz-supplied
+  bytes through three decode-side entry points in a single call:
+  `header::walk_segment` (12-byte segment header + variable
+  packet-header list, IPN 42-155 §IV), `parse_icer_metadata`
+  (multi-segment cursor walk), and `parse_icer` (full pixel
+  decode — binary arithmetic coder + stripe-ordered bit-plane
+  scanner + inverse 5/3 integer or float A–G wavelet + multi-
+  segment vertical stitch). The contract under test is liveness:
+  every call must return a `Result`, never panic / abort /
+  integer-overflow / OOM.
+- Seed corpus under `fuzz/corpus/decode_segment/` populated by
+  the encoder's own surface (no third-party reference codec used,
+  clean-room wall respected): five small ICER streams covering
+  the uncompressed (§III.D) path on a 16×12 ramp and the
+  compressed path on 16×12 ramp / 32×32 flat / 32×32 ramp / a
+  two-segment 32×16 ramp.
+- `.github/workflows/fuzz.yml` shim around the OxideAV org-level
+  reusable `crate-fuzz.yml` workflow. Daily 07:44 UTC cron run,
+  full 30-minute budget on the single target.
+- Baseline pinned at zero crashes after a 60-second local fuzz
+  session (11 429 iterations, 246 corpus growth before pruning
+  back to the curated 5 seeds; `fuzz/artifacts/decode_segment/`
+  empty).
+
 ### Added (round 91)
 
 - Round 91: rate-distortion (R-D) budget pruning per IPN 42-155

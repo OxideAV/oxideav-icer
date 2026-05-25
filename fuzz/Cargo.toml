@@ -1,0 +1,40 @@
+[package]
+name = "oxideav-icer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# ICER's decode-side attack surface is the 12-byte segment header +
+# multi-packet framing walk (`walk_segment`), the metadata enumerator
+# (`parse_icer_metadata`), and the full pixel decoder (`parse_icer`)
+# that drives the binary arithmetic coder and the integer/float
+# inverse wavelet transform. All three are reachable from arbitrary
+# bytes and must never panic / abort / integer-overflow (in a debug
+# build) / index out of bounds / OOM. This fuzz crate is decode-only:
+# there is no external reference codec to cross-decode against (the
+# clean-room wall bars JPL DSN ground software, MSL flight code, and
+# qccPack), so the contract under test is purely liveness — a
+# malformed stream yields `Err(IcerError::…)`, a well-formed one
+# yields `Ok`, and neither path may crash.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-icer]
+path = ".."
+default-features = false
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_segment"
+path = "fuzz_targets/decode_segment.rs"
+test = false
+doc = false

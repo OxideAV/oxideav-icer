@@ -1,0 +1,26 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. ICER's
+# decode-side attack surface is the 12-byte segment header + multi-
+# packet framing walk (`walk_segment`), the multi-segment metadata
+# enumerator (`parse_icer_metadata`), and the full pixel decoder
+# (`parse_icer`) which drives the binary arithmetic coder + the
+# inverse 5/3 integer or float A–G wavelet transform.
+#
+# There is no external reference codec to cross-decode against — the
+# clean-room wall bars JPL DSN ground software, MSL flight code, and
+# qccPack. The harness is decode-only liveness: malformed input must
+# always yield `Err(IcerError::…)` rather than panic / abort / OOM.
+# One target gets the whole 30-minute budget.
+
+on:
+  schedule:
+    - cron: "44 7 * * *"   # daily 07:44 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit
