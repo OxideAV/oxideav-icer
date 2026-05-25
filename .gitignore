@@ -1,1 +1,4 @@
-Cargo.lock
+# Anchor to the crate root so the library's lockfile stays untracked
+# but `fuzz/Cargo.lock` (conventional for a cargo-fuzz crate, which is
+# a separate non-published binary workspace member) can be committed.
+/Cargo.lock

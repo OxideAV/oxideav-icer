@@ -1,0 +1,21 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. ICER's wire
+# format is a sequence of segment headers + arithmetic-coded packet
+# bodies (IPN 42-155 §IV). The clean-room wall bars every public ICER
+# reference implementation, so this is a decode-only panic-free
+# harness: `decode_segment` exercises `walk_segment`,
+# `parse_icer_metadata` and `parse_icer` against arbitrary bytes and
+# gets the whole 30-minute budget.
+
+on:
+  schedule:
+    - cron: "37 6 * * *"   # daily 06:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

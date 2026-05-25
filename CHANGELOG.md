@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 131)
+
+- `fuzz/` directory with a cargo-fuzz harness (`decode_segment`)
+  exercising the three decode-side entry points against arbitrary
+  bytes: `header::walk_segment` (single-segment framing),
+  `parse_icer_metadata` (multi-segment walk), and `parse_icer`
+  (full decode including arithmetic coder + inverse DWT +
+  multi-segment stitch). Panic-free contract under test; no
+  reference-codec oracle (clean-room).
+- 5 seed-corpus files under `fuzz/corpus/decode_segment/`,
+  generated from icer's own encoder: an uncompressed gray ramp
+  (16x12), a compressed gray ramp with filter Q (32x32), a
+  compressed flat-128 baseline (32x32), a two-segment compressed
+  ramp (32x24, segment_count=2), and a truncated compressed ramp
+  (32x32, byte_budget=96) covering the partial-packet path.
+- `.github/workflows/fuzz.yml` mirroring the sibling crate
+  convention (daily 30-minute run; `OxideAV/.github/.../crate-fuzz.yml`).
+- Local 60-second fuzz session: 11612 runs, 0 crashes. One slow-unit
+  (~800 ms in release) flagged: a 69-byte input with
+  width=223, height=65312 causes `parse_icer` to allocate a
+  ~14.5 MB plane + inverse-DWT it. Documented as a known DoS
+  surface (u16 wire-format width/height permits up to 4 GB per
+  plane); not a fuzz-found crash, no source fix in this commit.
+- `.gitignore` anchored to `/Cargo.lock` so `fuzz/Cargo.lock` can
+  be tracked while the library's lockfile stays untracked.
+
 ### Added (round 91)
 
 - Round 91: rate-distortion (R-D) budget pruning per IPN 42-155

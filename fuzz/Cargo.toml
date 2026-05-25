@@ -1,0 +1,36 @@
+[package]
+name = "oxideav-icer-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# ICER's wire format is a sequence of segment headers, each followed by
+# packet headers + arithmetic-coded packet bodies (IPN 42-155 §IV).
+# `header::walk_segment` parses one segment's framing without touching
+# the entropy stage; `parse_icer_metadata` walks every segment in the
+# stream; `parse_icer` runs the full decode (framing + arithmetic +
+# inverse wavelet). This fuzz crate is decode-only: it feeds arbitrary
+# bytes through all three entry points and asserts none of them ever
+# panics / aborts / OOMs.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-icer]
+path = ".."
+default-features = false
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_segment"
+path = "fuzz_targets/decode_segment.rs"
+test = false
+doc = false

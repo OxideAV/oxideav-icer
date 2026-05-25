@@ -389,6 +389,39 @@ The standalone API is `parse_icer(bytes) -> Result<IcerImage>`,
 mode is opt-in via `EncodeOptions::compressed()`; multi-segment
 encode is opt-in via `EncodeOptions::segment_count`.
 
+## Fuzzing (round 131)
+
+A cargo-fuzz harness under `fuzz/` runs every byte slice through
+three decode-side entry points and asserts none panic / abort /
+OOM:
+
+* `header::walk_segment` -- single-segment framing parse.
+* `parse_icer_metadata` -- multi-segment walk (header-only).
+* `parse_icer` -- full decode (arith coder + inverse DWT + stitch).
+
+The seed corpus under `fuzz/corpus/decode_segment/` is generated
+from icer's own encoder (no third-party ICER reference): an
+uncompressed ramp, compressed filter-Q ramps + flat, a two-segment
+split, and a byte-budget-truncated input covering the partial-
+packet path.
+
+```bash
+cd fuzz
+cargo +nightly fuzz run decode_segment -- -max_total_time=60
+```
+
+Local 60-second run: 11612 iterations, 0 crashes. One slow-unit
+documented: a 69-byte input with width=223, height=65312 allocates
+~14.5 MB and runs `parse_icer` in ~800 ms (release). This is a
+pre-existing DoS surface: the wire format admits any (width,
+height) in `u16 * u16`, so a malicious 12-byte segment header
+can request up to ~4 GB of decoder-side allocation per plane.
+Not a fuzz crash; documented for a future header-validation pass
+(application-supplied max-geometry cap).
+
+A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
+budget; OxideAV reusable workflow).
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Karpeles Lab Inc.
