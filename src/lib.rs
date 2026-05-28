@@ -104,7 +104,8 @@ pub use analyze::{
 };
 pub use bitplane::EncodedPacket;
 pub use decoder::{
-    decode_uncompressed_icer, parse_icer, parse_icer_metadata, IcerMetadata, SegmentMetadata,
+    decode_uncompressed_icer, parse_icer, parse_icer_metadata, parse_icer_metadata_with_limits,
+    parse_icer_with_limits, DecodeLimits, IcerMetadata, SegmentMetadata,
 };
 pub use encoder::{encode_icer, EncodeOptions};
 pub use error::{IcerError, Result};

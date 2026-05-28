@@ -15,12 +15,117 @@
 //! each packet independently per bit-plane (significance + refinement
 //! per IPN 42-155 §IV). Packets can arrive truncated or out of order;
 //! missing packets simply skip the corresponding bit-planes.
+//!
+//! ## Decode-side resource limits (round 174)
+//!
+//! The wire format admits arbitrary `(width, height)` pairs in the
+//! 12-byte segment header (`u16 * u16`), which means a single tiny
+//! header can request up to ~4 GB of decoder allocation per plane —
+//! a DoS surface previously flagged by the cargo-fuzz harness. The
+//! [`DecodeLimits`] struct caps the per-segment and per-image pixel
+//! counts the decoder will agree to materialise. [`parse_icer`] and
+//! [`parse_icer_metadata`] apply [`DecodeLimits::default`] (64 MPx
+//! per segment, 256 MPx per image — well above the 1024x1024 / 2048
+//! x2048 Mars-rover Pancam / Hazcam fixtures and three orders of
+//! magnitude below the 4 GB wire-format ceiling). Callers that need
+//! to override the policy use [`parse_icer_with_limits`] /
+//! [`parse_icer_metadata_with_limits`].
 
 use crate::bitplane::{decode_bitplanes_multi, EncodedPacket};
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
 use crate::wavelet_float;
+
+/// Per-decode resource caps.
+///
+/// The wire format's 16-bit width / 16-bit height fields admit values
+/// up to `65535 * 65535 ≈ 4.29 GPx` per segment. Honouring that
+/// literally is a DoS surface — a 12-byte segment header could request
+/// a ~4 GB plane allocation plus the matching `i32` coefficient buffer
+/// (~16 GB). [`DecodeLimits`] is the application-supplied policy that
+/// bounds what the decoder will agree to materialise.
+///
+/// All caps are in **pixels**, not bytes. A Gray8 plane is one byte
+/// per pixel; the inverse-DWT coefficient buffer is four bytes
+/// (`i32`) per pixel; so a 64-MPx cap bounds peak allocation per
+/// segment to roughly `64 MB plane + 256 MB coefficients`.
+///
+/// The defaults are deliberately conservative-but-realistic for
+/// every published Mars-rover ICER deployment:
+///
+///   * Pancam delivery frames are 1024x1024 = 1 MPx.
+///   * Hazcam frames are 1024x1024 = 1 MPx.
+///   * Mastcam-Z (Mars 2020) frames are 1648x1200 ≈ 2 MPx.
+///   * HiRISE strips (the largest deep-space-imager target) cap out
+///     around 20k x 20k = 400 MPx, but those run through ICER-3D
+///     hyperspectral, not the 2-D path this crate covers.
+///
+/// 64 MPx per segment is two orders of magnitude above the actual
+/// rover Pancam / Hazcam frames; 256 MPx total bounds a worst-case
+/// multi-segment image at ~1 GB peak allocation. Callers with
+/// validated trusted inputs can lift the cap via
+/// [`DecodeLimits::unlimited`] or by constructing an explicit
+/// [`DecodeLimits`] with the desired values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Maximum `width * height` (in pixels) any single segment is
+    /// allowed to request. A segment whose header asks for more
+    /// returns [`IcerError::Unsupported`] from the parse / decode
+    /// entry points (we treat oversized geometry as an
+    /// application-policy refusal, not a wire-format violation).
+    pub max_pixels_per_segment: u64,
+    /// Maximum total `width * height` (in pixels) the stitched
+    /// multi-segment image is allowed to request. Sum-of-segment-
+    /// pixel-counts checked before any plane allocation.
+    pub max_total_pixels: u64,
+}
+
+impl DecodeLimits {
+    /// Application-defined default: 64 MPx per segment, 256 MPx total.
+    /// See the type-level rationale for why these values were chosen.
+    pub const DEFAULT_MAX_PIXELS_PER_SEGMENT: u64 = 64 * 1024 * 1024;
+    pub const DEFAULT_MAX_TOTAL_PIXELS: u64 = 256 * 1024 * 1024;
+
+    /// No-cap policy. Use only when the input is trusted (e.g. produced
+    /// by this crate's own encoder in a controlled batch run). Equivalent
+    /// to round-131 behaviour — fuzz inputs can drive ~4 GB / plane.
+    pub const fn unlimited() -> Self {
+        Self {
+            max_pixels_per_segment: u64::MAX,
+            max_total_pixels: u64::MAX,
+        }
+    }
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_pixels_per_segment: Self::DEFAULT_MAX_PIXELS_PER_SEGMENT,
+            max_total_pixels: Self::DEFAULT_MAX_TOTAL_PIXELS,
+        }
+    }
+}
+
+/// Pixel-count of a segment, computed in `u64` to side-step any
+/// `usize * usize` overflow risk on 32-bit targets. Always finite for
+/// in-range `SegmentHeader::{width, height}` (both `u16`).
+#[inline]
+fn segment_pixels(header: &SegmentHeader) -> u64 {
+    header.width as u64 * header.height as u64
+}
+
+fn check_segment_pixels(header: &SegmentHeader, limits: &DecodeLimits) -> Result<()> {
+    let px = segment_pixels(header);
+    if px > limits.max_pixels_per_segment {
+        return Err(IcerError::Unsupported(format!(
+            "segment {} geometry {}x{} = {} pixels exceeds per-segment cap of {} pixels \
+             (see DecodeLimits::max_pixels_per_segment)",
+            header.segment_index, header.width, header.height, px, limits.max_pixels_per_segment
+        )));
+    }
+    Ok(())
+}
 
 /// Per-segment metadata returned by [`parse_icer_metadata`].
 #[derive(Debug, Clone)]
@@ -43,11 +148,36 @@ pub struct IcerMetadata {
 
 /// Walk every segment in `bytes` and return per-segment metadata.
 /// Does not allocate or produce any decoded pixels.
+///
+/// Applies [`DecodeLimits::default`] for geometry validation. Use
+/// [`parse_icer_metadata_with_limits`] for explicit control.
 pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
+    parse_icer_metadata_with_limits(bytes, &DecodeLimits::default())
+}
+
+/// Walk every segment in `bytes` and return per-segment metadata,
+/// rejecting any segment whose geometry exceeds `limits`. Header-only
+/// walk — no plane allocation.
+pub fn parse_icer_metadata_with_limits(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<IcerMetadata> {
     let mut segments = Vec::new();
+    let mut total_pixels: u64 = 0;
     let mut cursor = 0;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
+        check_segment_pixels(&walked.header, limits)?;
+        total_pixels = total_pixels
+            .checked_add(segment_pixels(&walked.header))
+            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        if total_pixels > limits.max_total_pixels {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
+                 (see DecodeLimits::max_total_pixels)",
+                total_pixels, limits.max_total_pixels
+            )));
+        }
         let byte_length = walked.consumed;
         segments.push(SegmentMetadata {
             header: walked.header,
@@ -66,7 +196,22 @@ pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
 /// reconstructed strip (`segment_index` ascending) vertically. The
 /// per-segment width must agree with every other segment (no
 /// arbitrary tiling).
+///
+/// Applies [`DecodeLimits::default`] for geometry validation before
+/// any plane / coefficient allocation. Use [`parse_icer_with_limits`]
+/// for explicit control.
 pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
+    parse_icer_with_limits(bytes, &DecodeLimits::default())
+}
+
+/// Decode the full ICER bytestream into an image, rejecting any
+/// segment / total geometry that exceeds `limits` before allocating
+/// the plane or wavelet coefficient buffers.
+///
+/// This is the constructor [`parse_icer`] delegates into. Pass
+/// [`DecodeLimits::unlimited`] to recover the pre-round-174 behaviour
+/// (trusted-input batch processing).
+pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -75,8 +220,20 @@ pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
     // width up-front.
     let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
     let mut cursor = 0usize;
+    let mut total_pixels: u64 = 0;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
+        check_segment_pixels(&walked.header, limits)?;
+        total_pixels = total_pixels
+            .checked_add(segment_pixels(&walked.header))
+            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        if total_pixels > limits.max_total_pixels {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
+                 (see DecodeLimits::max_total_pixels)",
+                total_pixels, limits.max_total_pixels
+            )));
+        }
         cursor += walked.consumed;
         walked_all.push(walked);
     }

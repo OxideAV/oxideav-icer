@@ -38,6 +38,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
 | R-D budget pruning | full (round 91; `EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
+| Decode-side resource limits | full (round 174; `DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes round-131 4 GB-per-plane DoS surface) |
 
 End-to-end round-trips:
 
@@ -421,6 +422,53 @@ Not a fuzz crash; documented for a future header-validation pass
 
 A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
 budget; OxideAV reusable workflow).
+
+## Decode-side resource limits (round 174)
+
+The cargo-fuzz harness from round 131 surfaced a DoS vector inherent
+to the wire format: the 12-byte segment header carries `width` and
+`height` as `u16` each, which means a 12-byte input can declare up
+to `65535 * 65535 ≈ 4.29 GPx` per segment. Pre-round-174,
+`parse_icer` would dutifully allocate a ~4 GB plane plus
+~16 GB of `i32` coefficient buffers before discovering the body was
+empty.
+
+Round 174 adds an application-level geometry cap via
+[`DecodeLimits`]:
+
+```rust
+let limits = oxideav_icer::DecodeLimits::default();
+//         max_pixels_per_segment = 64 MPx
+//         max_total_pixels       = 256 MPx
+let img = oxideav_icer::parse_icer_with_limits(bytes, &limits)?;
+
+// Trusted-input batch path — preserves pre-round-174 behaviour:
+let img = oxideav_icer::parse_icer_with_limits(
+    bytes,
+    &oxideav_icer::DecodeLimits::unlimited(),
+)?;
+```
+
+The bare-name `parse_icer` / `parse_icer_metadata` entry points
+apply `DecodeLimits::default` automatically — every existing caller
+gets the conservative policy without an API change. Callers who
+need a different policy (oversized HiRISE-style strips, trusted
+batch processing) use the `_with_limits` variants explicitly.
+
+The defaults (64 MPx per segment, 256 MPx total) sit two orders of
+magnitude above every published Mars-rover Pancam / Hazcam / Mastcam-Z
+delivery frame and three orders of magnitude below the 4 GB
+wire-format ceiling, so realistic inputs are unaffected and synthetic
+worst-case inputs are rejected with `IcerError::Unsupported` before
+any plane allocation.
+
+A segment that exceeds the per-segment cap, or a multi-segment image
+whose stitched pixel count exceeds the total cap, returns
+`IcerError::Unsupported` (a deliberate application-policy refusal,
+not a wire-format error). The metadata walker
+(`parse_icer_metadata`) and the full decoder (`parse_icer`) apply
+the same cap, so an attacker cannot bypass the policy by stopping at
+the metadata stage.
 
 ## Licence
 

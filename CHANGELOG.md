@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 174)
+
+- `DecodeLimits` struct (`src/decoder.rs`) capping per-segment and
+  per-image pixel counts the decoder will agree to materialise.
+  Defaults: 64 MPx per segment, 256 MPx total — two orders of
+  magnitude above every published Mars-rover Pancam / Hazcam /
+  Mastcam-Z delivery frame and three orders of magnitude below the
+  4 GB wire-format ceiling. `DecodeLimits::unlimited()` recovers the
+  pre-round-174 behaviour for trusted-input batch processing.
+- `parse_icer_with_limits` + `parse_icer_metadata_with_limits` —
+  explicit-policy entry points. The bare-name `parse_icer` /
+  `parse_icer_metadata` functions now apply
+  `DecodeLimits::default()` automatically, so every existing caller
+  picks up the conservative policy without an API change.
+- Both the metadata walk and the full decode check the per-segment
+  cap before any plane allocation, and check the multi-segment
+  running pixel total against `max_total_pixels` mid-walk. A segment
+  / total over the cap returns `IcerError::Unsupported`.
+- Closes the round-131 fuzz-flagged DoS surface: a 12-byte segment
+  header declaring 65535x65535 used to drive `parse_icer` into a
+  ~4 GB plane + ~16 GB coefficient-buffer allocation; under the
+  default limits the same input is rejected before any allocation.
+- New integration test file `tests/decode_limits.rs` with 6 tests
+  covering: rover-sized round-trip under default limits; default
+  limits rejecting a 4 GPx synthetic header (both `parse_icer` and
+  `parse_icer_metadata`); `unlimited()` letting the metadata walker
+  return giant-geometry headers; explicit per-segment cap honoured;
+  explicit multi-segment total cap honoured (4-segment 4x12 fixture);
+  default constants pinned to the documented values.
+
 ### Added (round 131)
 
 - `fuzz/` directory with a cargo-fuzz harness (`decode_segment`)
