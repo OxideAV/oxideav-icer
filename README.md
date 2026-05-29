@@ -39,6 +39,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | R-D budget pruning | full (round 91; `EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 | Decode-side resource limits | full (round 174; `DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes round-131 4 GB-per-plane DoS surface) |
+| Per-segment uncompressed fallback | full (round 189; `EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
 
 End-to-end round-trips:
 
@@ -469,6 +470,59 @@ not a wire-format error). The metadata walker
 (`parse_icer_metadata`) and the full decoder (`parse_icer`) apply
 the same cap, so an attacker cannot bypass the policy by stopping at
 the metadata stage.
+
+## Per-segment uncompressed fallback (round 189)
+
+IPN 42-155 §III.D "Performance with Difficult Imagery" specifies
+that the encoder may bypass the entropy stage on a per-segment basis
+when arithmetic coding would *expand* the payload -- pure-noise tiles,
+single-pixel transitions on otherwise flat backgrounds, and other
+content where the per-packet header plus arithmetic-coder per-packet
+renormalisation overhead exceeds what the entropy stage can squeeze
+out. The §III.D path ships raw 8-bit pixels in a single packet under
+the same segment-framing layer, with the wire-format
+`SegmentHeader::uncompressed` flag (1 bit) telling the decoder which
+path was taken.
+
+Round 189 surfaces this as a new `EncodeOptions` builder:
+
+* **`with_uncompressed_fallback()`** -- enable per-segment fallback.
+  When set, the compressed-path encoder produces *both* candidates
+  (compressed + uncompressed) for each segment and emits whichever is
+  smaller. The decision is recorded per-segment on the wire, so a
+  multi-segment image may mix paths (noisy strip -> uncompressed,
+  smooth strip -> compressed) transparently.
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_uncompressed_fallback();
+let bytes = encode_icer(&image, &opts)?;
+// Decoder reads each segment's `uncompressed` flag and reconstructs
+// accordingly -- no caller-side awareness needed.
+let decoded = parse_icer(&bytes)?;
+```
+
+Compose-rules:
+
+* The fallback only fires on the compressed path
+  (`opts.uncompressed = false`). Forcing `opts.uncompressed = true`
+  short-circuits the comparison and emits uncompressed
+  unconditionally (the round-1 default).
+* The wire-format §IV per-segment body-length ceiling is `u16::MAX
+  = 65535` pixels; strips that exceed that cap can't be shipped raw
+  and keep the compressed result with no error.
+* Equal-length ties go to compressed: the entropy-coded packets are
+  strictly more useful to a truncating decoder than the raw dump.
+* Composes with `auto_filter_rd` (each filter candidate is offered
+  the fallback choice independently), `byte_budget` / `target_bytes`
+  / `rd_pruning` (compressed candidate honours the budget;
+  uncompressed candidate is fixed-size), and `segment_priorities`
+  (priority order is independent of path choice).
+
+The per-segment behaviour is tested in
+`tests/uncompressed_fallback.rs` against an LCG-driven noise tile
+(strict fallback win), a smooth diagonal ramp (compressed stays),
+and a stacked noise/ramp image (each strip independently decides).
 
 ## Benchmarks (round 181)
 

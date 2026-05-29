@@ -150,6 +150,52 @@ pub struct EncodeOptions {
     /// are emitted MSB-down sig-before-ref, truncated at the first
     /// packet that would overflow `byte_budget`.
     pub rd_pruning: bool,
+    /// Per-segment automatic uncompressed fallback (IPN 42-155 §III.D
+    /// "Performance with Difficult Imagery").
+    ///
+    /// When `true` AND the compressed path is in use (i.e.
+    /// [`Self::uncompressed`] is `false`), the encoder produces *both*
+    /// the compressed and the uncompressed encoding of each segment and
+    /// emits whichever is smaller. The wire-format `uncompressed` flag
+    /// on the segment header records which path was taken, so the
+    /// decoder reconstructs from whatever was emitted without any
+    /// caller-side awareness.
+    ///
+    /// IPN 42-155 §III.D motivates this as the path Mars-rover
+    /// deployments take when the entropy stage would *expand* the
+    /// payload: pure-noise tiles, single-pixel transitions on otherwise
+    /// flat backgrounds, and other content where the per-packet header
+    /// plus arithmetic-coder per-packet renormalisation overhead
+    /// exceeds the data the entropy stage can squeeze out. The paper
+    /// notes (§III.D) that a per-segment decision keeps the entropy
+    /// stage for the easy parts of the image while shipping the
+    /// difficult tiles uncompressed.
+    ///
+    /// Compose-rules:
+    ///
+    /// * The fallback only fires when [`Self::uncompressed`] is
+    ///   `false`. Setting [`Self::uncompressed`] to `true` forces
+    ///   the uncompressed path unconditionally and ignores this flag.
+    /// * The uncompressed segment body must fit `body_len <=
+    ///   u16::MAX = 65535 pixels` per IPN 42-155 §IV. If the strip
+    ///   exceeds that cap the uncompressed candidate cannot be
+    ///   produced and the encoder keeps the compressed result with no
+    ///   error.
+    /// * The fallback is per-segment; in a multi-segment image
+    ///   different segments may independently take the compressed or
+    ///   uncompressed path.
+    /// * `auto_filter_rd` runs *outside* the fallback selection: each
+    ///   filter candidate is offered the fallback choice
+    ///   independently, then the byte-smallest of `(filter,
+    ///   path)` combinations wins.
+    /// * Quota interaction (`byte_budget` / `target_bytes` /
+    ///   `rd_pruning`) is honoured by the compressed candidate as
+    ///   today; the uncompressed candidate is byte-fixed (header +
+    ///   raw pixels) and never truncated.
+    ///
+    /// `false` (the default) keeps the compressed-or-fail semantic
+    /// callers had before this option existed.
+    pub auto_uncompressed_fallback: bool,
 }
 
 impl Default for EncodeOptions {
@@ -172,6 +218,7 @@ impl Default for EncodeOptions {
             auto_filter_rd: false,
             segment_priorities: None,
             rd_pruning: false,
+            auto_uncompressed_fallback: false,
         }
     }
 }
@@ -318,6 +365,22 @@ impl EncodeOptions {
             step += 1;
         }
         self.segment_priorities = Some(priorities);
+        self
+    }
+
+    /// Enable per-segment automatic uncompressed fallback (IPN 42-155
+    /// §III.D "Performance with Difficult Imagery"). See
+    /// [`EncodeOptions::auto_uncompressed_fallback`] for the full
+    /// contract.
+    ///
+    /// Only meaningful with the compressed path — calling this on an
+    /// `EncodeOptions::default()` (which forces uncompressed) is
+    /// harmless but has no observable effect: the segment is already
+    /// emitted via the uncompressed path. The intended usage is
+    /// `EncodeOptions::compressed().with_uncompressed_fallback()`.
+    #[must_use]
+    pub fn with_uncompressed_fallback(mut self) -> Self {
+        self.auto_uncompressed_fallback = true;
         self
     }
 }
@@ -554,9 +617,54 @@ fn encode_one_segment(
     levels: u8,
 ) -> Result<Vec<u8>> {
     if opts.uncompressed {
-        encode_one_segment_uncompressed(plane, img_w, y_start, strip_h, segment_index, opts)
-    } else {
-        encode_one_segment_compressed(plane, img_w, y_start, strip_h, segment_index, opts, levels)
+        return encode_one_segment_uncompressed(
+            plane,
+            img_w,
+            y_start,
+            strip_h,
+            segment_index,
+            opts,
+        );
+    }
+
+    // Compressed path. Optionally also produce the uncompressed
+    // candidate and pick the smaller (IPN 42-155 §III.D "Performance
+    // with Difficult Imagery"). Per-segment decision: the wire-format
+    // `uncompressed` flag on the segment header records which path
+    // was emitted, so the decoder reconstructs each segment via its
+    // own flag without any caller-side awareness.
+    let compressed =
+        encode_one_segment_compressed(plane, img_w, y_start, strip_h, segment_index, opts, levels)?;
+
+    if !opts.auto_uncompressed_fallback {
+        return Ok(compressed);
+    }
+
+    // Uncompressed candidate. The wire format caps each segment's body
+    // length at u16::MAX bytes (§IV), so strips with more than 65535
+    // pixels can't be shipped uncompressed and the compressed result
+    // is kept unconditionally.
+    if img_w.saturating_mul(strip_h) > u16::MAX as usize {
+        return Ok(compressed);
+    }
+    // The uncompressed encoder needs `opts.uncompressed = true` to set
+    // the wire-format flag correctly; clone + flip on a local copy so
+    // the caller's options stay untouched.
+    let mut uncompressed_opts = opts.clone();
+    uncompressed_opts.uncompressed = true;
+    match encode_one_segment_uncompressed(
+        plane,
+        img_w,
+        y_start,
+        strip_h,
+        segment_index,
+        &uncompressed_opts,
+    ) {
+        Ok(uncompressed) if uncompressed.len() < compressed.len() => Ok(uncompressed),
+        // Equal-length tie goes to the compressed path: the entropy
+        // coder's per-bit-plane progressive structure is strictly more
+        // useful to a truncating decoder than the uncompressed dump.
+        _ => Ok(compressed),
     }
 }
 

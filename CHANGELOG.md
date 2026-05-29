@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 189)
+
+- Per-segment automatic uncompressed fallback (IPN 42-155 §III.D
+  "Performance with Difficult Imagery"). New
+  `EncodeOptions::auto_uncompressed_fallback` field plus a
+  `with_uncompressed_fallback()` builder. When enabled on a compressed
+  encode, each segment is also encoded via the §III.D raw-pixel path
+  and the byte-smaller of the two candidates is emitted. The on-the-
+  wire segment-header `uncompressed` flag records the path taken, so
+  the decoder reconstructs each segment via its own flag with no
+  caller-side awareness.
+- Per-segment decision: in a multi-segment image, noisy strips may
+  take the uncompressed path while smooth strips stay on the
+  entropy-coded path -- matching the spaceflight behaviour the paper
+  describes for content where the entropy stage would expand the
+  payload (random-noise / high-frequency tiles).
+- Fallback honours the wire-format §IV per-segment body-length ceiling
+  (`u16::MAX = 65535` pixels): strips exceeding that cap keep the
+  compressed result with no error. Equal-length ties go to the
+  compressed path (its per-bit-plane progressive structure is strictly
+  more useful to a truncating decoder than the uncompressed dump).
+- Composes naturally with `auto_filter_rd` (each filter candidate is
+  offered the fallback decision independently), `byte_budget` /
+  `target_bytes` / `rd_pruning` (compressed candidate honours the
+  budget; uncompressed candidate is fixed-size), and
+  `segment_priorities` (priority order is independent of path
+  choice).
+- `tests/uncompressed_fallback.rs` -- six cover-cases: strict noise
+  win, ramp keeps compressed, decode round-trip on noise, per-segment
+  decision in a two-strip image, no-op when forced uncompressed,
+  composes with the float A filter.
+
 ### Added (round 181)
 
 - `benches/encode_decode.rs` -- criterion benchmark suite covering the
