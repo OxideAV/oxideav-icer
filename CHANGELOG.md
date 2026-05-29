@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 181)
+
+- `benches/encode_decode.rs` -- criterion benchmark suite covering the
+  encode + decode hot paths. Three input shapes (`ramp_16x16`,
+  `smooth_16x16`, `ramp_64x64`) exercised across:
+  * `encode_compressed_filter_q` -- the reversible 5/3 wavelet path
+    (`WaveletFilter::Reversible53`), `wavelet_levels = 2`,
+    `bit_plane_count = 8`.
+  * `decode_compressed_filter_q` -- the matching `parse_icer` round-trip
+    on pre-encoded fixtures.
+  * `uncompressed_path_64x64` -- the IPN 42-155 §III.D path on the
+    larger ramp, as a near-`memcpy` contrast against the compressed
+    pipeline.
+  Each subgroup records `Throughput::Bytes(width * height)` so
+  regressions surface as MiB/s or GiB/s on the criterion report.
+- Baseline numbers on aarch64-darwin (M-series, debug-info release with
+  default `--bench` opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_q/ramp_64x64`: ~271 µs / 14.4 MiB/s.
+  * `decode_compressed_filter_q/ramp_64x64`: ~254 µs / 15.2 MiB/s.
+  * `uncompressed_path_64x64/encode`: ~197 ns / 19.2 GiB/s.
+  * `uncompressed_path_64x64/decode`: ~336 ns / 11.3 GiB/s.
+  The two-order-of-magnitude gap between the compressed and
+  uncompressed paths sets the dynamic range future entropy-coder /
+  wavelet vectorisation work has to play with.
+- `[dev-dependencies] criterion = "0.5"` and a `[[bench]]` table entry
+  in `Cargo.toml`. CI's existing `cargo build --all-targets` step
+  exercises the bench file as a compilation gate; the benchmark itself
+  is opt-in via `cargo bench`.
+
 ### Added (round 174)
 
 - `DecodeLimits` struct (`src/decoder.rs`) capping per-segment and

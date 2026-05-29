@@ -470,6 +470,43 @@ not a wire-format error). The metadata walker
 the same cap, so an attacker cannot bypass the policy by stopping at
 the metadata stage.
 
+## Benchmarks (round 181)
+
+`benches/encode_decode.rs` is a criterion suite covering the encode +
+decode hot paths so future entropy-coder, wavelet, or filter-selection
+work has a stable baseline to compare against. Three input shapes
+(diagonal-ramp 16x16, mid-grey 16x16, diagonal-ramp 64x64) are
+exercised on the reversible 5/3 wavelet path
+(`WaveletFilter::Reversible53`, `wavelet_levels = 2`,
+`bit_plane_count = 8`) plus a fourth group covering the IPN 42-155
+§III.D uncompressed path on the 64x64 ramp as a near-`memcpy`
+contrast against the compressed pipeline. Each subgroup records
+`Throughput::Bytes(width * height)` so regressions surface as MiB/s
+or GiB/s on the criterion report.
+
+Run with:
+
+```sh
+cargo bench --bench encode_decode -- --quick   # smoke (sub-second)
+cargo bench --bench encode_decode              # full criterion run
+```
+
+Baseline numbers on aarch64-darwin (M-series, default `--bench`
+opt-level, `--quick` smoke):
+
+| Group                                  | Time   | Throughput |
+|----------------------------------------|--------|------------|
+| `encode_compressed_filter_q/ramp_64x64`| ~271 µs| ~14.4 MiB/s|
+| `decode_compressed_filter_q/ramp_64x64`| ~254 µs| ~15.2 MiB/s|
+| `uncompressed_path_64x64/encode`       | ~197 ns| ~19.2 GiB/s|
+| `uncompressed_path_64x64/decode`       | ~336 ns| ~11.3 GiB/s|
+
+The two-order-of-magnitude gap between the compressed and
+uncompressed paths sets the dynamic range future entropy-coder and
+wavelet vectorisation work has to play with. CI's existing
+`cargo build --all-targets` step exercises the bench file as a
+compilation gate; the benchmark itself is opt-in via `cargo bench`.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE). Copyright (c) 2026 Karpeles Lab Inc.

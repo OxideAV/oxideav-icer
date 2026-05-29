@@ -28,3 +28,10 @@ default = ["registry"]
 # `register()` entry point against `oxideav-core`. Default-on; turn
 # off for image-library use-cases that just want the standalone API.
 registry = ["dep:oxideav-core"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "encode_decode"
+harness = false
