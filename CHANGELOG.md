@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 192)
+
+- Lenient multi-segment decode (IPN 42-155 §III.E independent-segment
+  scheduling). New `parse_icer_lenient` + `parse_icer_lenient_with_limits`
+  entry points and a `LenientDecode { image, received, missing_count }`
+  report. Tolerates a bytestream missing entire segments (the
+  spaceflight scenario where DSN packet loss drops individual ICER
+  segments in transit between the orbiter relay and the ground
+  station). Missing strips are reconstructed as flat 128 (level-shifted
+  zero, matching the round-6 ROI-priority placeholder semantic).
+- Geometry rules: segment 0 must be present (it pins the canonical
+  strip height + canonical width). The canonical strip height is taken
+  from segment 0; non-trailing received segments must agree on that
+  height (a wire-format guarantee from `encode_icer`'s `div_ceil`
+  row-strip split). The trailing received segment is allowed to be
+  shorter. Width mismatch among received segments still surfaces as
+  `IcerError::Unsupported` -- this is a real geometry contradiction,
+  not a loss-tolerance scenario.
+- Image-height semantics: `(max_received_index * strip_h) +
+  last_received_height`. A trailing-drop case (segment N missing when
+  it was the last) truncates the image at end of segment N-1 rather
+  than padding with placeholder rows -- the receiver has no way to
+  tell that a higher-indexed segment was supposed to exist.
+- Composes with `DecodeLimits` (the round-174 DoS-cap policy applies
+  identically) and with all encoder paths (compressed filter Q,
+  compressed filter A, uncompressed §III.D).
+- New integration test file `tests/lenient_decode.rs` with 9 tests
+  covering: no-loss round-trip equivalence with strict `parse_icer`;
+  middle-segment drop reconstructing as flat 128; trailing-segment
+  drop truncating the image; segment-0-missing rejected with
+  `IcerError::Truncated`; width-mismatch among received segments still
+  rejected; explicit `DecodeLimits` honoured; uncompressed-path drop
+  reconstructing identically; filter-A drop round-tripping; empty-input
+  rejected.
+
 ### Added (round 189)
 
 - Per-segment automatic uncompressed fallback (IPN 42-155 §III.D

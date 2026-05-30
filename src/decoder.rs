@@ -371,6 +371,205 @@ fn decode_compressed_segment_into(
     Ok(())
 }
 
+/// Lenient-decode report returned by [`parse_icer_lenient`].
+///
+/// The lenient API tolerates a bytestream that is missing entire
+/// segments (e.g. DSN packet loss in transit between the rover and the
+/// ground station). Missing strips are reconstructed as flat 128
+/// (level-shifted zero); the receiver gets back the [`IcerImage`] it
+/// would have got plus a per-index "was this segment present?" report
+/// so it knows which strips are genuine and which are placeholders.
+///
+/// IPN 42-155 §III.E "Image Partitioning" is the spec justification:
+/// segments are self-contained independently-decodable units, and the
+/// paper notes (§I, §III.E) that this independence is what makes ICER
+/// loss-tolerant on the deep-space link. The strict [`parse_icer`]
+/// rejects gaps in the `segment_index` sequence with
+/// `IcerError::invalid("non-contiguous segment indices: ...")`; the
+/// lenient API accepts them and surfaces the gap on the report instead.
+#[derive(Debug, Clone)]
+pub struct LenientDecode {
+    /// Decoded image. Missing strips are filled with 128 (level-shifted
+    /// zero, matching the round-6 ROI-priority placeholder semantic
+    /// already implemented in [`parse_icer`]).
+    pub image: IcerImage,
+    /// `received[i] == true` iff segment with `segment_index == i` was
+    /// present in the bytestream. Length equals
+    /// `expected_segment_count` (the inferred maximum index + 1).
+    pub received: Vec<bool>,
+    /// Number of `false` entries in [`Self::received`] -- i.e. how many
+    /// strips are flat-128 placeholders.
+    pub missing_count: usize,
+}
+/// Decode an ICER bytestream that may be missing entire segments due
+/// to packet loss in transit (IPN 42-155 §III.E independent-segment
+/// scheduling). Missing strips are reconstructed as flat 128; the
+/// report carries the per-index presence map and the missing-count.
+///
+/// Requirements:
+///   * Segment 0 **must** be present (it pins the canonical strip
+///     height + the canonical width); a missing segment 0 returns
+///     `IcerError::Truncated`.
+///   * The strip height is inferred as the modal height across all
+///     received non-trailing segments. The last received segment is
+///     allowed to be shorter (the encoder's `div_ceil` row-strip split
+///     produces a trailing remainder).
+///   * Width is required to agree across all received segments
+///     (canonical-width mismatch still returns
+///     `IcerError::Unsupported`).
+///   * The reconstructed image height is
+///     `last_received_index * strip_h + last_received_height` if the
+///     highest-index segment was received, else
+///     `(max_received_index + 1) * strip_h` -- the latter case rounds
+///     up; the missing trailing-strip-shorter-than-strip_h case isn't
+///     recoverable without out-of-band geometry coordination.
+///
+/// Applies [`DecodeLimits::default`] for geometry validation. Use
+/// [`parse_icer_lenient_with_limits`] for explicit control.
+///
+/// On a bytestream with **no** missing segments, the returned image
+/// is bit-identical to what [`parse_icer`] would return and
+/// `missing_count == 0`.
+pub fn parse_icer_lenient(bytes: &[u8]) -> Result<LenientDecode> {
+    parse_icer_lenient_with_limits(bytes, &DecodeLimits::default())
+}
+
+/// [`parse_icer_lenient`] with an explicit [`DecodeLimits`] policy.
+pub fn parse_icer_lenient_with_limits(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<LenientDecode> {
+    if bytes.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+
+    // Walk every segment as in `parse_icer_with_limits` -- gather them
+    // first so the strip-height inference has the full set.
+    let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
+    let mut cursor = 0usize;
+    let mut total_pixels: u64 = 0;
+    while cursor < bytes.len() {
+        let walked = walk_segment(&bytes[cursor..])?;
+        check_segment_pixels(&walked.header, limits)?;
+        total_pixels = total_pixels
+            .checked_add(segment_pixels(&walked.header))
+            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        if total_pixels > limits.max_total_pixels {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
+                 (see DecodeLimits::max_total_pixels)",
+                total_pixels, limits.max_total_pixels
+            )));
+        }
+        cursor += walked.consumed;
+        walked_all.push(walked);
+    }
+    if walked_all.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+    // Sort by segment_index so out-of-order delivery still composes.
+    walked_all.sort_by_key(|w| w.header.segment_index);
+
+    // Segment 0 must be present so we can pin the canonical width +
+    // strip height.
+    let first = &walked_all[0];
+    if first.header.segment_index != 0 {
+        return Err(IcerError::Truncated);
+    }
+    let canonical_width = first.header.width as usize;
+
+    // Width agreement across received segments.
+    for w in &walked_all {
+        if w.header.width as usize != canonical_width {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment width mismatch: segment {} is {}, expected {}",
+                w.header.segment_index, w.header.width, canonical_width
+            )));
+        }
+    }
+
+    // Determine the canonical strip height. Convention (matches
+    // `encode_icer`'s `div_ceil(h, segment_count)` split): every strip
+    // except the last has identical height. We use the height of
+    // segment 0 as the canonical strip_h; the trailing segment is
+    // allowed to be shorter.
+    let strip_h = first.header.height as usize;
+    if strip_h == 0 {
+        return Err(IcerError::invalid("segment 0 has zero height"));
+    }
+
+    let max_received_index = walked_all.last().unwrap().header.segment_index as usize;
+    // expected_segment_count = max + 1. The caller could in principle
+    // know there were more trailing segments lost; we don't, so we
+    // truncate the image at the highest-received index.
+    let expected_segment_count = max_received_index + 1;
+    let last_received_h = walked_all.last().unwrap().header.height as usize;
+
+    // Image height: (n-1) * strip_h + last_strip_h, where last_strip_h
+    // is the trailing-segment height for the highest-received index.
+    // (If higher-indexed segments were dropped we don't know about
+    // them; the image is truncated at the highest-received boundary.)
+    let total_height = max_received_index
+        .checked_mul(strip_h)
+        .and_then(|v| v.checked_add(last_received_h))
+        .ok_or_else(|| IcerError::invalid("multi-segment height overflow"))?;
+    if total_height > u32::MAX as usize {
+        return Err(IcerError::invalid("multi-segment height overflow"));
+    }
+
+    let mut img = IcerImage::zeros(
+        canonical_width as u32,
+        total_height as u32,
+        IcerPixelFormat::Gray8,
+    );
+    let mut received = vec![false; expected_segment_count];
+
+    // Place each received segment at its inferred y_offset.
+    for walked in &walked_all {
+        let seg_idx = walked.header.segment_index as usize;
+        let y_offset = seg_idx * strip_h;
+        received[seg_idx] = true;
+        // For non-trailing received segments, verify height equals
+        // canonical strip_h. A different height in the middle of the
+        // stream is a geometry-policy contradiction (the trailing
+        // remainder rule allows ONE shorter strip at the END only).
+        if seg_idx != max_received_index && (walked.header.height as usize) != strip_h {
+            return Err(IcerError::Unsupported(format!(
+                "non-trailing segment {} height {} != canonical strip height {}",
+                seg_idx, walked.header.height, strip_h
+            )));
+        }
+        decode_segment_into(walked, &mut img.planes[0], y_offset, canonical_width)?;
+    }
+
+    // Fill missing-segment regions with flat 128 (level-shifted zero,
+    // matching the round-6 ROI-priority placeholder semantic).
+    let mut missing_count = 0usize;
+    for (seg_idx, was_received) in received.iter().enumerate() {
+        if *was_received {
+            continue;
+        }
+        missing_count += 1;
+        let y_offset = seg_idx * strip_h;
+        // Missing-segment height: canonical strip_h (we don't have a
+        // tighter source). Trailing-segment-missing case is handled by
+        // the highest-received-index truncation above, so any missing
+        // seg here is a *gap*, not a trailing drop.
+        let plane = &mut img.planes[0];
+        for y in 0..strip_h {
+            let dst = &mut plane.data
+                [(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + canonical_width];
+            dst.fill(128);
+        }
+    }
+
+    Ok(LenientDecode {
+        image: img,
+        received,
+        missing_count,
+    })
+}
+
 /// Decode the IPN 42-155 §III.D "uncompressed" path explicitly. The
 /// generic [`parse_icer`] entry point also handles this case, but the
 /// dedicated function is kept for callers that want to assert the

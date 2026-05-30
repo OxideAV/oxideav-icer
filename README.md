@@ -40,6 +40,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 | Decode-side resource limits | full (round 174; `DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes round-131 4 GB-per-plane DoS surface) |
 | Per-segment uncompressed fallback | full (round 189; `EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
+| Lenient multi-segment decode | full (round 192; `parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128 like round-6 ROI placeholders; segment 0 must be present to pin canonical strip height) |
 
 End-to-end round-trips:
 
@@ -310,6 +311,54 @@ The R-D mode composes with `with_auto_filter` and
 `encode_one_segment_compressed`, after the wavelet transform and
 bit-plane encode, so per-segment dependencies are honoured
 naturally.
+
+## Lenient multi-segment decode (round 192)
+
+The Mars-rover deep-space link is lossy: ICER segments can be dropped
+in transit between the orbiter relay and the DSN ground station.
+IPN 42-155 §III.E "Image Partitioning" makes each segment a
+self-contained, independently-decodable unit precisely so that the
+receiver can still recover most of the image from whatever survived.
+
+`parse_icer` enforces a contiguous `segment_index` sequence and
+rejects a stream missing any segment with
+`IcerError::invalid("non-contiguous segment indices: ...")`. Round 192
+adds the lenient counterpart:
+
+* **`parse_icer_lenient(bytes)`** -- accept a stream that may be
+  missing entire segments. Missing strips are reconstructed as flat
+  128 (level-shifted zero, identical to the round-6 ROI-priority
+  placeholder semantic the encoder already produces under tight byte
+  budgets). The returned [`LenientDecode`] report carries the
+  per-index presence map and the missing-segment count.
+
+```rust
+let lenient = oxideav_icer::parse_icer_lenient(&bytes)?;
+assert_eq!(lenient.received[2], false); // segment 2 was lost in transit
+assert_eq!(lenient.missing_count, 1);
+// `lenient.image` is the reconstructed image with segment 2's strip
+// filled flat 128.
+```
+
+Constraints:
+
+* Segment 0 must be present (it pins the canonical strip height + the
+  canonical width). A missing segment 0 returns `IcerError::Truncated`.
+* The canonical strip height is read from segment 0; non-trailing
+  received segments must agree on that height (matches `encode_icer`'s
+  `div_ceil(h, segment_count)` row-strip split, where every strip
+  except the last has identical height).
+* Width mismatch among received segments still surfaces as
+  `IcerError::Unsupported` -- that's a geometry contradiction, not a
+  loss-tolerance scenario.
+* A trailing-segment drop (e.g. segment N missing when it was the
+  last) truncates the image at the end of segment N-1; the receiver
+  has no way to detect that a higher-indexed segment was supposed to
+  exist (the wire format carries no total-segment-count field).
+
+Composes with `DecodeLimits` (the round-174 DoS-cap policy applies
+identically via `parse_icer_lenient_with_limits`) and with every
+encoder path (filter Q / filter A / uncompressed §III.D).
 
 ## Roadmap
 
