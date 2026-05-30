@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-icer/compare/v0.0.2...v0.0.3) - 2026-05-30
+
+### Other
+
+- Round 192: lenient multi-segment decode (IPN 42-155 §III.E)
+- Round 189: per-segment uncompressed fallback (IPN 42-155 §III.D)
+- Round 181: criterion benchmark for encode + decode hot paths
+- Round 174: DecodeLimits — close round-131 fuzz-flagged DoS surface
+- Round 131: cargo-fuzz harness for the decoder framing + entropy path
+- Round 91: rate-distortion budget pruning (IPN 42-155 §IV.B)
+- Round 6: ROI segment prioritisation (IPN 42-155 §III.E)
+- Round 5: automatic wavelet-filter selection
+
 ### Added (round 192)
 
 - Lenient multi-segment decode (IPN 42-155 §III.E independent-segment
