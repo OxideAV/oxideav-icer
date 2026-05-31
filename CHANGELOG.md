@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 199)
+
+- Encode-side cargo-fuzz harness (`fuzz/fuzz_targets/encode_roundtrip.rs`).
+  Synthesises a bounded `IcerImage` (≤ 128 x 128 Gray8) and an
+  `EncodeOptions` value (filter A-G + Q, wavelet levels 1-4, segment
+  count 1-16, byte budget on/off, target bytes on/off, ROI priority
+  permutation on/off, R-D pruning, automatic uncompressed fallback,
+  uncompressed-force) from fuzzer-controlled bytes, calls
+  `encode_icer`, and on success self-roundtrips through both
+  `parse_icer` (strict) and `parse_icer_lenient`. Asserts the
+  advertised byte-budget hard cap is honoured (modulo committed
+  segment-header slop) and that strict-decode geometry matches the
+  encoded geometry. Complements the round-131 `decode_segment` harness
+  which only exercises the decoder.
+- Per-push smoke test (`tests/encode_fuzz_seed.rs`) that runs the
+  exact same extraction + drive logic on a bank of 17 hand-picked seed
+  inputs every CI run. Exercises the matrix of encoder option flags
+  (uncompressed force, segment count, byte budget, R-D pruning,
+  automatic uncompressed fallback, ROI priorities, auto-filter, auto-
+  filter-RD), the eight wavelet filters individually, and the
+  pathological geometries 1 x 1 / 1 x 32 / 32 x 1 / 128 x 128. A
+  regression in the encoder's input-validation surface surfaces in
+  normal CI rather than waiting ~24 h for the daily fuzz cron.
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-icer/compare/v0.0.2...v0.0.3) - 2026-05-30
 
 ### Other

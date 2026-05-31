@@ -12,9 +12,16 @@ cargo-fuzz = true
 # `header::walk_segment` parses one segment's framing without touching
 # the entropy stage; `parse_icer_metadata` walks every segment in the
 # stream; `parse_icer` runs the full decode (framing + arithmetic +
-# inverse wavelet). This fuzz crate is decode-only: it feeds arbitrary
-# bytes through all three entry points and asserts none of them ever
+# inverse wavelet). The `decode_segment` target feeds arbitrary bytes
+# through all three decoder entry points and asserts none of them ever
 # panics / aborts / OOMs.
+#
+# The `encode_roundtrip` target (round 199) covers the other half of
+# the surface: synthesise a small Gray8 image + an `EncodeOptions`
+# value from fuzzer-controlled bytes, drive `encode_icer`, and
+# self-roundtrip through the strict + lenient decoders. Asserts the
+# advertised byte-budget hard cap is honoured and that the strict
+# decoder's geometry matches what was encoded.
 [dependencies]
 libfuzzer-sys = "0.4"
 
@@ -32,5 +39,11 @@ debug = 1
 [[bin]]
 name = "decode_segment"
 path = "fuzz_targets/decode_segment.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
