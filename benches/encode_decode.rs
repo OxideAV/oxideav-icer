@@ -182,10 +182,105 @@ fn bench_uncompressed_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// Float-filter (`A`) encode-options. Filter A is the lossy 9/7-style
+/// CDF lifting filter named in IPN 42-155 §III.A; it is the Mars-rover
+/// lossy default and is the natural perf contrast against the integer
+/// Q (`Reversible53`) lossless path -- the wavelet stage now runs in
+/// `f64` lifting + integer quantisation rather than pure `i32`, so the
+/// numbers exposed here are the baseline for any future float-DWT
+/// vectorisation work.
+fn compressed_filter_a_opts() -> EncodeOptions {
+    EncodeOptions {
+        filter: WaveletFilter::NineSevenA,
+        wavelet_levels: 2,
+        bit_plane_count: 8,
+        uncompressed: false,
+        ..EncodeOptions::default()
+    }
+}
+
+fn bench_filter_a_path(c: &mut Criterion) {
+    // Mirrors the filter-Q encode + decode groups but on the lossy float
+    // 9/7 CDF path. Same three input shapes so the criterion report
+    // makes the Q-vs-A delta directly readable.
+    let opts = compressed_filter_a_opts();
+
+    let mut enc_group = c.benchmark_group("encode_compressed_filter_a");
+    let ramp_small = ramp_image(16, 16);
+    enc_group.throughput(Throughput::Bytes(
+        (ramp_small.width as u64) * (ramp_small.height as u64),
+    ));
+    enc_group.bench_function("ramp_16x16", |b| {
+        b.iter(|| {
+            let bytes = encode_icer(black_box(&ramp_small), black_box(&opts)).unwrap();
+            black_box(bytes);
+        });
+    });
+
+    let smooth = smooth_image(16, 16);
+    enc_group.throughput(Throughput::Bytes(
+        (smooth.width as u64) * (smooth.height as u64),
+    ));
+    enc_group.bench_function("smooth_16x16", |b| {
+        b.iter(|| {
+            let bytes = encode_icer(black_box(&smooth), black_box(&opts)).unwrap();
+            black_box(bytes);
+        });
+    });
+
+    let ramp_large = ramp_image(64, 64);
+    enc_group.throughput(Throughput::Bytes(
+        (ramp_large.width as u64) * (ramp_large.height as u64),
+    ));
+    enc_group.bench_function("ramp_64x64", |b| {
+        b.iter(|| {
+            let bytes = encode_icer(black_box(&ramp_large), black_box(&opts)).unwrap();
+            black_box(bytes);
+        });
+    });
+    enc_group.finish();
+
+    let mut dec_group = c.benchmark_group("decode_compressed_filter_a");
+    let ramp_small_bytes = encode_icer(&ramp_small, &opts).unwrap();
+    dec_group.throughput(Throughput::Bytes(
+        (ramp_small.width as u64) * (ramp_small.height as u64),
+    ));
+    dec_group.bench_function("ramp_16x16", |b| {
+        b.iter(|| {
+            let img = parse_icer(black_box(&ramp_small_bytes)).unwrap();
+            black_box(img);
+        });
+    });
+
+    let smooth_bytes = encode_icer(&smooth, &opts).unwrap();
+    dec_group.throughput(Throughput::Bytes(
+        (smooth.width as u64) * (smooth.height as u64),
+    ));
+    dec_group.bench_function("smooth_16x16", |b| {
+        b.iter(|| {
+            let img = parse_icer(black_box(&smooth_bytes)).unwrap();
+            black_box(img);
+        });
+    });
+
+    let ramp_large_bytes = encode_icer(&ramp_large, &opts).unwrap();
+    dec_group.throughput(Throughput::Bytes(
+        (ramp_large.width as u64) * (ramp_large.height as u64),
+    ));
+    dec_group.bench_function("ramp_64x64", |b| {
+        b.iter(|| {
+            let img = parse_icer(black_box(&ramp_large_bytes)).unwrap();
+            black_box(img);
+        });
+    });
+    dec_group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
     bench_decode_compressed,
     bench_uncompressed_path,
+    bench_filter_a_path,
 );
 criterion_main!(benches);

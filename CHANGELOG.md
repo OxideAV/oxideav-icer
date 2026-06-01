@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 205)
+
+- Float-filter (`A`) benchmark coverage. The criterion suite under
+  `benches/encode_decode.rs` gains two new groups,
+  `encode_compressed_filter_a` and `decode_compressed_filter_a`,
+  mirroring the existing filter-Q groups on the same three input
+  shapes (`ramp_16x16`, `smooth_16x16`, `ramp_64x64`) so the Q-vs-A
+  delta is directly readable from the criterion report. Filter A is
+  the lossy float 9/7-style CDF lifting filter named in IPN 42-155
+  §III.A and is the Mars-rover lossy default; the existing baseline
+  only exercised the integer 5/3 reversible path (filter Q), leaving
+  the float-DWT pipeline uncovered as a perf-regression target.
+- Baseline numbers on aarch64-darwin (M-series, default `--bench`
+  opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_a/ramp_64x64`: ~286 µs / 13.7 MiB/s
+    (vs ~271 µs / 14.4 MiB/s for filter Q -- ~5% encode overhead
+    from float lifting + integer quantisation).
+  * `decode_compressed_filter_a/ramp_64x64`: ~258 µs / 15.2 MiB/s
+    (vs ~254 µs / 15.2 MiB/s for filter Q -- decode is dominated by
+    the entropy coder, the inverse-DWT lifting cost is negligible).
+  * `encode_compressed_filter_a/smooth_16x16`: ~15 µs / 15.8 MiB/s
+    (constant input collapses the entropy stage to its smallest
+    regime; same shape on filter Q).
+- Documentation gap closed: the round-181 "Baseline numbers" table in
+  `README.md` now includes filter-A rows so future float-DWT
+  vectorisation has a stable reference point to compare against.
+
 ### Added (round 199)
 
 - Encode-side cargo-fuzz harness (`fuzz/fuzz_targets/encode_roundtrip.rs`).

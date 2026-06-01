@@ -42,6 +42,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Per-segment uncompressed fallback | full (round 189; `EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
 | Lenient multi-segment decode | full (round 192; `parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128 like round-6 ROI placeholders; segment 0 must be present to pin canonical strip height) |
 | Encode-side fuzz harness | full (round 199; `fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the round-131 decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
+| Float-filter benchmark coverage | full (round 205; criterion suite extended to cover the lossy float 9/7 CDF path -- `encode_compressed_filter_a` + `decode_compressed_filter_a` -- on the same three input shapes the filter-Q groups already exercise, so the Q-vs-A delta is directly readable from the criterion report) |
 
 End-to-end round-trips:
 
@@ -602,14 +603,23 @@ opt-level, `--quick` smoke):
 |----------------------------------------|--------|------------|
 | `encode_compressed_filter_q/ramp_64x64`| ~271 µs| ~14.4 MiB/s|
 | `decode_compressed_filter_q/ramp_64x64`| ~254 µs| ~15.2 MiB/s|
+| `encode_compressed_filter_a/ramp_64x64`| ~286 µs| ~13.7 MiB/s|
+| `decode_compressed_filter_a/ramp_64x64`| ~258 µs| ~15.2 MiB/s|
 | `uncompressed_path_64x64/encode`       | ~197 ns| ~19.2 GiB/s|
 | `uncompressed_path_64x64/decode`       | ~336 ns| ~11.3 GiB/s|
 
-The two-order-of-magnitude gap between the compressed and
-uncompressed paths sets the dynamic range future entropy-coder and
-wavelet vectorisation work has to play with. CI's existing
-`cargo build --all-targets` step exercises the bench file as a
-compilation gate; the benchmark itself is opt-in via `cargo bench`.
+The filter-A numbers (round 205) cover the lossy float 9/7 CDF
+lifting path on the same three input shapes the filter-Q groups
+already exercise; the Q-vs-A delta on the 64×64 ramp is ~5% on the
+encode side (the float lifting + IEEE-754 quantisation step is a
+small overhead vs the integer 5/3 lifting) and ~1% on the decode
+side (the inverse-DWT cost is dominated by the entropy coder, not
+the lifting arithmetic). The two-order-of-magnitude gap between the
+compressed and uncompressed paths sets the dynamic range future
+entropy-coder and wavelet vectorisation work has to play with. CI's
+existing `cargo build --all-targets` step exercises the bench file
+as a compilation gate; the benchmark itself is opt-in via
+`cargo bench`.
 
 ## Licence
 
