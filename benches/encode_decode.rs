@@ -276,11 +276,71 @@ fn bench_filter_a_path(c: &mut Criterion) {
     dec_group.finish();
 }
 
+/// Round 210 -- wavelet-decomposition-depth sweep on the integer 5/3
+/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// the default `wavelet_levels = 2` configuration; this group sweeps
+/// `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp so a
+/// regression (or, eventually, a wavelet-vectorisation win) on the
+/// dyadic 5/3 recursion is visible per-depth rather than averaged into
+/// a single number. Encode + decode are reported as separate benches
+/// against the same per-depth input so the cost split between forward
+/// DWT + entropy and inverse DWT + entropy is directly readable.
+///
+/// `wavelet_levels` is clamped to `1..=6` by the encoder (see
+/// `EncodeOptions::wavelet_levels` and the clamps in
+/// `encoder.rs`); depth 4 is the deepest sensible value for a 64x64
+/// input (subband LL at depth 4 is 4x4 = 16 coefficients, below which
+/// further dyadic recursion no longer changes the bit-plane scanner's
+/// stripe coverage).
+fn compressed_filter_q_opts_levels(levels: u8) -> EncodeOptions {
+    EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        wavelet_levels: levels,
+        bit_plane_count: 8,
+        uncompressed: false,
+        ..EncodeOptions::default()
+    }
+}
+
+fn bench_wavelet_levels_sweep(c: &mut Criterion) {
+    const DEPTHS: [u8; 4] = [1, 2, 3, 4];
+    let ramp = ramp_image(64, 64);
+    let pixel_bytes = (ramp.width as u64) * (ramp.height as u64);
+
+    let mut enc_group = c.benchmark_group("encode_compressed_filter_q_levels_64x64");
+    enc_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &d in &DEPTHS {
+        let opts = compressed_filter_q_opts_levels(d);
+        enc_group.bench_function(format!("levels_{}", d), |b| {
+            b.iter(|| {
+                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                black_box(bytes);
+            });
+        });
+    }
+    enc_group.finish();
+
+    let mut dec_group = c.benchmark_group("decode_compressed_filter_q_levels_64x64");
+    dec_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &d in &DEPTHS {
+        let opts = compressed_filter_q_opts_levels(d);
+        let bytes = encode_icer(&ramp, &opts).unwrap();
+        dec_group.bench_function(format!("levels_{}", d), |b| {
+            b.iter(|| {
+                let img = parse_icer(black_box(&bytes)).unwrap();
+                black_box(img);
+            });
+        });
+    }
+    dec_group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
     bench_decode_compressed,
     bench_uncompressed_path,
     bench_filter_a_path,
+    bench_wavelet_levels_sweep,
 );
 criterion_main!(benches);

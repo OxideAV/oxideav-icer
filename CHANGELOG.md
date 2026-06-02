@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 210)
+
+- Wavelet-decomposition-depth sweep in the criterion suite under
+  `benches/encode_decode.rs`. Two new groups,
+  `encode_compressed_filter_q_levels_64x64` and
+  `decode_compressed_filter_q_levels_64x64`, sweep `wavelet_levels`
+  over `[1, 2, 3, 4]` on the 64x64 ramp on the integer 5/3 (filter Q)
+  path. The pre-round-210 baseline pinned `wavelet_levels = 2` so any
+  cost change from the dyadic recursion depth was hidden in the
+  default-depth number; the sweep splits the per-depth cost out so
+  future wavelet-cache-locality or vectorisation work has a clean
+  per-depth reference. `wavelet_levels` is clamped to `1..=6` in
+  `src/encoder.rs`; depth 4 is the deepest sensible value for a 64x64
+  input (subband LL at depth 4 is 4x4 = 16 coefficients).
+- Baseline numbers on aarch64-darwin (M-series, default `--bench`
+  opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_q_levels_64x64/levels_1`: ~254 µs / 15.4 MiB/s
+  * `encode_compressed_filter_q_levels_64x64/levels_2`: ~275 µs / 14.2 MiB/s
+  * `encode_compressed_filter_q_levels_64x64/levels_3`: ~306 µs / 12.8 MiB/s
+  * `encode_compressed_filter_q_levels_64x64/levels_4`: ~313 µs / 12.5 MiB/s
+  * `decode_compressed_filter_q_levels_64x64/levels_1`: ~233 µs / 16.8 MiB/s
+  * `decode_compressed_filter_q_levels_64x64/levels_2`: ~236 µs / 16.6 MiB/s
+  * `decode_compressed_filter_q_levels_64x64/levels_3`: ~270 µs / 14.5 MiB/s
+  * `decode_compressed_filter_q_levels_64x64/levels_4`: ~261 µs / 15.0 MiB/s
+  Encode shows a clean ~5%/depth slowdown as the dyadic recursion adds
+  forward-lifting passes; decode rises with depth on the inverse-DWT
+  cost but flattens at depth 4 because the entropy-stage cost
+  dominates over the now-tiny LL subband. The two-extreme split
+  (levels_1 = single-level DWT vs levels_4 = deepest sensible) gives
+  future wavelet-vectorisation work a ~20% encode-side headroom
+  envelope to target on this input shape.
+
 ### Added (round 205)
 
 - Float-filter (`A`) benchmark coverage. The criterion suite under

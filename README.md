@@ -43,6 +43,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Lenient multi-segment decode | full (round 192; `parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128 like round-6 ROI placeholders; segment 0 must be present to pin canonical strip height) |
 | Encode-side fuzz harness | full (round 199; `fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the round-131 decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
 | Float-filter benchmark coverage | full (round 205; criterion suite extended to cover the lossy float 9/7 CDF path -- `encode_compressed_filter_a` + `decode_compressed_filter_a` -- on the same three input shapes the filter-Q groups already exercise, so the Q-vs-A delta is directly readable from the criterion report) |
+| Wavelet-depth benchmark sweep | full (round 210; criterion suite extended with `encode_compressed_filter_q_levels_64x64` + `decode_compressed_filter_q_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the integer 5/3 path, so the per-depth cost of the dyadic DWT recursion is directly readable rather than averaged into the default-depth number) |
 
 End-to-end round-trips:
 
@@ -620,6 +621,32 @@ entropy-coder and wavelet vectorisation work has to play with. CI's
 existing `cargo build --all-targets` step exercises the bench file
 as a compilation gate; the benchmark itself is opt-in via
 `cargo bench`.
+
+Round 210 adds two more groups that sweep `wavelet_levels` over
+`[1, 2, 3, 4]` on the 64×64 ramp on the integer 5/3 (filter Q)
+path so the per-depth cost of the dyadic DWT recursion is no longer
+hidden by the round-181 default-depth pin
+(`wavelet_levels = 2`). The encode side rises linearly with depth
+(~5% per added level on this input) — every additional level adds a
+forward-lifting pass over a half-sized buffer plus its bit-plane
+scan. The decode side rises through depth 3, then flattens at
+depth 4 because the inverse-DWT cost is dominated by the entropy
+stage by then and the now-tiny LL subband (4×4 = 16 coefficients at
+depth 4) no longer changes the scanner's stripe coverage. The
+~20% encode-side spread between depth 1 (~254 µs) and depth 4
+(~313 µs) is the headroom envelope future wavelet-vectorisation
+work has on this input shape.
+
+| Group                                                  | Time   | Throughput |
+|--------------------------------------------------------|--------|------------|
+| `encode_compressed_filter_q_levels_64x64/levels_1`     | ~254 µs| ~15.4 MiB/s|
+| `encode_compressed_filter_q_levels_64x64/levels_2`     | ~275 µs| ~14.2 MiB/s|
+| `encode_compressed_filter_q_levels_64x64/levels_3`     | ~306 µs| ~12.8 MiB/s|
+| `encode_compressed_filter_q_levels_64x64/levels_4`     | ~313 µs| ~12.5 MiB/s|
+| `decode_compressed_filter_q_levels_64x64/levels_1`     | ~233 µs| ~16.8 MiB/s|
+| `decode_compressed_filter_q_levels_64x64/levels_2`     | ~236 µs| ~16.6 MiB/s|
+| `decode_compressed_filter_q_levels_64x64/levels_3`     | ~270 µs| ~14.5 MiB/s|
+| `decode_compressed_filter_q_levels_64x64/levels_4`     | ~261 µs| ~15.0 MiB/s|
 
 ## Licence
 
