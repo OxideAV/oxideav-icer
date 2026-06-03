@@ -335,6 +335,70 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
     dec_group.finish();
 }
 
+/// Round 225 -- segment-count sweep on the integer 5/3
+/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// `segment_count = 1` (the `EncodeOptions::default` value); this group
+/// sweeps `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp so the
+/// per-strip overhead of the IPN 42-155 §III.E independent-segment
+/// partitioning is visible per-count rather than hidden by the
+/// single-segment default. Each segment carries its own 12-byte segment
+/// header + an independent arithmetic-coder context model + its own
+/// stripe-ordered bit-plane scan, so the per-segment fixed cost is
+/// expected to dominate the throughput trend as `segment_count` rises
+/// against a fixed pixel budget.
+///
+/// Encode + decode are reported as separate benches against the same
+/// per-count input so the per-stage cost is directly readable.
+///
+/// `segment_count` is clamped to `1..=u16::MAX` by the encoder, but the
+/// usable upper bound on a 64x64 input is constrained by the encoder's
+/// "minimum 2 rows per strip" check (see `encoder.rs`). The chosen
+/// sweep `[1, 2, 4, 8]` keeps every strip at >= 8 rows (64 / 8 = 8),
+/// well above the floor.
+fn compressed_filter_q_opts_segments(segments: u16) -> EncodeOptions {
+    EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        wavelet_levels: 2,
+        bit_plane_count: 8,
+        uncompressed: false,
+        segment_count: segments,
+        ..EncodeOptions::default()
+    }
+}
+
+fn bench_segment_count_sweep(c: &mut Criterion) {
+    const SEGMENTS: [u16; 4] = [1, 2, 4, 8];
+    let ramp = ramp_image(64, 64);
+    let pixel_bytes = (ramp.width as u64) * (ramp.height as u64);
+
+    let mut enc_group = c.benchmark_group("encode_compressed_filter_q_segments_64x64");
+    enc_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &n in &SEGMENTS {
+        let opts = compressed_filter_q_opts_segments(n);
+        enc_group.bench_function(format!("segments_{}", n), |b| {
+            b.iter(|| {
+                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                black_box(bytes);
+            });
+        });
+    }
+    enc_group.finish();
+
+    let mut dec_group = c.benchmark_group("decode_compressed_filter_q_segments_64x64");
+    dec_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &n in &SEGMENTS {
+        let opts = compressed_filter_q_opts_segments(n);
+        let bytes = encode_icer(&ramp, &opts).unwrap();
+        dec_group.bench_function(format!("segments_{}", n), |b| {
+            b.iter(|| {
+                let img = parse_icer(black_box(&bytes)).unwrap();
+                black_box(img);
+            });
+        });
+    }
+    dec_group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -342,5 +406,6 @@ criterion_group!(
     bench_uncompressed_path,
     bench_filter_a_path,
     bench_wavelet_levels_sweep,
+    bench_segment_count_sweep,
 );
 criterion_main!(benches);

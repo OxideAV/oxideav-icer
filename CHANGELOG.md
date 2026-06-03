@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 225)
+
+- Segment-count sweep in the criterion suite under
+  `benches/encode_decode.rs`. Two new groups,
+  `encode_compressed_filter_q_segments_64x64` and
+  `decode_compressed_filter_q_segments_64x64`, sweep `segment_count`
+  over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 (filter Q)
+  path. The round-181 baseline pinned `segment_count = 1` (the
+  `EncodeOptions::default` value) so the per-strip overhead of the
+  IPN 42-155 §III.E independent-segment partitioning was hidden in the
+  single-segment number; the sweep splits the per-count cost out so
+  future multi-segment work (per-segment parallelism, shared-context
+  reuse, lenient-decode tightening) has a clean per-count reference.
+  Every value in `[1, 2, 4, 8]` keeps strips >= 8 rows on the 64x64
+  ramp, well above the encoder's "minimum 2 rows per strip" floor.
+- Baseline numbers on aarch64-darwin (M-series, default `--bench`
+  opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_q_segments_64x64/segments_1`: ~292 µs / 13.4 MiB/s
+  * `encode_compressed_filter_q_segments_64x64/segments_2`: ~288 µs / 13.6 MiB/s
+  * `encode_compressed_filter_q_segments_64x64/segments_4`: ~296 µs / 13.2 MiB/s
+  * `encode_compressed_filter_q_segments_64x64/segments_8`: ~317 µs / 12.3 MiB/s
+  * `decode_compressed_filter_q_segments_64x64/segments_1`: ~258 µs / 15.2 MiB/s
+  * `decode_compressed_filter_q_segments_64x64/segments_2`: ~255 µs / 15.3 MiB/s
+  * `decode_compressed_filter_q_segments_64x64/segments_4`: ~262 µs / 14.9 MiB/s
+  * `decode_compressed_filter_q_segments_64x64/segments_8`: ~279 µs / 14.0 MiB/s
+  Encode stays within criterion noise across `segments_1..4` then takes
+  a ~9% step up at `segments_8` as the per-strip fixed cost
+  (arith-coder init + sub-band de-interleave + wavelet boundary
+  handling) starts dominating the now-tiny 8-row strip payload. Decode
+  rises monotonically (~258 → ~282 µs) on the per-segment framing-parse
+  cost. The ~10% encode-side spread is the headroom envelope future
+  multi-segment encoder work has on this input shape.
+
 ### Added (round 210)
 
 - Wavelet-decomposition-depth sweep in the criterion suite under

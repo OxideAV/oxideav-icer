@@ -44,6 +44,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Encode-side fuzz harness | full (round 199; `fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the round-131 decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
 | Float-filter benchmark coverage | full (round 205; criterion suite extended to cover the lossy float 9/7 CDF path -- `encode_compressed_filter_a` + `decode_compressed_filter_a` -- on the same three input shapes the filter-Q groups already exercise, so the Q-vs-A delta is directly readable from the criterion report) |
 | Wavelet-depth benchmark sweep | full (round 210; criterion suite extended with `encode_compressed_filter_q_levels_64x64` + `decode_compressed_filter_q_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the integer 5/3 path, so the per-depth cost of the dyadic DWT recursion is directly readable rather than averaged into the default-depth number) |
+| Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
 
 End-to-end round-trips:
 
@@ -647,6 +648,39 @@ work has on this input shape.
 | `decode_compressed_filter_q_levels_64x64/levels_2`     | ~236 µs| ~16.6 MiB/s|
 | `decode_compressed_filter_q_levels_64x64/levels_3`     | ~270 µs| ~14.5 MiB/s|
 | `decode_compressed_filter_q_levels_64x64/levels_4`     | ~261 µs| ~15.0 MiB/s|
+
+Round 225 adds two more groups that sweep `segment_count` over
+`[1, 2, 4, 8]` on the 64×64 ramp on the integer 5/3 (filter Q) path
+so the per-strip overhead of the IPN 42-155 §III.E independent-segment
+partitioning is no longer hidden by the round-181 single-segment
+default (`segment_count = 1`, the `EncodeOptions::default` value).
+Each additional segment carries its own 12-byte segment header + a
+fresh adaptive arithmetic-coder context model + an independent
+stripe-ordered bit-plane scan, so the per-segment fixed cost
+accumulates linearly while each strip's payload shrinks
+proportionally. The encode side is essentially flat (within criterion
+noise) between `segments_1`, `segments_2`, and `segments_4` (each
+~290 µs / ~13.4 MiB/s on the 64×64 ramp), then takes a ~9% step up at
+`segments_8` (~317 µs / ~12.3 MiB/s) as the per-strip fixed overhead
+(arith-coder init + sub-band de-interleave + per-strip wavelet
+boundary handling) starts to dominate over the now-tiny 8-row strip
+payload. The decode side rises monotonically (~258 → ~282 µs) because
+the decoder pays the per-segment framing-parse cost on every segment
+regardless of payload size. The ~10% encode-side spread between
+`segments_1` and `segments_8` is the headroom envelope future
+multi-segment encoder work (per-segment parallelism, shared-context
+reuse) has on this input shape.
+
+| Group                                                       | Time    | Throughput |
+|-------------------------------------------------------------|---------|------------|
+| `encode_compressed_filter_q_segments_64x64/segments_1`      | ~292 µs | ~13.4 MiB/s|
+| `encode_compressed_filter_q_segments_64x64/segments_2`      | ~288 µs | ~13.6 MiB/s|
+| `encode_compressed_filter_q_segments_64x64/segments_4`      | ~296 µs | ~13.2 MiB/s|
+| `encode_compressed_filter_q_segments_64x64/segments_8`      | ~317 µs | ~12.3 MiB/s|
+| `decode_compressed_filter_q_segments_64x64/segments_1`      | ~258 µs | ~15.2 MiB/s|
+| `decode_compressed_filter_q_segments_64x64/segments_2`      | ~255 µs | ~15.3 MiB/s|
+| `decode_compressed_filter_q_segments_64x64/segments_4`      | ~262 µs | ~14.9 MiB/s|
+| `decode_compressed_filter_q_segments_64x64/segments_8`      | ~279 µs | ~14.0 MiB/s|
 
 ## Licence
 
