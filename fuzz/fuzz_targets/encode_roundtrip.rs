@@ -171,6 +171,7 @@ fuzz_target!(|data: &[u8]| {
         segment_priorities,
         rd_pruning,
         auto_uncompressed_fallback,
+        quality_target_psnr: None,
     };
 
     // ---- Encode ------------------------------------------------------

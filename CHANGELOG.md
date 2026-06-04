@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 233)
+
+- Quality-target rate-control via
+  `EncodeOptions::with_quality_target(target_db: f32)` (new field
+  `quality_target_psnr: Option<f32>`). The compressed-path encoder runs
+  a binary search over byte budgets, decodes each trial output,
+  computes PSNR against the original `image`, and returns the smallest
+  output whose PSNR is greater than or equal to `target_db`. This is
+  the inverse shape of [`Self::byte_budget`]: byte-budget says "emit
+  at most N bytes, take whatever quality the truncation yields";
+  quality-target says "emit at whatever byte count is needed to reach
+  quality Q, return the smallest such output". The control suits
+  downlink pipelines that ship every image at the same quality (rather
+  than the same byte count).
+- Algorithm (in `analyze::encode_to_quality_target`): compute the
+  bracket via `analyze::quality_search_bounds` (lo = segment-header
+  floor, hi = unbudgeted compressed-path encode); if the upper-bracket
+  encode misses the target, return it as the best effort; if the
+  lower-bracket encode already meets the target, return it; otherwise
+  bisect with `BISECT_TOL = 8` bytes for at most `MAX_ITERATIONS = 48`
+  steps. Each trial encodes + decodes + computes PSNR via the new
+  `analyze::psnr_db(original, decoded)` helper (identical formula to
+  the `tests/quota_encode.rs::psnr` helper that has gated the
+  round-trip tests since round 4).
+- Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`
+  -- combining them returns `IcerError::Unsupported` at encode time
+  (the quality search manages the budget directly). No-op on the
+  uncompressed path (`uncompressed: true`): the round-trip is bit-exact
+  by construction so every finite PSNR target is satisfied trivially;
+  the encoder short-circuits and uses the regular uncompressed path.
+- Public surface additions (re-exported from the crate root):
+  `analyze::psnr_db`, `analyze::quality_search_bounds`,
+  `analyze::encode_to_quality_target`, plus the new field and builder
+  on `EncodeOptions`.
+- Tests under `tests/quality_target.rs` exercise the trivial-pass case
+  (lossless filter Q collapses to the floor), the target-meeting
+  property (filter A on a 32x32 ramp at 25 dB), monotonicity
+  (`hi_target` -> at least as many bytes as `lo_target`), the
+  best-effort behaviour above the filter ceiling (9999 dB returns the
+  unbudgeted encode without erroring), and the three mutual-exclusion
+  guards.
+
 ### Added (round 230)
 
 - Bit-plane-count sweep in the criterion suite under

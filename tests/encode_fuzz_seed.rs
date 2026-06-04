@@ -127,6 +127,7 @@ fn drive(data: &[u8]) -> bool {
         segment_priorities,
         rd_pruning,
         auto_uncompressed_fallback,
+        quality_target_psnr: None,
     };
 
     let encoded = match encode_icer(&img, &opts) {

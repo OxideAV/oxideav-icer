@@ -196,6 +196,52 @@ pub struct EncodeOptions {
     /// `false` (the default) keeps the compressed-or-fail semantic
     /// callers had before this option existed.
     pub auto_uncompressed_fallback: bool,
+    /// Quality-target rate-control (round 233).
+    ///
+    /// When `Some(target_db)`, the compressed-path encoder runs a binary
+    /// search over `byte_budget` candidates, decoding each trial output
+    /// and computing the PSNR (dB) of the reconstruction against the
+    /// original `image`. The smallest output whose PSNR is greater than
+    /// or equal to `target_db` is emitted.
+    ///
+    /// This is the inverse of [`Self::byte_budget`]: byte-budget says
+    /// "encode at most N bytes, take whatever quality that yields";
+    /// quality-target says "encode at whatever byte count is needed to
+    /// reach quality Q, return the smallest such output". For
+    /// bandwidth-limited downlink pipelines that ship every image at the
+    /// same quality (rather than the same byte count) this is the
+    /// natural control knob.
+    ///
+    /// The search is bracketed by the byte-count range exposed by
+    /// [`crate::analyze::quality_search_bounds`] (a small lower bound
+    /// covering a header-only emission and an upper bound covering an
+    /// unbudgeted compressed-path encode). It costs `O(log(N))`
+    /// encode-then-decode trials, where `N` is the byte-count range. A
+    /// `target_db` already met by the smallest trial returns the smallest
+    /// trial; a `target_db` above the unbudgeted encode's PSNR returns
+    /// the unbudgeted encode (best-effort: we can't synthesise quality
+    /// the lossy filter doesn't supply).
+    ///
+    /// Compose-rules:
+    ///
+    /// * Only fires when [`Self::uncompressed`] is `false`. Forcing the
+    ///   uncompressed path makes quality-target a no-op (uncompressed
+    ///   is bit-exact already; PSNR is `+inf`).
+    /// * Composes with [`Self::auto_filter`] / [`Self::auto_filter_rd`]:
+    ///   the search runs *after* filter resolution, so the chosen filter
+    ///   is used for every trial.
+    /// * Mutually exclusive with [`Self::byte_budget`] /
+    ///   [`Self::target_bytes`] / [`Self::rd_pruning`] (the search
+    ///   manages the budget directly). Setting both returns
+    ///   `IcerError::Unsupported` at encode time.
+    /// * The PSNR used is identical to the one computed in the
+    ///   round-trip tests: MSE over the first plane, then `10 *
+    ///   log10(255^2 / MSE)`. Identical reconstructions return
+    ///   `f32::INFINITY` and trivially satisfy any finite `target_db`.
+    ///
+    /// `None` (the default) preserves the pre-round-233 behaviour: no
+    /// quality search, the caller's `byte_budget` (if any) governs.
+    pub quality_target_psnr: Option<f32>,
 }
 
 impl Default for EncodeOptions {
@@ -219,6 +265,7 @@ impl Default for EncodeOptions {
             segment_priorities: None,
             rd_pruning: false,
             auto_uncompressed_fallback: false,
+            quality_target_psnr: None,
         }
     }
 }
@@ -383,6 +430,23 @@ impl EncodeOptions {
         self.auto_uncompressed_fallback = true;
         self
     }
+
+    /// Enable quality-target rate-control (round 233). See
+    /// [`EncodeOptions::quality_target_psnr`] for the full contract.
+    ///
+    /// `target_db` is the minimum acceptable PSNR (dB) of the decoded
+    /// reconstruction relative to the input. The encoder runs a binary
+    /// search over byte-budget values and returns the smallest output
+    /// whose decoded PSNR is greater than or equal to `target_db`.
+    ///
+    /// Mutually exclusive with [`Self::with_byte_budget`] /
+    /// [`Self::with_target_bytes`] / [`Self::with_rd_budget`] (the
+    /// search manages the byte budget directly).
+    #[must_use]
+    pub fn with_quality_target(mut self, target_db: f32) -> Self {
+        self.quality_target_psnr = Some(target_db);
+        self
+    }
 }
 
 /// Encode `image` into the on-the-wire ICER byte stream. Single or
@@ -427,6 +491,38 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
         opts.clone()
     };
     let opts = &resolved_opts;
+
+    // Round 233: quality-target rate-control. Run a binary search over
+    // byte-budget values, encode + decode each trial, compute PSNR,
+    // and emit the smallest output meeting the target. The search is
+    // implemented in `crate::analyze` so the encoder's main flow stays
+    // focused on the single-shot path.
+    if let Some(target_db) = opts.quality_target_psnr {
+        if !opts.uncompressed {
+            // Reject conflicting options up-front: byte_budget /
+            // target_bytes / rd_pruning all conflict with the quality
+            // search managing the budget itself.
+            if opts.byte_budget.is_some() {
+                return Err(IcerError::Unsupported(
+                    "quality_target_psnr conflicts with byte_budget; pick one".into(),
+                ));
+            }
+            if opts.target_bytes.is_some() {
+                return Err(IcerError::Unsupported(
+                    "quality_target_psnr conflicts with target_bytes; pick one".into(),
+                ));
+            }
+            if opts.rd_pruning {
+                return Err(IcerError::Unsupported(
+                    "quality_target_psnr conflicts with rd_pruning; pick one".into(),
+                ));
+            }
+            return crate::analyze::encode_to_quality_target(image, opts, target_db);
+        }
+        // Uncompressed-forced: the round-trip is bit-exact by
+        // construction, every finite PSNR target is satisfied
+        // trivially. Fall through to the regular encode path.
+    }
 
     let segment_count = opts.segment_count.max(1);
     let levels = opts.wavelet_levels.clamp(1, 6);

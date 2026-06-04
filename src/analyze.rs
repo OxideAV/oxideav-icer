@@ -258,6 +258,215 @@ pub fn supported_for_analysis(image: &IcerImage) -> bool {
         && image.height > 0
 }
 
+/// Compute PSNR (dB) of the first plane of `decoded` against `original`.
+///
+/// Returns [`f32::INFINITY`] when the planes are bit-identical (MSE
+/// 0). Returns a finite, non-negative value otherwise (the
+/// `10 * log10(255^2 / MSE)` formula used in every round-trip test in
+/// this crate). Panics on dimension mismatch or empty planes -- callers
+/// are expected to feed a same-shape `(original, decoded)` pair.
+pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
+    assert_eq!(original.width, decoded.width, "psnr_db: width mismatch");
+    assert_eq!(original.height, decoded.height, "psnr_db: height mismatch");
+    let w = original.width as usize;
+    let h = original.height as usize;
+    let n = (w * h) as f64;
+    if n == 0.0 {
+        return f32::INFINITY;
+    }
+    let op = original
+        .planes
+        .first()
+        .expect("psnr_db: original has no planes");
+    let dp = decoded
+        .planes
+        .first()
+        .expect("psnr_db: decoded has no planes");
+    let mut mse_sum = 0.0f64;
+    for y in 0..h {
+        let orow = &op.data[y * op.stride..y * op.stride + w];
+        let drow = &dp.data[y * dp.stride..y * dp.stride + w];
+        for x in 0..w {
+            let diff = orow[x] as f64 - drow[x] as f64;
+            mse_sum += diff * diff;
+        }
+    }
+    let mse = mse_sum / n;
+    if mse == 0.0 {
+        f32::INFINITY
+    } else {
+        (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+    }
+}
+
+/// Compute the bracket `(lo_bytes, hi_bytes)` used by the quality-target
+/// binary search.
+///
+/// * `lo_bytes` is a small floor: the per-segment header size plus the
+///   theoretical minimum body-bit count. Trial encodes below this would
+///   be header-only emissions and have no chance of meeting any
+///   non-trivial PSNR target.
+/// * `hi_bytes` is the size of an unbudgeted compressed-path encode of
+///   `image` under `opts`. The encoder cannot synthesise quality above
+///   what a full encode produces, so `hi_bytes` is the natural upper
+///   bound of the search.
+///
+/// Returns `Err` only if the unbudgeted encode fails (in which case the
+/// quality search cannot proceed either).
+pub fn quality_search_bounds(
+    image: &IcerImage,
+    opts: &crate::encoder::EncodeOptions,
+) -> Result<(u64, u64)> {
+    use crate::header::SegmentHeader;
+
+    // Unbudgeted encode (no byte_budget / target_bytes / rd_pruning /
+    // quality_target_psnr). This is the size of the best-quality output
+    // the configured filter can produce on `image`; any search budget
+    // above it is wasted.
+    let mut clean_opts = opts.clone();
+    clean_opts.byte_budget = None;
+    clean_opts.target_bytes = None;
+    clean_opts.rd_pruning = false;
+    clean_opts.quality_target_psnr = None;
+    clean_opts.auto_uncompressed_fallback = false;
+    let hi_bytes = crate::encoder::encode_icer(image, &clean_opts)?.len() as u64;
+
+    // Lower bound: per-segment header overhead. A useful encode must
+    // ship at least the headers of every segment.
+    let segs = opts.segment_count.max(1) as u64;
+    let lo_bytes = segs * (SegmentHeader::ENCODED_BYTES as u64);
+
+    // Clamp lo to hi: degenerate cases (tiny images that even an
+    // unbudgeted encode finishes in less than the header-only bound)
+    // collapse the search to a single point.
+    let lo_bytes = lo_bytes.min(hi_bytes);
+    Ok((lo_bytes, hi_bytes))
+}
+
+/// Quality-target rate-control: binary search over byte budgets and
+/// return the smallest output whose decoded PSNR meets or exceeds
+/// `target_db`.
+///
+/// This is the body of the [`crate::encoder::EncodeOptions::quality_target_psnr`]
+/// dispatch path; it lives here because the bracket / PSNR helpers are
+/// shared with the `pick_filter_by_rate_distortion` family.
+///
+/// Algorithm:
+///
+/// 1. Compute the search bounds via [`quality_search_bounds`].
+/// 2. If the unbudgeted encode already misses the target, return it
+///    (best-effort: the configured filter caps the achievable quality).
+/// 3. If the smallest-bracket encode meets the target, return it (the
+///    floor wins).
+/// 4. Otherwise binary-search the byte budget. At each step encode at
+///    the mid budget, decode, compute PSNR. If PSNR >= target keep mid
+///    as the running winner and search the lower half; otherwise
+///    search the upper half. Stop when the bracket collapses to within
+///    `BISECT_TOL` bytes.
+///
+/// The trial-encode path uses a clone of `opts` with
+/// `quality_target_psnr` cleared and `byte_budget` set to the trial
+/// value, so the regular byte-budget machinery (and its
+/// already-tested guarantees) does the real work on every iteration.
+pub fn encode_to_quality_target(
+    image: &IcerImage,
+    opts: &crate::encoder::EncodeOptions,
+    target_db: f32,
+) -> Result<Vec<u8>> {
+    /// Stop the bisection once `hi - lo` falls below this many bytes.
+    /// Smaller values cost more trial encodes; larger values can miss a
+    /// few-byte saving. 8 bytes is well below the ~12-byte segment
+    /// header overhead and keeps the search to ~log2(hi_bytes / 8)
+    /// iterations.
+    const BISECT_TOL: u64 = 8;
+    /// Hard cap on the bisection iteration count. log2(2^31) is 31; we
+    /// pad up to 48 so a misbehaving `hi_bytes` (e.g. ~4 GB synthetic
+    /// upper bound) still terminates in finite time.
+    const MAX_ITERATIONS: usize = 48;
+
+    let (lo_bytes, hi_bytes) = quality_search_bounds(image, opts)?;
+    if lo_bytes >= hi_bytes {
+        // Degenerate single-point bracket: the unbudgeted encode is at
+        // or below the floor. Return it directly.
+        let mut clean = opts.clone();
+        clean.quality_target_psnr = None;
+        return crate::encoder::encode_icer(image, &clean);
+    }
+
+    // Helper closure to encode + decode + compute PSNR at a given byte
+    // budget. Clones `opts` and clears the quality-target field so the
+    // recursive call hits the regular byte-budget path.
+    let trial = |budget: u64| -> Result<(Vec<u8>, f32)> {
+        let mut trial_opts = opts.clone();
+        trial_opts.quality_target_psnr = None;
+        trial_opts.byte_budget = Some(budget);
+        // `rd_pruning` deliberately preserved here so a caller who set
+        // `rd_pruning = true` BUT did not set byte_budget gets the
+        // benefit of R-D packet selection on every trial. The
+        // mutual-exclusion check at the encoder entry only rejects the
+        // *combination* (rd_pruning + quality_target_psnr) when
+        // rd_pruning was set with the explicit-budget flow. In the
+        // current API surface `with_quality_target` doesn't set
+        // rd_pruning, so this branch is academic; we preserve the field
+        // to leave room for future composition.
+        let bytes = crate::encoder::encode_icer(image, &trial_opts)?;
+        let decoded = crate::decoder::parse_icer(&bytes)?;
+        let p = psnr_db(image, &decoded);
+        Ok((bytes, p))
+    };
+
+    // Upper-bracket trial first: if the unbudgeted-equivalent encode
+    // misses the target, no smaller encode will meet it either. Return
+    // the upper encode as the best effort.
+    let (hi_out, hi_psnr) = trial(hi_bytes)?;
+    if hi_psnr < target_db {
+        return Ok(hi_out);
+    }
+
+    // Lower-bracket trial: if even the floor encode meets the target,
+    // return it directly (lossless inputs / very-flat content land
+    // here).
+    let (lo_out, lo_psnr) = trial(lo_bytes)?;
+    if lo_psnr >= target_db {
+        return Ok(lo_out);
+    }
+
+    // Binary search. Invariant: the byte budget at `best_budget` (when
+    // `best` is `Some`) is the smallest known to meet the target.
+    // Initial `best` is the upper-bracket encode (proven to meet).
+    let mut best: Vec<u8> = hi_out;
+    let mut lo = lo_bytes;
+    let mut hi = hi_bytes;
+    for _ in 0..MAX_ITERATIONS {
+        if hi - lo <= BISECT_TOL {
+            break;
+        }
+        let mid = lo + (hi - lo) / 2;
+        match trial(mid) {
+            Ok((bytes, p)) => {
+                if p >= target_db {
+                    // Mid encode meets the target; record as the new
+                    // best and search the lower half.
+                    best = bytes;
+                    hi = mid;
+                } else {
+                    // Mid encode misses the target; search the upper
+                    // half.
+                    lo = mid;
+                }
+            }
+            Err(_) => {
+                // Trial-encode failure (e.g. budget below the
+                // mechanical minimum the encoder can write). Treat as
+                // "this budget cannot meet the target" and search the
+                // upper half.
+                lo = mid;
+            }
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
