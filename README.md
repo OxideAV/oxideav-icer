@@ -45,6 +45,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Float-filter benchmark coverage | full (round 205; criterion suite extended to cover the lossy float 9/7 CDF path -- `encode_compressed_filter_a` + `decode_compressed_filter_a` -- on the same three input shapes the filter-Q groups already exercise, so the Q-vs-A delta is directly readable from the criterion report) |
 | Wavelet-depth benchmark sweep | full (round 210; criterion suite extended with `encode_compressed_filter_q_levels_64x64` + `decode_compressed_filter_q_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the integer 5/3 path, so the per-depth cost of the dyadic DWT recursion is directly readable rather than averaged into the default-depth number) |
 | Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
+| Bit-plane-count benchmark sweep | full (round 230; criterion suite extended with `encode_compressed_filter_q_bit_planes_64x64` + `decode_compressed_filter_q_bit_planes_64x64` groups sweeping `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 path, so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering is visible per-floor rather than hidden by the round-181 default-floor pin -- `bit_plane_count` is a floor on `q`, so raising it above the natural `needed` walks pure per-packet overhead) |
 
 End-to-end round-trips:
 
@@ -681,6 +682,37 @@ reuse) has on this input shape.
 | `decode_compressed_filter_q_segments_64x64/segments_2`      | ~255 µs | ~15.3 MiB/s|
 | `decode_compressed_filter_q_segments_64x64/segments_4`      | ~262 µs | ~14.9 MiB/s|
 | `decode_compressed_filter_q_segments_64x64/segments_8`      | ~279 µs | ~14.0 MiB/s|
+
+Round 230 adds two more groups that sweep `bit_plane_count` over
+`[4, 8, 12, 16]` on the 64×64 ramp on the integer 5/3 (filter Q) path
+so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering
+is no longer hidden by the round-181 default-floor pin
+(`bit_plane_count = 8`). The field acts as a floor on the per-segment
+packet-count `q` (`q = max(needed_for_largest_coeff,
+caller_floor).min(31)`), so raising it above the natural `needed`
+forces the encoder to emit additional bit-plane pairs that mostly
+carry zero significance + zero refinement -- the cleanest way to
+isolate the per-packet fixed cost (arith-coder init / flush / packet
+framing) from coefficient-magnitude noise. Both encode and decode rise
+monotonically with the floor; the largest step is between `q_8` and
+`q_12` (+42% encode, +47% decode) because the natural `needed` on the
+64×64 ramp lands around 7-8 bit-planes, so `q_4` and `q_8` both
+effectively walk the same number of packets while `q_12` and `q_16`
+add 4 and 8 extra empty pairs respectively. The ~100% encode-side
+spread between `q_4` and `q_16` is the headroom envelope future
+per-packet arith-coder-init / flush amortisation work has on this
+input shape.
+
+| Group                                                          | Time    | Throughput |
+|----------------------------------------------------------------|---------|------------|
+| `encode_compressed_filter_q_bit_planes_64x64/q_4`              | ~238 µs | ~16.4 MiB/s|
+| `encode_compressed_filter_q_bit_planes_64x64/q_8`              | ~268 µs | ~14.6 MiB/s|
+| `encode_compressed_filter_q_bit_planes_64x64/q_12`             | ~380 µs | ~10.3 MiB/s|
+| `encode_compressed_filter_q_bit_planes_64x64/q_16`             | ~480 µs |  ~8.1 MiB/s|
+| `decode_compressed_filter_q_bit_planes_64x64/q_4`              | ~207 µs | ~18.9 MiB/s|
+| `decode_compressed_filter_q_bit_planes_64x64/q_8`              | ~230 µs | ~17.0 MiB/s|
+| `decode_compressed_filter_q_bit_planes_64x64/q_12`             | ~339 µs | ~11.5 MiB/s|
+| `decode_compressed_filter_q_bit_planes_64x64/q_16`             | ~415 µs |  ~9.4 MiB/s|
 
 ## Licence
 

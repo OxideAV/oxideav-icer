@@ -399,6 +399,77 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
     dec_group.finish();
 }
 
+/// Round 230 -- bit-plane-count sweep on the integer 5/3
+/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// `bit_plane_count = 8` (the round-181 baseline); this group sweeps
+/// `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp so the
+/// per-packet overhead of the IPN 42-155 §IV multi-packet ordering is
+/// visible per-count rather than hidden by the default-floor pin.
+/// `bit_plane_count` acts as a floor on the per-segment packet-count `q`
+/// (the encoder takes `q = max(needed_for_largest_coeff,
+/// caller_floor).min(31)`), so raising it above the natural `needed`
+/// forces the encoder to emit additional bit-plane pairs that mostly
+/// carry zero significance bits + zero refinement bits -- the cleanest
+/// way to expose the per-packet fixed overhead of the arithmetic-coder
+/// init / flush / framing in isolation from coefficient-magnitude noise.
+///
+/// Encode + decode are reported as separate benches against the same
+/// per-count input so the per-stage cost is directly readable.
+///
+/// `bit_plane_count` is clamped to `1..=31` by the encoder (see
+/// `encoder.rs`); the chosen sweep `[4, 8, 12, 16]` brackets the
+/// round-181 default (`8`) symmetrically on the low side (entropy stage
+/// dominated by the largest-coefficient `needed` floor; the caller
+/// floor is overridden) and walks up to `16` on the high side (well
+/// above what any natural 8-bit Gray8 input ever reaches; every added
+/// plane is pure per-packet overhead). The 64x64 ramp's `needed` is
+/// `select_bit_plane_count` of the DWT coefficients (filter Q on this
+/// shape lands around 8 bit-planes), so `4` and `8` collapse to the
+/// same effective `q` while `12` and `16` walk above it; the floor /
+/// no-floor split is exactly the interesting dynamic.
+fn compressed_filter_q_opts_bit_planes(bit_planes: u8) -> EncodeOptions {
+    EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        wavelet_levels: 2,
+        bit_plane_count: bit_planes,
+        uncompressed: false,
+        ..EncodeOptions::default()
+    }
+}
+
+fn bench_bit_plane_count_sweep(c: &mut Criterion) {
+    const BIT_PLANES: [u8; 4] = [4, 8, 12, 16];
+    let ramp = ramp_image(64, 64);
+    let pixel_bytes = (ramp.width as u64) * (ramp.height as u64);
+
+    let mut enc_group = c.benchmark_group("encode_compressed_filter_q_bit_planes_64x64");
+    enc_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &q in &BIT_PLANES {
+        let opts = compressed_filter_q_opts_bit_planes(q);
+        enc_group.bench_function(format!("q_{}", q), |b| {
+            b.iter(|| {
+                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                black_box(bytes);
+            });
+        });
+    }
+    enc_group.finish();
+
+    let mut dec_group = c.benchmark_group("decode_compressed_filter_q_bit_planes_64x64");
+    dec_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &q in &BIT_PLANES {
+        let opts = compressed_filter_q_opts_bit_planes(q);
+        let bytes = encode_icer(&ramp, &opts).unwrap();
+        dec_group.bench_function(format!("q_{}", q), |b| {
+            b.iter(|| {
+                let img = parse_icer(black_box(&bytes)).unwrap();
+                black_box(img);
+            });
+        });
+    }
+    dec_group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -407,5 +478,6 @@ criterion_group!(
     bench_filter_a_path,
     bench_wavelet_levels_sweep,
     bench_segment_count_sweep,
+    bench_bit_plane_count_sweep,
 );
 criterion_main!(benches);

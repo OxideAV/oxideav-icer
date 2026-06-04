@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 230)
+
+- Bit-plane-count sweep in the criterion suite under
+  `benches/encode_decode.rs`. Two new groups,
+  `encode_compressed_filter_q_bit_planes_64x64` and
+  `decode_compressed_filter_q_bit_planes_64x64`, sweep `bit_plane_count`
+  over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 (filter Q)
+  path. The round-181 baseline pinned `bit_plane_count = 8` (the
+  round-181 default) so the per-bit-plane overhead of the IPN 42-155 §IV
+  multi-packet ordering was hidden in the default-floor number; the
+  sweep splits the per-count cost out so future entropy-stage work
+  (per-packet flush amortisation, bit-plane scanner vectorisation) has
+  a clean per-floor reference. `bit_plane_count` acts as a floor on the
+  per-segment packet-count `q` (`q = max(needed_for_largest_coeff,
+  caller_floor).min(31)`), so raising it above the natural `needed`
+  forces the encoder to emit additional bit-plane pairs that mostly
+  carry zero significance + zero refinement -- the cleanest way to
+  isolate the per-packet fixed cost (arith-coder init / flush / packet
+  framing) from coefficient-magnitude noise. The chosen sweep `[4, 8,
+  12, 16]` brackets the round-181 default symmetrically: `q_4` lands at
+  the natural floor (overridden by `needed`), `q_8` is the round-181
+  default, and `q_12` / `q_16` walk well above what any 8-bit Gray8
+  input ever reaches so every added plane is pure per-packet overhead.
+- Baseline numbers on aarch64-darwin (M-series, default `--bench`
+  opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_q_bit_planes_64x64/q_4`: ~238 µs / 16.4 MiB/s
+  * `encode_compressed_filter_q_bit_planes_64x64/q_8`: ~268 µs / 14.6 MiB/s
+  * `encode_compressed_filter_q_bit_planes_64x64/q_12`: ~380 µs / 10.3 MiB/s
+  * `encode_compressed_filter_q_bit_planes_64x64/q_16`: ~480 µs / 8.1 MiB/s
+  * `decode_compressed_filter_q_bit_planes_64x64/q_4`: ~207 µs / 18.9 MiB/s
+  * `decode_compressed_filter_q_bit_planes_64x64/q_8`: ~230 µs / 17.0 MiB/s
+  * `decode_compressed_filter_q_bit_planes_64x64/q_12`: ~339 µs / 11.5 MiB/s
+  * `decode_compressed_filter_q_bit_planes_64x64/q_16`: ~415 µs / 9.4 MiB/s
+  Encode + decode both rise monotonically with the caller-supplied
+  floor as the encoder emits an extra significance + refinement packet
+  pair per added bit-plane and the decoder walks them in turn. The
+  step from `q_8` to `q_12` is the largest (+42% encode / +47% decode)
+  because `q_8` is already at-or-below the natural `needed` floor on
+  this input (the largest DWT coefficient on the 64x64 ramp lands
+  around 7-8 bit-planes), so `q_4` and `q_8` both effectively walk the
+  same number of packets while `q_12` and `q_16` add 4 and 8 extra
+  empty pairs respectively. The ~100% encode-side spread between `q_4`
+  and `q_16` is the headroom envelope future per-packet
+  arith-coder-init / flush amortisation work has on this input shape.
+
 ### Added (round 225)
 
 - Segment-count sweep in the criterion suite under
