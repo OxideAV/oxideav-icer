@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 262)
+
+- Filter-A wavelet-depth sweep in the criterion suite under
+  `benches/encode_decode.rs`. Two new groups,
+  `encode_compressed_filter_a_levels_64x64` and
+  `decode_compressed_filter_a_levels_64x64`, sweep `wavelet_levels` over
+  `[1, 2, 3, 4]` on the 64x64 ramp on the lossy float 9/7 (`NineSevenA`)
+  path -- the round-210 filter-Q `wavelet_levels` sweep's counterpart for
+  the float CDF lifting recursion. The round-205 filter-A coverage pinned
+  the round-181 default `wavelet_levels = 2`, so the per-depth cost of
+  the float dyadic DWT recursion was hidden in the default-depth filter-A
+  number; the sweep splits the per-depth cost out so future float-DWT
+  work (lifting vectorisation, IEEE-754 quantisation amortisation) has a
+  clean per-depth reference. The interesting Q-vs-A delta on a per-depth
+  basis is the lifting arithmetic cost -- filter Q's integer 5/3 lifting
+  is pure `i32` add/shift, filter A's float 9/7 CDF lifting is `f64`
+  multiply-add. Both paths share the same bit-plane scanner +
+  arithmetic coder, so the slope difference between this group and the
+  round-210 `encode_compressed_filter_q_levels_64x64` group isolates the
+  float-vs-integer lifting overhead per added dyadic level.
+- Baseline numbers on aarch64-darwin (M-series, default `--bench`
+  opt-level, criterion `--quick` smoke):
+  * `encode_compressed_filter_a_levels_64x64/levels_1`: ~354 µs / 11.0 MiB/s
+  * `encode_compressed_filter_a_levels_64x64/levels_2`: ~441 µs /  8.8 MiB/s
+  * `encode_compressed_filter_a_levels_64x64/levels_3`: ~477 µs /  8.2 MiB/s
+  * `encode_compressed_filter_a_levels_64x64/levels_4`: ~445 µs /  8.8 MiB/s
+  * `decode_compressed_filter_a_levels_64x64/levels_1`: ~224 µs / 17.4 MiB/s
+  * `decode_compressed_filter_a_levels_64x64/levels_2`: ~247 µs / 15.8 MiB/s
+  * `decode_compressed_filter_a_levels_64x64/levels_3`: ~273 µs / 14.2 MiB/s
+  * `decode_compressed_filter_a_levels_64x64/levels_4`: ~243 µs / 16.1 MiB/s
+  Encode rises monotonically from depth 1 through depth 3, then flattens
+  at depth 4 because the now-tiny LL subband (4x4 = 16 coefficients at
+  depth 4) stops adding meaningful forward-lifting work on top of the
+  entropy stage. Decode shows the same shape -- the bit-plane scanner's
+  stripe coverage hits the same floor regardless of filter choice.
+  Filter A is consistently ~40% slower on encode than filter Q at the
+  same depth (round 210: ~254-313 µs), which quantifies the float
+  lifting overhead vs the integer 5/3 lifting; decode shows ~5% delta
+  because the inverse path is entropy-coder dominated.
+
 ### Added (round 233)
 
 - Quality-target rate-control via

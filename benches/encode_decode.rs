@@ -470,6 +470,74 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
     dec_group.finish();
 }
 
+/// Round 262 -- wavelet-decomposition-depth sweep on the lossy float
+/// 9/7 (`NineSevenA`) path. Round 210 added the same shape of sweep
+/// over `wavelet_levels` for filter Q (integer 5/3); this group is the
+/// filter-A counterpart so the per-depth cost of the **float** dyadic
+/// recursion is directly readable rather than averaged into the
+/// round-205 default-depth (`wavelet_levels = 2`) filter-A number.
+///
+/// The interesting Q-vs-A delta on a per-depth basis is the lifting
+/// arithmetic cost -- filter Q's integer 5/3 lifting is pure `i32`
+/// add/shift, filter A's float 9/7 CDF lifting is `f64` multiply-add.
+/// Both paths share the same bit-plane scanner + arithmetic coder, so
+/// the per-depth slope difference between this group and the round-210
+/// `encode_compressed_filter_q_levels_64x64` group isolates the float
+/// vs. integer lifting overhead in the dyadic recursion (each added
+/// level adds a forward-lifting pass over a half-sized buffer).
+///
+/// Encode + decode are reported as separate benches against the same
+/// per-depth input so the forward + inverse DWT cost split is directly
+/// readable. The same `[1, 2, 3, 4]` depth set as round 210 is used so
+/// the report rows line up cell-by-cell with the integer 5/3 sweep
+/// when read side-by-side.
+///
+/// `wavelet_levels` is clamped to `1..=6` by the encoder; depth 4 is
+/// the deepest sensible value for a 64x64 input (subband LL at depth
+/// 4 is 4x4 = 16 coefficients) -- matches the round-210 ceiling.
+fn compressed_filter_a_opts_levels(levels: u8) -> EncodeOptions {
+    EncodeOptions {
+        filter: WaveletFilter::NineSevenA,
+        wavelet_levels: levels,
+        bit_plane_count: 8,
+        uncompressed: false,
+        ..EncodeOptions::default()
+    }
+}
+
+fn bench_filter_a_wavelet_levels_sweep(c: &mut Criterion) {
+    const DEPTHS: [u8; 4] = [1, 2, 3, 4];
+    let ramp = ramp_image(64, 64);
+    let pixel_bytes = (ramp.width as u64) * (ramp.height as u64);
+
+    let mut enc_group = c.benchmark_group("encode_compressed_filter_a_levels_64x64");
+    enc_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &d in &DEPTHS {
+        let opts = compressed_filter_a_opts_levels(d);
+        enc_group.bench_function(format!("levels_{}", d), |b| {
+            b.iter(|| {
+                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                black_box(bytes);
+            });
+        });
+    }
+    enc_group.finish();
+
+    let mut dec_group = c.benchmark_group("decode_compressed_filter_a_levels_64x64");
+    dec_group.throughput(Throughput::Bytes(pixel_bytes));
+    for &d in &DEPTHS {
+        let opts = compressed_filter_a_opts_levels(d);
+        let bytes = encode_icer(&ramp, &opts).unwrap();
+        dec_group.bench_function(format!("levels_{}", d), |b| {
+            b.iter(|| {
+                let img = parse_icer(black_box(&bytes)).unwrap();
+                black_box(img);
+            });
+        });
+    }
+    dec_group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -479,5 +547,6 @@ criterion_group!(
     bench_wavelet_levels_sweep,
     bench_segment_count_sweep,
     bench_bit_plane_count_sweep,
+    bench_filter_a_wavelet_levels_sweep,
 );
 criterion_main!(benches);

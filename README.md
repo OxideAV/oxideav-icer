@@ -47,6 +47,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
 | Quality-target rate-control | full (round 233; `EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget` (byte-budget pins size + reports quality; quality-target pins quality + reports size). Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op (bit-exact round-trip satisfies any finite target trivially); above-ceiling targets return the unbudgeted encode as best-effort) |
 | Bit-plane-count benchmark sweep | full (round 230; criterion suite extended with `encode_compressed_filter_q_bit_planes_64x64` + `decode_compressed_filter_q_bit_planes_64x64` groups sweeping `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 path, so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering is visible per-floor rather than hidden by the round-181 default-floor pin -- `bit_plane_count` is a floor on `q`, so raising it above the natural `needed` walks pure per-packet overhead) |
+| Filter-A wavelet-depth benchmark sweep | full (round 262; criterion suite extended with `encode_compressed_filter_a_levels_64x64` + `decode_compressed_filter_a_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the lossy float 9/7 (`NineSevenA`) path -- the round-210 filter-Q counterpart for the float CDF lifting recursion. Slope difference vs. the round-210 integer-Q sweep isolates float-vs-integer lifting overhead per added dyadic level on the otherwise-shared bit-plane scanner + arithmetic coder.) |
 
 End-to-end round-trips:
 
@@ -761,6 +762,40 @@ input shape.
 | `decode_compressed_filter_q_bit_planes_64x64/q_8`              | ~230 µs | ~17.0 MiB/s|
 | `decode_compressed_filter_q_bit_planes_64x64/q_12`             | ~339 µs | ~11.5 MiB/s|
 | `decode_compressed_filter_q_bit_planes_64x64/q_16`             | ~415 µs |  ~9.4 MiB/s|
+
+Round 262 adds two more groups that sweep `wavelet_levels` over
+`[1, 2, 3, 4]` on the 64×64 ramp on the lossy float 9/7 (`NineSevenA`)
+path -- the filter-A counterpart of the round-210 filter-Q levels
+sweep, so the per-depth cost of the **float** dyadic recursion is no
+longer averaged into the round-205 default-depth (`wavelet_levels = 2`)
+filter-A number. The interesting Q-vs-A delta on a per-depth basis is
+the lifting arithmetic cost -- filter Q's integer 5/3 lifting is pure
+`i32` add/shift, filter A's float 9/7 CDF lifting is `f64`
+multiply-add -- and both paths share the same bit-plane scanner +
+arithmetic coder, so the slope difference between this group and the
+round-210 `encode_compressed_filter_q_levels_64x64` group isolates
+the float-vs-integer lifting overhead per added dyadic level.
+Encode rises from depth 1 (~354 µs) through depth 3 (~477 µs) then
+flattens at depth 4 (~445 µs) as the now-tiny LL subband (4×4 = 16
+coefficients at depth 4) stops adding meaningful forward-lifting work
+on top of the entropy stage; decode shows the same shape (~224 µs at
+depth 1, ~273 µs at depth 3, ~243 µs at depth 4) -- the bit-plane
+scanner's stripe coverage hits the same floor regardless of filter
+choice. Filter A is consistently ~40% slower on encode than filter Q
+at the same depth (round 210: ~254-313 µs), which quantifies the float
+lifting overhead vs the integer 5/3 lifting; decode shows ~5% delta
+because the inverse path is entropy-coder dominated.
+
+| Group                                                          | Time    | Throughput |
+|----------------------------------------------------------------|---------|------------|
+| `encode_compressed_filter_a_levels_64x64/levels_1`             | ~354 µs | ~11.0 MiB/s|
+| `encode_compressed_filter_a_levels_64x64/levels_2`             | ~441 µs |  ~8.8 MiB/s|
+| `encode_compressed_filter_a_levels_64x64/levels_3`             | ~477 µs |  ~8.2 MiB/s|
+| `encode_compressed_filter_a_levels_64x64/levels_4`             | ~445 µs |  ~8.8 MiB/s|
+| `decode_compressed_filter_a_levels_64x64/levels_1`             | ~224 µs | ~17.4 MiB/s|
+| `decode_compressed_filter_a_levels_64x64/levels_2`             | ~247 µs | ~15.8 MiB/s|
+| `decode_compressed_filter_a_levels_64x64/levels_3`             | ~273 µs | ~14.2 MiB/s|
+| `decode_compressed_filter_a_levels_64x64/levels_4`             | ~243 µs | ~16.1 MiB/s|
 
 ## Licence
 
