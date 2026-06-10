@@ -299,6 +299,172 @@ pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
     }
 }
 
+/// A structured distortion report comparing a decoded image against its
+/// original, computed in a single pass over the first plane.
+///
+/// Unlike [`psnr_db`] (which panics on a shape mismatch and returns only
+/// the single PSNR number), [`DistortionReport::compare`] returns
+/// [`Err`] on a geometry contradiction and bundles every common
+/// distortion metric so a caller verifying a lossy encode (or the
+/// fidelity of an ROI-prioritised segment, round 6) gets them all
+/// without re-scanning the pixels once per metric.
+///
+/// All metrics are over the 8-bit pixel domain (`0..=255`):
+///
+/// * `mse` -- mean squared error.
+/// * `rmse` -- `sqrt(mse)`, the error in pixel units.
+/// * `mae` -- mean absolute error.
+/// * `max_abs_error` -- the single largest `|original - decoded|` over
+///   the frame (`0..=255`). A worst-case bound, useful when a mission
+///   needs a per-pixel error ceiling rather than an averaged one.
+/// * `psnr_db` -- peak signal-to-noise ratio in dB, identical to
+///   [`psnr_db`] (`f32::INFINITY` when the images are bit-identical).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DistortionReport {
+    /// Mean squared error over the first plane.
+    pub mse: f64,
+    /// Root mean squared error (`sqrt(mse)`), in pixel units.
+    pub rmse: f64,
+    /// Mean absolute error over the first plane, in pixel units.
+    pub mae: f64,
+    /// Largest single-pixel absolute error (`0..=255`).
+    pub max_abs_error: u8,
+    /// Peak signal-to-noise ratio in dB (`f32::INFINITY` if bit-exact).
+    pub psnr_db: f32,
+}
+
+impl DistortionReport {
+    /// Compare the first plane of `decoded` against `original` and
+    /// produce every distortion metric in one pass.
+    ///
+    /// Returns [`IcerError::Unsupported`] on a width/height mismatch or
+    /// when either image has no planes -- the non-panicking complement
+    /// to [`psnr_db`]. A zero-pixel image (`width == 0 || height == 0`)
+    /// is a bit-exact match by construction: all averaged metrics are
+    /// `0` and `psnr_db` is `f32::INFINITY`.
+    pub fn compare(original: &IcerImage, decoded: &IcerImage) -> Result<Self> {
+        if original.width != decoded.width || original.height != decoded.height {
+            return Err(crate::error::IcerError::unsupported(format!(
+                "distortion: geometry mismatch {}x{} vs {}x{}",
+                original.width, original.height, decoded.width, decoded.height
+            )));
+        }
+        let op = original.planes.first().ok_or_else(|| {
+            crate::error::IcerError::unsupported("distortion: original has no planes")
+        })?;
+        let dp = decoded.planes.first().ok_or_else(|| {
+            crate::error::IcerError::unsupported("distortion: decoded has no planes")
+        })?;
+
+        let w = original.width as usize;
+        let h = original.height as usize;
+        let n = (w * h) as f64;
+        if n == 0.0 {
+            return Ok(DistortionReport {
+                mse: 0.0,
+                rmse: 0.0,
+                mae: 0.0,
+                max_abs_error: 0,
+                psnr_db: f32::INFINITY,
+            });
+        }
+
+        let mut sq_sum = 0.0f64;
+        let mut abs_sum = 0.0f64;
+        let mut max_abs = 0u8;
+        for y in 0..h {
+            let orow = &op.data[y * op.stride..y * op.stride + w];
+            let drow = &dp.data[y * dp.stride..y * dp.stride + w];
+            for x in 0..w {
+                let abs = (orow[x] as i32 - drow[x] as i32).unsigned_abs() as u8;
+                if abs > max_abs {
+                    max_abs = abs;
+                }
+                let d = abs as f64;
+                sq_sum += d * d;
+                abs_sum += d;
+            }
+        }
+        let mse = sq_sum / n;
+        let psnr = if mse == 0.0 {
+            f32::INFINITY
+        } else {
+            (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+        };
+        Ok(DistortionReport {
+            mse,
+            rmse: mse.sqrt(),
+            mae: abs_sum / n,
+            max_abs_error: max_abs,
+            psnr_db: psnr,
+        })
+    }
+}
+
+/// Compute the mean absolute error over a rectangular sub-region of the
+/// first plane, in pixel units (`0.0..=255.0`).
+///
+/// The region is `[x0, x0 + region_w) x [y0, y0 + region_h)`. This is
+/// the programmatic form of the centre-band / periphery MAE comparison
+/// the round-6 ROI-prioritisation feature documents: a caller can
+/// measure that a centre strip kept its fidelity (low MAE) while the
+/// periphery was truncated (high MAE) under a tight byte budget.
+///
+/// Returns [`IcerError::Unsupported`] on a geometry mismatch, a missing
+/// plane, or a region that does not fit entirely inside the image.
+pub fn region_mae(
+    original: &IcerImage,
+    decoded: &IcerImage,
+    x0: u32,
+    y0: u32,
+    region_w: u32,
+    region_h: u32,
+) -> Result<f64> {
+    if original.width != decoded.width || original.height != decoded.height {
+        return Err(crate::error::IcerError::unsupported(format!(
+            "region_mae: geometry mismatch {}x{} vs {}x{}",
+            original.width, original.height, decoded.width, decoded.height
+        )));
+    }
+    // The region must lie fully inside the image. `checked_add` guards
+    // the u32 overflow a malicious (x0, region_w) pair could induce.
+    let x_end = x0
+        .checked_add(region_w)
+        .ok_or_else(|| crate::error::IcerError::unsupported("region_mae: x overflow"))?;
+    let y_end = y0
+        .checked_add(region_h)
+        .ok_or_else(|| crate::error::IcerError::unsupported("region_mae: y overflow"))?;
+    if x_end > original.width || y_end > original.height {
+        return Err(crate::error::IcerError::unsupported(format!(
+            "region_mae: region {x0},{y0} {region_w}x{region_h} exceeds {}x{}",
+            original.width, original.height
+        )));
+    }
+    if region_w == 0 || region_h == 0 {
+        return Ok(0.0);
+    }
+    let op = original.planes.first().ok_or_else(|| {
+        crate::error::IcerError::unsupported("region_mae: original has no planes")
+    })?;
+    let dp = decoded
+        .planes
+        .first()
+        .ok_or_else(|| crate::error::IcerError::unsupported("region_mae: decoded has no planes"))?;
+
+    let x0 = x0 as usize;
+    let x_end = x_end as usize;
+    let mut abs_sum = 0.0f64;
+    for y in y0 as usize..y_end as usize {
+        let orow = &op.data[y * op.stride + x0..y * op.stride + x_end];
+        let drow = &dp.data[y * dp.stride + x0..y * dp.stride + x_end];
+        for (o, d) in orow.iter().zip(drow.iter()) {
+            abs_sum += (*o as i32 - *d as i32).unsigned_abs() as f64;
+        }
+    }
+    let n = (region_w as f64) * (region_h as f64);
+    Ok(abs_sum / n)
+}
+
 /// Compute the bracket `(lo_bytes, hi_bytes)` used by the quality-target
 /// binary search.
 ///

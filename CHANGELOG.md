@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 272)
+
+- `DistortionReport` and `region_mae` in `analyze` (re-exported at the
+  crate root). `DistortionReport::compare(original, decoded)` walks the
+  first plane once and returns every common distortion metric -- `mse`,
+  `rmse`, `mae`, `max_abs_error` (the worst single-pixel error, useful
+  when a mission needs a per-pixel error ceiling rather than an averaged
+  one), and `psnr_db` -- in a single struct. Unlike `psnr_db`, which
+  asserts on a shape mismatch and reports only the single PSNR number,
+  `compare` returns `IcerError::Unsupported` on a geometry contradiction
+  or a missing plane (the non-panicking complement) and computes all
+  metrics in one pass instead of re-scanning the pixels per metric.
+- `region_mae(original, decoded, x0, y0, w, h)` measures the mean
+  absolute error over a rectangular sub-region -- the programmatic form
+  of the centre-band vs. periphery MAE comparison the round-6 ROI
+  prioritisation feature previously documented in prose only. A caller
+  can now verify, in code, that a centre-ROI encode under a tight byte
+  budget kept the centre strip's fidelity (low MAE) while the periphery
+  was truncated (high MAE). The region must lie fully inside the image
+  (`checked_add` guards the `u32` extent overflow a malicious
+  `(x0, w)` pair could induce); an out-of-bounds region returns
+  `IcerError::Unsupported`, a zero-area region returns `0.0`.
+- Both helpers are pure post-decode image-quality measurements
+  (spec-neutral; no wavelet / entropy machinery), depend only on std
+  primitives, and so are available on both the default `registry` and
+  the `default-features = false` standalone builds.
+- `tests/distortion_report.rs` -- seven tests covering bit-identical
+  (lossless) inputs, exact constant-offset metrics cross-checked against
+  a direct per-pixel computation and against `psnr_db`, geometry-mismatch
+  error (not panic), the zero-pixel degenerate case, sub-region error
+  isolation, region bounds/overflow rejection, and an end-to-end
+  centre-beats-periphery assertion on a centre-ROI encode under a
+  260-byte budget.
+
 ### Added (round 262)
 
 - Filter-A wavelet-depth sweep in the criterion suite under

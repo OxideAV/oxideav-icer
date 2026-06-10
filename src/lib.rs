@@ -100,8 +100,8 @@ pub const CODEC_ID_STR: &str = "icer";
 // Standalone public surface — works whether or not `registry` is on.
 pub use analyze::{
     analyze, encode_to_quality_target, pick_filter_by_rate_distortion, psnr_db,
-    quality_search_bounds, recommend_filter, supported_for_analysis, ImageStats,
-    DEFAULT_RD_CANDIDATES,
+    quality_search_bounds, recommend_filter, region_mae, supported_for_analysis, DistortionReport,
+    ImageStats, DEFAULT_RD_CANDIDATES,
 };
 pub use bitplane::EncodedPacket;
 pub use decoder::{
