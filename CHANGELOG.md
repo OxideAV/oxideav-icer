@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-icer/compare/v0.0.3...v0.0.4) - 2026-06-10
+
+### Other
+
+- structured DistortionReport + region_mae quality metrics (round 272)
+- Round 262: filter-A wavelet-depth benchmark sweep
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 233: quality-target rate-control
+- Round 230: bit-plane-count benchmark sweep
+- Round 225: segment-count benchmark sweep
+- Round 210: wavelet-decomposition-depth benchmark sweep
+- Round 205: float-filter (A) benchmark coverage
+- Round 199: encode-side cargo-fuzz harness + per-push seed test
+
 ### Added (round 272)
 
 - `DistortionReport` and `region_mae` in `analyze` (re-exported at the
