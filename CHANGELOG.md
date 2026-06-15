@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-icer/compare/v0.0.4...v0.0.5) - 2026-06-15
+
+### Other
+
+- add SSIM perceptual-quality metric (round 312)
+
 ### Added (round 312)
 
 - `analyze::ssim(original, decoded) -> Result<f64>` (re-exported at the
