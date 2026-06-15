@@ -12,7 +12,7 @@ Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
 sole source; no other material was consulted, paraphrased, or
 cross-checked.
 
-## Round-6 status
+## Status
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -36,19 +36,15 @@ cross-checked.
 | Auto filter selection (heuristic) | full (`EncodeOptions::with_auto_filter()`, single-pass) |
 | Auto filter selection (rate-distortion) | full (`EncodeOptions::with_auto_filter_rd()`, N-pass trial) |
 | ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
-| R-D budget pruning | full (round 91; `EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
+| R-D budget pruning | full (`EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
-| Decode-side resource limits | full (round 174; `DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes round-131 4 GB-per-plane DoS surface) |
-| Per-segment uncompressed fallback | full (round 189; `EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
-| Lenient multi-segment decode | full (round 192; `parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128 like round-6 ROI placeholders; segment 0 must be present to pin canonical strip height) |
-| Encode-side fuzz harness | full (round 199; `fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the round-131 decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
-| Float-filter benchmark coverage | full (round 205; criterion suite extended to cover the lossy float 9/7 CDF path -- `encode_compressed_filter_a` + `decode_compressed_filter_a` -- on the same three input shapes the filter-Q groups already exercise, so the Q-vs-A delta is directly readable from the criterion report) |
-| Wavelet-depth benchmark sweep | full (round 210; criterion suite extended with `encode_compressed_filter_q_levels_64x64` + `decode_compressed_filter_q_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the integer 5/3 path, so the per-depth cost of the dyadic DWT recursion is directly readable rather than averaged into the default-depth number) |
-| Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
-| Quality-target rate-control | full (round 233; `EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget` (byte-budget pins size + reports quality; quality-target pins quality + reports size). Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op (bit-exact round-trip satisfies any finite target trivially); above-ceiling targets return the unbudgeted encode as best-effort) |
-| Bit-plane-count benchmark sweep | full (round 230; criterion suite extended with `encode_compressed_filter_q_bit_planes_64x64` + `decode_compressed_filter_q_bit_planes_64x64` groups sweeping `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 path, so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering is visible per-floor rather than hidden by the round-181 default-floor pin -- `bit_plane_count` is a floor on `q`, so raising it above the natural `needed` walks pure per-packet overhead) |
-| Post-decode quality metrics | full (round 272 `DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae`; round 312 adds `ssim` -- mean structural-similarity index over a sliding 8x8 window, complements the MSE-family metrics on structured vs. diffuse error; all spec-neutral) |
-| Filter-A wavelet-depth benchmark sweep | full (round 262; criterion suite extended with `encode_compressed_filter_a_levels_64x64` + `decode_compressed_filter_a_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the lossy float 9/7 (`NineSevenA`) path -- the round-210 filter-Q counterpart for the float CDF lifting recursion. Slope difference vs. the round-210 integer-Q sweep isolates float-vs-integer lifting overhead per added dyadic level on the otherwise-shared bit-plane scanner + arithmetic coder.) |
+| Decode-side resource limits | full (`DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits) |
+| Per-segment uncompressed fallback | full (`EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
+| Lenient multi-segment decode | full (`parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128; segment 0 must be present to pin canonical strip height) |
+| Encode-side fuzz harness | full (`fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
+| Quality-target rate-control | full (`EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget`. Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op; above-ceiling targets return the unbudgeted encode as best-effort) |
+| Post-decode quality metrics | full (`DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae` + `ssim` -- mean structural-similarity index over a sliding 8x8 window; all spec-neutral) |
+| Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on both the integer 5/3 (filter Q) and float 9/7 (filter A) paths -- see Benchmarks below) |
 
 End-to-end round-trips:
 
@@ -65,7 +61,7 @@ End-to-end round-trips:
 ## Wavelet filter coverage
 
 IPN 42-155 §III.A enumerates eight candidate wavelet filters: A through G
-(float lifting variants) plus Q (integer 5/3). Round 3 implements all eight:
+(float lifting variants) plus Q (integer 5/3). All eight are implemented:
 
 * Filter `Q` (the integer 5/3 reversible lifting filter) -- bit-exact integer
   round-trip.
@@ -77,10 +73,10 @@ IPN 42-155 §III.A enumerates eight candidate wavelet filters: A through G
   floating point with an orthonormal post-scale (zeta = sqrt(2)/2). Lossy
   like filters A-F. Completes the full A-G filter set.
 
-## Context model (round-3 upgrade)
+## Context model
 
-The round-2 placeholder popcount-based significance context table has been
-replaced with the IPN 42-155 §III.B H/V/D neighbour-count classification:
+The significance context table uses the IPN 42-155 §III.B H/V/D
+neighbour-count classification:
 
 * **9 significance contexts** -- determined by the count of significant
   horizontal neighbours (H: 0, 1, or 2+), vertical neighbours (V: 0 or 1+),
@@ -89,9 +85,9 @@ replaced with the IPN 42-155 §III.B H/V/D neighbour-count classification:
   sign contributions (clipped to {-1, 0, +1} per axis) per §III.B, with
   sign-flip coding convention applied (the coder always codes the sign
   relative to the prediction, not the raw sign).
-* **3 refinement contexts** -- unchanged from round 2.
+* **3 refinement contexts**.
 
-## Stripe-ordered scan (round-3 upgrade)
+## Stripe-ordered scan
 
 The bit-plane scanner now uses **stripe-ordered** processing (IPN 42-155
 §III.B): the image is partitioned into horizontal stripes of height 4 rows
@@ -99,7 +95,7 @@ The bit-plane scanner now uses **stripe-ordered** processing (IPN 42-155
 refinement pass each process one complete stripe before advancing to the next.
 This maximises context-pattern locality.
 
-## Multi-packet ordering (round-3 upgrade)
+## Multi-packet ordering
 
 Each compressed segment now emits one packet pair per bit-plane per IPN
 42-155 §IV:
@@ -112,7 +108,7 @@ For a segment with bit-plane count Q, the encoder emits `2*Q` packets in
 MSB-first priority order. A decoder receiving a truncated stream can still
 reconstruct a lower-quality image from the packets it received.
 
-## What is *not* in round 3
+## What is *not* implemented
 
 * **Real-world bitstream interop**. The context model now uses the IPN 42-155
   §III.B classification scheme, but the exact pattern-to-context index
@@ -142,18 +138,18 @@ to "the implementation":
   64.
 * The **exact neighbourhood-pattern to context-index tables** for the
   significance + sign passes (§III.B Table 1 lists the context counts but not
-  the per-pattern lookup). Round 3 ships the H/V/D classification scheme
+  the per-pattern lookup). The crate ships the H/V/D classification scheme
   described in §III.B; the supplemental tables in the
   `descanso.jpl.nasa.gov` ICER white papers (reference [13]) are not yet
   in `docs/image/icer/`.
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
 
-## Automatic filter selection (round-5 upgrade)
+## Automatic filter selection
 
 ICER's eight wavelet filters (A-G plus Q) have different rate-distortion
 profiles depending on image content. IPN 42-155 §I notes that the choice
-is image-dependent but does not prescribe a fixed mapping. Round 5 adds
-two ways to let the encoder pick the filter:
+is image-dependent but does not prescribe a fixed mapping. Two ways let
+the encoder pick the filter:
 
 * **Heuristic** (`EncodeOptions::with_auto_filter()`): a one-pass scan
   computes image statistics (mean, variance, horizontal + vertical
@@ -178,7 +174,7 @@ let opts = EncodeOptions::compressed()
 let bytes = encode_icer(&image, &opts)?;
 ```
 
-## ROI segment prioritisation (round-6 upgrade)
+## ROI segment prioritisation
 
 IPN 42-155 §III.E specifies that ICER's image partitioning (the
 `segment_count` row-strip split) gives the encoder freedom to
@@ -187,7 +183,7 @@ to save the centre of a Pancam frame -- where the science target sits
 -- ahead of the periphery (sky / rover hardware at the edges) when the
 downlink budget is tight.
 
-Round 6 surfaces that freedom as two new `EncodeOptions` builders:
+That freedom is surfaced as two `EncodeOptions` builders:
 
 * **`with_segment_priorities(Vec<u16>)`** -- supply a per-segment
   priority vector. Entry `prios[seg_idx] = rank` means segment
@@ -250,9 +246,9 @@ integer 5/3) actually produces fewer bytes on this implementation's
 arithmetic coder. Use the heuristic when you want zero per-image
 overhead; use RD-mode when you want the true minimum.
 
-## Rate-distortion budget pruning (round-91 upgrade)
+## Rate-distortion budget pruning
 
-The round-4 quota-controlled encoder truncates packets in strict
+The quota-controlled encoder truncates packets in strict
 MSB-down emission order: it emits sig(0), ref(0), sig(1), ref(1),
 ... and stops the moment the next packet would exceed the byte cap.
 That semantic is byte-honest but R-D-suboptimal: the truncation cut
@@ -260,7 +256,7 @@ often falls on a refinement packet whose distortion-reduction-per-
 byte is poor compared to *other* packets later in the chain that
 would have fit individually but for the budget being already spent.
 
-Round 91 adds a true rate-distortion (R-D) packet selector
+A true rate-distortion (R-D) packet selector is available
 (`EncodeOptions::with_rd_budget(n)`) per IPN 42-155 §IV.B
 rate-allocation principle. The selector:
 
@@ -320,7 +316,7 @@ The R-D mode composes with `with_auto_filter` and
 bit-plane encode, so per-segment dependencies are honoured
 naturally.
 
-## Lenient multi-segment decode (round 192)
+## Lenient multi-segment decode
 
 The Mars-rover deep-space link is lossy: ICER segments can be dropped
 in transit between the orbiter relay and the DSN ground station.
@@ -330,14 +326,13 @@ receiver can still recover most of the image from whatever survived.
 
 `parse_icer` enforces a contiguous `segment_index` sequence and
 rejects a stream missing any segment with
-`IcerError::invalid("non-contiguous segment indices: ...")`. Round 192
-adds the lenient counterpart:
+`IcerError::invalid("non-contiguous segment indices: ...")`. The lenient
+counterpart:
 
 * **`parse_icer_lenient(bytes)`** -- accept a stream that may be
   missing entire segments. Missing strips are reconstructed as flat
-  128 (level-shifted zero, identical to the round-6 ROI-priority
-  placeholder semantic the encoder already produces under tight byte
-  budgets). The returned [`LenientDecode`] report carries the
+  128 (level-shifted zero, identical to the ROI-priority placeholder
+  semantic the encoder produces under tight byte budgets). The returned [`LenientDecode`] report carries the
   per-index presence map and the missing-segment count.
 
 ```rust
@@ -364,15 +359,14 @@ Constraints:
   has no way to detect that a higher-indexed segment was supposed to
   exist (the wire format carries no total-segment-count field).
 
-Composes with `DecodeLimits` (the round-174 DoS-cap policy applies
+Composes with `DecodeLimits` (the DoS-cap policy applies
 identically via `parse_icer_lenient_with_limits`) and with every
 encoder path (filter Q / filter A / uncompressed §III.D).
 
-## Quality-target rate-control (round 233)
+## Quality-target rate-control
 
-The round-4 quota-controlled encoder lets the caller pin a byte budget
-and reports back whatever quality the truncation yields. Round 233 adds
-the inverse shape: pin a quality (PSNR floor) and let the encoder
+The quota-controlled encoder lets the caller pin a byte budget and reports
+back whatever quality the truncation yields. The inverse shape: pin a quality (PSNR floor) and let the encoder
 report back the smallest byte count that meets it.
 
 ```rust
@@ -420,7 +414,7 @@ runs after filter resolution, so each trial uses the chosen filter.
 One piece is deliberately not in the current rounds — it is core
 to ICER's value proposition for deep-space imaging:
 
-### ✅ Quota-controlled encoding (landed in round 4)
+### Quota-controlled encoding
 
 `encode_icer(image, &opts)` now supports truncation to a caller-
 specified byte budget. ICER's signature feature — **emitting
@@ -495,7 +489,7 @@ The standalone API is `parse_icer(bytes) -> Result<IcerImage>`,
 mode is opt-in via `EncodeOptions::compressed()`; multi-segment
 encode is opt-in via `EncodeOptions::segment_count`.
 
-## Fuzzing (round 131)
+## Fuzzing
 
 A cargo-fuzz harness under `fuzz/` runs every byte slice through
 three decode-side entry points and asserts none panic / abort /
@@ -528,17 +522,17 @@ Not a fuzz crash; documented for a future header-validation pass
 A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
 budget; OxideAV reusable workflow).
 
-## Decode-side resource limits (round 174)
+## Decode-side resource limits
 
-The cargo-fuzz harness from round 131 surfaced a DoS vector inherent
+The cargo-fuzz decode harness surfaced a DoS vector inherent
 to the wire format: the 12-byte segment header carries `width` and
 `height` as `u16` each, which means a 12-byte input can declare up
-to `65535 * 65535 ≈ 4.29 GPx` per segment. Pre-round-174,
+to `65535 * 65535 ≈ 4.29 GPx` per segment. Without a cap,
 `parse_icer` would dutifully allocate a ~4 GB plane plus
 ~16 GB of `i32` coefficient buffers before discovering the body was
 empty.
 
-Round 174 adds an application-level geometry cap via
+An application-level geometry cap is available via
 [`DecodeLimits`]:
 
 ```rust
@@ -547,7 +541,7 @@ let limits = oxideav_icer::DecodeLimits::default();
 //         max_total_pixels       = 256 MPx
 let img = oxideav_icer::parse_icer_with_limits(bytes, &limits)?;
 
-// Trusted-input batch path — preserves pre-round-174 behaviour:
+// Trusted-input batch path — uncapped:
 let img = oxideav_icer::parse_icer_with_limits(
     bytes,
     &oxideav_icer::DecodeLimits::unlimited(),
@@ -575,7 +569,7 @@ not a wire-format error). The metadata walker
 the same cap, so an attacker cannot bypass the policy by stopping at
 the metadata stage.
 
-## Per-segment uncompressed fallback (round 189)
+## Per-segment uncompressed fallback
 
 IPN 42-155 §III.D "Performance with Difficult Imagery" specifies
 that the encoder may bypass the entropy stage on a per-segment basis
@@ -588,7 +582,7 @@ the same segment-framing layer, with the wire-format
 `SegmentHeader::uncompressed` flag (1 bit) telling the decoder which
 path was taken.
 
-Round 189 surfaces this as a new `EncodeOptions` builder:
+This is surfaced as an `EncodeOptions` builder:
 
 * **`with_uncompressed_fallback()`** -- enable per-segment fallback.
   When set, the compressed-path encoder produces *both* candidates
@@ -611,7 +605,7 @@ Compose-rules:
 * The fallback only fires on the compressed path
   (`opts.uncompressed = false`). Forcing `opts.uncompressed = true`
   short-circuits the comparison and emits uncompressed
-  unconditionally (the round-1 default).
+  unconditionally (the default).
 * The wire-format §IV per-segment body-length ceiling is `u16::MAX
   = 65535` pixels; strips that exceed that cap can't be shipped raw
   and keep the compressed result with no error.
@@ -628,7 +622,7 @@ The per-segment behaviour is tested in
 (strict fallback win), a smooth diagonal ramp (compressed stays),
 and a stacked noise/ramp image (each strip independently decides).
 
-## Benchmarks (round 181)
+## Benchmarks
 
 `benches/encode_decode.rs` is a criterion suite covering the encode +
 decode hot paths so future entropy-coder, wavelet, or filter-selection
@@ -661,142 +655,35 @@ opt-level, `--quick` smoke):
 | `uncompressed_path_64x64/encode`       | ~197 ns| ~19.2 GiB/s|
 | `uncompressed_path_64x64/decode`       | ~336 ns| ~11.3 GiB/s|
 
-The filter-A numbers (round 205) cover the lossy float 9/7 CDF
-lifting path on the same three input shapes the filter-Q groups
-already exercise; the Q-vs-A delta on the 64×64 ramp is ~5% on the
-encode side (the float lifting + IEEE-754 quantisation step is a
-small overhead vs the integer 5/3 lifting) and ~1% on the decode
-side (the inverse-DWT cost is dominated by the entropy coder, not
-the lifting arithmetic). The two-order-of-magnitude gap between the
-compressed and uncompressed paths sets the dynamic range future
-entropy-coder and wavelet vectorisation work has to play with. CI's
-existing `cargo build --all-targets` step exercises the bench file
-as a compilation gate; the benchmark itself is opt-in via
-`cargo bench`.
+The filter-A groups cover the lossy float 9/7 CDF lifting path on
+the same input shapes; the Q-vs-A delta on the 64×64 ramp is ~5% on
+encode and ~1% on decode (the inverse-DWT cost is dominated by the
+entropy coder). The two-order-of-magnitude gap between the compressed
+and uncompressed paths sets the dynamic range available to future
+entropy-coder and wavelet vectorisation work. CI's
+`cargo build --all-targets` step exercises the bench file as a
+compilation gate; the benchmark itself is opt-in via `cargo bench`.
 
-Round 210 adds two more groups that sweep `wavelet_levels` over
-`[1, 2, 3, 4]` on the 64×64 ramp on the integer 5/3 (filter Q)
-path so the per-depth cost of the dyadic DWT recursion is no longer
-hidden by the round-181 default-depth pin
-(`wavelet_levels = 2`). The encode side rises linearly with depth
-(~5% per added level on this input) — every additional level adds a
-forward-lifting pass over a half-sized buffer plus its bit-plane
-scan. The decode side rises through depth 3, then flattens at
-depth 4 because the inverse-DWT cost is dominated by the entropy
-stage by then and the now-tiny LL subband (4×4 = 16 coefficients at
-depth 4) no longer changes the scanner's stripe coverage. The
-~20% encode-side spread between depth 1 (~254 µs) and depth 4
-(~313 µs) is the headroom envelope future wavelet-vectorisation
-work has on this input shape.
+The suite additionally sweeps three encoder knobs on the 64×64 ramp so
+each one's cost is readable in isolation rather than averaged into a
+single default:
 
-| Group                                                  | Time   | Throughput |
-|--------------------------------------------------------|--------|------------|
-| `encode_compressed_filter_q_levels_64x64/levels_1`     | ~254 µs| ~15.4 MiB/s|
-| `encode_compressed_filter_q_levels_64x64/levels_2`     | ~275 µs| ~14.2 MiB/s|
-| `encode_compressed_filter_q_levels_64x64/levels_3`     | ~306 µs| ~12.8 MiB/s|
-| `encode_compressed_filter_q_levels_64x64/levels_4`     | ~313 µs| ~12.5 MiB/s|
-| `decode_compressed_filter_q_levels_64x64/levels_1`     | ~233 µs| ~16.8 MiB/s|
-| `decode_compressed_filter_q_levels_64x64/levels_2`     | ~236 µs| ~16.6 MiB/s|
-| `decode_compressed_filter_q_levels_64x64/levels_3`     | ~270 µs| ~14.5 MiB/s|
-| `decode_compressed_filter_q_levels_64x64/levels_4`     | ~261 µs| ~15.0 MiB/s|
-
-Round 225 adds two more groups that sweep `segment_count` over
-`[1, 2, 4, 8]` on the 64×64 ramp on the integer 5/3 (filter Q) path
-so the per-strip overhead of the IPN 42-155 §III.E independent-segment
-partitioning is no longer hidden by the round-181 single-segment
-default (`segment_count = 1`, the `EncodeOptions::default` value).
-Each additional segment carries its own 12-byte segment header + a
-fresh adaptive arithmetic-coder context model + an independent
-stripe-ordered bit-plane scan, so the per-segment fixed cost
-accumulates linearly while each strip's payload shrinks
-proportionally. The encode side is essentially flat (within criterion
-noise) between `segments_1`, `segments_2`, and `segments_4` (each
-~290 µs / ~13.4 MiB/s on the 64×64 ramp), then takes a ~9% step up at
-`segments_8` (~317 µs / ~12.3 MiB/s) as the per-strip fixed overhead
-(arith-coder init + sub-band de-interleave + per-strip wavelet
-boundary handling) starts to dominate over the now-tiny 8-row strip
-payload. The decode side rises monotonically (~258 → ~282 µs) because
-the decoder pays the per-segment framing-parse cost on every segment
-regardless of payload size. The ~10% encode-side spread between
-`segments_1` and `segments_8` is the headroom envelope future
-multi-segment encoder work (per-segment parallelism, shared-context
-reuse) has on this input shape.
-
-| Group                                                       | Time    | Throughput |
-|-------------------------------------------------------------|---------|------------|
-| `encode_compressed_filter_q_segments_64x64/segments_1`      | ~292 µs | ~13.4 MiB/s|
-| `encode_compressed_filter_q_segments_64x64/segments_2`      | ~288 µs | ~13.6 MiB/s|
-| `encode_compressed_filter_q_segments_64x64/segments_4`      | ~296 µs | ~13.2 MiB/s|
-| `encode_compressed_filter_q_segments_64x64/segments_8`      | ~317 µs | ~12.3 MiB/s|
-| `decode_compressed_filter_q_segments_64x64/segments_1`      | ~258 µs | ~15.2 MiB/s|
-| `decode_compressed_filter_q_segments_64x64/segments_2`      | ~255 µs | ~15.3 MiB/s|
-| `decode_compressed_filter_q_segments_64x64/segments_4`      | ~262 µs | ~14.9 MiB/s|
-| `decode_compressed_filter_q_segments_64x64/segments_8`      | ~279 µs | ~14.0 MiB/s|
-
-Round 230 adds two more groups that sweep `bit_plane_count` over
-`[4, 8, 12, 16]` on the 64×64 ramp on the integer 5/3 (filter Q) path
-so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering
-is no longer hidden by the round-181 default-floor pin
-(`bit_plane_count = 8`). The field acts as a floor on the per-segment
-packet-count `q` (`q = max(needed_for_largest_coeff,
-caller_floor).min(31)`), so raising it above the natural `needed`
-forces the encoder to emit additional bit-plane pairs that mostly
-carry zero significance + zero refinement -- the cleanest way to
-isolate the per-packet fixed cost (arith-coder init / flush / packet
-framing) from coefficient-magnitude noise. Both encode and decode rise
-monotonically with the floor; the largest step is between `q_8` and
-`q_12` (+42% encode, +47% decode) because the natural `needed` on the
-64×64 ramp lands around 7-8 bit-planes, so `q_4` and `q_8` both
-effectively walk the same number of packets while `q_12` and `q_16`
-add 4 and 8 extra empty pairs respectively. The ~100% encode-side
-spread between `q_4` and `q_16` is the headroom envelope future
-per-packet arith-coder-init / flush amortisation work has on this
-input shape.
-
-| Group                                                          | Time    | Throughput |
-|----------------------------------------------------------------|---------|------------|
-| `encode_compressed_filter_q_bit_planes_64x64/q_4`              | ~238 µs | ~16.4 MiB/s|
-| `encode_compressed_filter_q_bit_planes_64x64/q_8`              | ~268 µs | ~14.6 MiB/s|
-| `encode_compressed_filter_q_bit_planes_64x64/q_12`             | ~380 µs | ~10.3 MiB/s|
-| `encode_compressed_filter_q_bit_planes_64x64/q_16`             | ~480 µs |  ~8.1 MiB/s|
-| `decode_compressed_filter_q_bit_planes_64x64/q_4`              | ~207 µs | ~18.9 MiB/s|
-| `decode_compressed_filter_q_bit_planes_64x64/q_8`              | ~230 µs | ~17.0 MiB/s|
-| `decode_compressed_filter_q_bit_planes_64x64/q_12`             | ~339 µs | ~11.5 MiB/s|
-| `decode_compressed_filter_q_bit_planes_64x64/q_16`             | ~415 µs |  ~9.4 MiB/s|
-
-Round 262 adds two more groups that sweep `wavelet_levels` over
-`[1, 2, 3, 4]` on the 64×64 ramp on the lossy float 9/7 (`NineSevenA`)
-path -- the filter-A counterpart of the round-210 filter-Q levels
-sweep, so the per-depth cost of the **float** dyadic recursion is no
-longer averaged into the round-205 default-depth (`wavelet_levels = 2`)
-filter-A number. The interesting Q-vs-A delta on a per-depth basis is
-the lifting arithmetic cost -- filter Q's integer 5/3 lifting is pure
-`i32` add/shift, filter A's float 9/7 CDF lifting is `f64`
-multiply-add -- and both paths share the same bit-plane scanner +
-arithmetic coder, so the slope difference between this group and the
-round-210 `encode_compressed_filter_q_levels_64x64` group isolates
-the float-vs-integer lifting overhead per added dyadic level.
-Encode rises from depth 1 (~354 µs) through depth 3 (~477 µs) then
-flattens at depth 4 (~445 µs) as the now-tiny LL subband (4×4 = 16
-coefficients at depth 4) stops adding meaningful forward-lifting work
-on top of the entropy stage; decode shows the same shape (~224 µs at
-depth 1, ~273 µs at depth 3, ~243 µs at depth 4) -- the bit-plane
-scanner's stripe coverage hits the same floor regardless of filter
-choice. Filter A is consistently ~40% slower on encode than filter Q
-at the same depth (round 210: ~254-313 µs), which quantifies the float
-lifting overhead vs the integer 5/3 lifting; decode shows ~5% delta
-because the inverse path is entropy-coder dominated.
-
-| Group                                                          | Time    | Throughput |
-|----------------------------------------------------------------|---------|------------|
-| `encode_compressed_filter_a_levels_64x64/levels_1`             | ~354 µs | ~11.0 MiB/s|
-| `encode_compressed_filter_a_levels_64x64/levels_2`             | ~441 µs |  ~8.8 MiB/s|
-| `encode_compressed_filter_a_levels_64x64/levels_3`             | ~477 µs |  ~8.2 MiB/s|
-| `encode_compressed_filter_a_levels_64x64/levels_4`             | ~445 µs |  ~8.8 MiB/s|
-| `decode_compressed_filter_a_levels_64x64/levels_1`             | ~224 µs | ~17.4 MiB/s|
-| `decode_compressed_filter_a_levels_64x64/levels_2`             | ~247 µs | ~15.8 MiB/s|
-| `decode_compressed_filter_a_levels_64x64/levels_3`             | ~273 µs | ~14.2 MiB/s|
-| `decode_compressed_filter_a_levels_64x64/levels_4`             | ~243 µs | ~16.1 MiB/s|
+* **`wavelet_levels` over `[1, 2, 3, 4]`** (both filter Q and filter
+  A): encode rises with depth (each level adds a forward-lifting pass
+  + bit-plane scan); decode flattens past depth 3 as the entropy stage
+  dominates and the LL subband shrinks to 16 coefficients. Filter A is
+  consistently ~40% slower on encode than filter Q, quantifying the
+  float-vs-integer lifting overhead.
+* **`segment_count` over `[1, 2, 4, 8]`** (filter Q): each segment
+  carries its own header + arithmetic-coder context + stripe scan, so
+  fixed per-segment cost accumulates as strip payloads shrink. Encode
+  is ~flat through 4 segments then steps up at 8; decode rises
+  monotonically with the per-segment framing-parse cost.
+* **`bit_plane_count` over `[4, 8, 12, 16]`** (filter Q): the field is
+  a floor on the per-segment packet count, so raising it past the
+  natural `needed` (~7-8 on this ramp) emits extra near-empty bit-plane
+  pairs, isolating the per-packet fixed cost (arith-coder init / flush
+  / framing). Both directions roughly double between `q_4` and `q_16`.
 
 ## Licence
 
