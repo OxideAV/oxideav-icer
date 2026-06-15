@@ -319,6 +319,12 @@ pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
 ///   needs a per-pixel error ceiling rather than an averaged one.
 /// * `psnr_db` -- peak signal-to-noise ratio in dB, identical to
 ///   [`psnr_db`] (`f32::INFINITY` when the images are bit-identical).
+/// * `ssim` -- mean structural-similarity index in `[-1.0, 1.0]`,
+///   identical to [`ssim`] (`1.0` when the images are structurally
+///   identical). Unlike the point-wise error metrics above, SSIM is
+///   windowed (it requires a second pass over the plane), so it is the
+///   one field [`DistortionReport::compare`] computes via a follow-on
+///   scan rather than in the shared point-wise loop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DistortionReport {
     /// Mean squared error over the first plane.
@@ -331,6 +337,9 @@ pub struct DistortionReport {
     pub max_abs_error: u8,
     /// Peak signal-to-noise ratio in dB (`f32::INFINITY` if bit-exact).
     pub psnr_db: f32,
+    /// Mean structural-similarity index in `[-1.0, 1.0]` (`1.0` if
+    /// structurally identical). See [`ssim`].
+    pub ssim: f64,
 }
 
 impl DistortionReport {
@@ -366,6 +375,7 @@ impl DistortionReport {
                 mae: 0.0,
                 max_abs_error: 0,
                 psnr_db: f32::INFINITY,
+                ssim: 1.0,
             });
         }
 
@@ -391,14 +401,142 @@ impl DistortionReport {
         } else {
             (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
         };
+        // SSIM is windowed, so it needs its own scan; geometry + plane
+        // presence were already validated above, so this cannot fail.
+        let ssim = ssim(original, decoded)?;
         Ok(DistortionReport {
             mse,
             rmse: mse.sqrt(),
             mae: abs_sum / n,
             max_abs_error: max_abs,
             psnr_db: psnr,
+            ssim,
         })
     }
+}
+
+/// Side length (in pixels) of the sliding window the windowed SSIM
+/// estimator scans the image with. 8 is the canonical block size used by
+/// the structural-similarity index when no Gaussian weighting is applied
+/// (Wang, Bovik, Sheikh & Simoncelli, "Image Quality Assessment: From
+/// Error Visibility to Structural Similarity", IEEE TIP 2004): a uniform
+/// 8x8 window is the simplest unweighted formulation and is what this
+/// crate uses (no Gaussian kernel, no codec-specific data).
+const SSIM_WINDOW: usize = 8;
+
+/// Compute the mean structural-similarity index (SSIM) of the first plane
+/// of `decoded` against `original`, returned in the closed interval
+/// `[-1.0, 1.0]` (`1.0` == structurally identical).
+///
+/// SSIM is a full-reference perceptual-quality metric that, unlike PSNR /
+/// MSE (which are pure point-wise error sums), correlates structure
+/// (local mean, local variance, local covariance) between the two images.
+/// It is the natural companion to [`psnr_db`] when evaluating ICER's
+/// *lossy* float-filter (A-G) output, where the wavelet + quantisation
+/// loss is structured rather than white and PSNR is a known-poor predictor
+/// of perceived fidelity.
+///
+/// Clean-room note: the SSIM formula is the standard published definition
+/// (Wang et al. 2004), entirely independent of the ICER codec — no NASA
+/// reference impl, no qccPack, no third-party ICER port, and no FFmpeg
+/// SSIM filter was consulted. The implementation is derived directly from
+/// the published equation
+/// `SSIM(x, y) = ((2*mu_x*mu_y + C1)(2*sigma_xy + C2)) /
+///               ((mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2))`
+/// with the standard constants `C1 = (0.01 * 255)^2`,
+/// `C2 = (0.03 * 255)^2` for the 8-bit pixel domain.
+///
+/// Windowing: the index is computed over every [`SSIM_WINDOW`]x
+/// [`SSIM_WINDOW`] block of the image, stepped one pixel at a time
+/// (unweighted / uniform window, no Gaussian kernel), and the per-window
+/// SSIM values are averaged. An image smaller than the window in either
+/// dimension is scored with a single global window covering the whole
+/// plane (the same formula, one block) so tiny inputs still get a value.
+///
+/// Returns [`IcerError::Unsupported`] on a width/height mismatch or a
+/// missing plane (the same contract as [`DistortionReport::compare`]).
+/// A zero-pixel image (`width == 0 || height == 0`) is structurally
+/// identical to itself and scores `1.0`.
+pub fn ssim(original: &IcerImage, decoded: &IcerImage) -> Result<f64> {
+    if original.width != decoded.width || original.height != decoded.height {
+        return Err(crate::error::IcerError::unsupported(format!(
+            "ssim: geometry mismatch {}x{} vs {}x{}",
+            original.width, original.height, decoded.width, decoded.height
+        )));
+    }
+    let op = original
+        .planes
+        .first()
+        .ok_or_else(|| crate::error::IcerError::unsupported("ssim: original has no planes"))?;
+    let dp = decoded
+        .planes
+        .first()
+        .ok_or_else(|| crate::error::IcerError::unsupported("ssim: decoded has no planes"))?;
+
+    let w = original.width as usize;
+    let h = original.height as usize;
+    if w == 0 || h == 0 {
+        return Ok(1.0);
+    }
+
+    // Standard 8-bit-domain SSIM stabilisation constants.
+    const L: f64 = 255.0;
+    const C1: f64 = (0.01 * L) * (0.01 * L);
+    const C2: f64 = (0.03 * L) * (0.03 * L);
+
+    // Window side: clamp to the image extent so an input smaller than
+    // SSIM_WINDOW in either axis is scored with a single global window.
+    let win_w = SSIM_WINDOW.min(w);
+    let win_h = SSIM_WINDOW.min(h);
+    let win_n = (win_w * win_h) as f64;
+
+    // SSIM of one window whose top-left corner is at (wx, wy).
+    let window_ssim = |wx: usize, wy: usize| -> f64 {
+        let mut sum_o = 0.0f64;
+        let mut sum_d = 0.0f64;
+        let mut sum_oo = 0.0f64;
+        let mut sum_dd = 0.0f64;
+        let mut sum_od = 0.0f64;
+        for y in wy..wy + win_h {
+            let orow = &op.data[y * op.stride..];
+            let drow = &dp.data[y * dp.stride..];
+            for x in wx..wx + win_w {
+                let o = orow[x] as f64;
+                let d = drow[x] as f64;
+                sum_o += o;
+                sum_d += d;
+                sum_oo += o * o;
+                sum_dd += d * d;
+                sum_od += o * d;
+            }
+        }
+        let mu_o = sum_o / win_n;
+        let mu_d = sum_d / win_n;
+        // Population (biased, `/N`) variance + covariance, matching the
+        // unweighted-window SSIM definition.
+        let var_o = (sum_oo / win_n) - mu_o * mu_o;
+        let var_d = (sum_dd / win_n) - mu_d * mu_d;
+        let cov_od = (sum_od / win_n) - mu_o * mu_d;
+        let num = (2.0 * mu_o * mu_d + C1) * (2.0 * cov_od + C2);
+        let den = (mu_o * mu_o + mu_d * mu_d + C1) * (var_o + var_d + C2);
+        num / den
+    };
+
+    // Slide the window one pixel at a time; average the per-window scores.
+    // `last_x` / `last_y` are the inclusive last valid top-left corners.
+    let last_x = w - win_w;
+    let last_y = h - win_h;
+    let mut acc = 0.0f64;
+    let mut count = 0.0f64;
+    for wy in 0..=last_y {
+        for wx in 0..=last_x {
+            acc += window_ssim(wx, wy);
+            count += 1.0;
+        }
+    }
+    // `count` is always >= 1 (the global-window fallback yields exactly one
+    // window when the image equals or is smaller than SSIM_WINDOW).
+    Ok(acc / count)
 }
 
 /// Compute the mean absolute error over a rectangular sub-region of the
@@ -745,5 +883,88 @@ mod tests {
     fn supported_for_analysis_basics() {
         let img = flat_image(4, 4, 128);
         assert!(supported_for_analysis(&img));
+    }
+
+    /// Clone `img` and add a constant offset to every pixel (clamped to
+    /// `0..=255`). Used to fabricate a degraded image with known
+    /// structure.
+    fn shifted(img: &IcerImage, delta: i32) -> IcerImage {
+        let mut out = img.clone();
+        let stride = out.planes[0].stride;
+        let w = out.width as usize;
+        let h = out.height as usize;
+        for y in 0..h {
+            for x in 0..w {
+                let v = img.planes[0].data[y * stride + x] as i32 + delta;
+                out.planes[0].data[y * stride + x] = v.clamp(0, 255) as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ssim_identical_is_one() {
+        let img = ramp_image(32, 32);
+        let s = ssim(&img, &img).unwrap();
+        assert!((s - 1.0).abs() < 1e-12, "ssim {s} should be 1.0");
+    }
+
+    #[test]
+    fn ssim_zero_pixel_is_one() {
+        let a = IcerImage::zeros(0, 0, IcerPixelFormat::Gray8);
+        assert_eq!(ssim(&a, &a).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn ssim_geometry_mismatch_errs() {
+        let a = ramp_image(16, 16);
+        let b = ramp_image(16, 8);
+        let err = ssim(&a, &b).unwrap_err();
+        assert!(format!("{err}").contains("geometry mismatch"));
+    }
+
+    #[test]
+    fn ssim_small_image_uses_global_window() {
+        // 4x4 image is smaller than SSIM_WINDOW (8); the global-window
+        // fallback must still produce 1.0 for an identical pair and a
+        // finite value in range for a degraded one.
+        let img = ramp_image(4, 4);
+        assert!((ssim(&img, &img).unwrap() - 1.0).abs() < 1e-12);
+        let degraded = shifted(&img, 40);
+        let s = ssim(&img, &degraded).unwrap();
+        assert!((-1.0..=1.0).contains(&s), "ssim {s} out of range");
+        assert!(s < 1.0, "a degraded small image should score below 1.0");
+    }
+
+    #[test]
+    fn ssim_degrades_monotonically_with_noise() {
+        // A larger constant offset distorts structure more, so SSIM must
+        // fall as the offset grows. A diagonal ramp keeps local variance
+        // non-trivial so the structural term is active.
+        let img = ramp_image(64, 64);
+        let mild = shifted(&img, 5);
+        let harsh = shifted(&img, 60);
+        let s_mild = ssim(&img, &mild).unwrap();
+        let s_harsh = ssim(&img, &harsh).unwrap();
+        assert!(s_mild <= 1.0 && s_harsh <= 1.0);
+        assert!(
+            s_harsh < s_mild,
+            "harsher distortion {s_harsh} should score below milder {s_mild}"
+        );
+    }
+
+    #[test]
+    fn distortion_report_carries_ssim() {
+        let img = ramp_image(32, 32);
+        // Bit-identical -> ssim 1.0 + psnr infinite.
+        let rep = DistortionReport::compare(&img, &img).unwrap();
+        assert!((rep.ssim - 1.0).abs() < 1e-12);
+        assert!(rep.psnr_db.is_infinite());
+        // Degraded -> ssim < 1.0 and equals the standalone helper.
+        let degraded = shifted(&img, 20);
+        let rep = DistortionReport::compare(&img, &degraded).unwrap();
+        let standalone = ssim(&img, &degraded).unwrap();
+        assert!((rep.ssim - standalone).abs() < 1e-12);
+        assert!(rep.ssim < 1.0);
     }
 }

@@ -47,6 +47,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
 | Quality-target rate-control | full (round 233; `EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget` (byte-budget pins size + reports quality; quality-target pins quality + reports size). Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op (bit-exact round-trip satisfies any finite target trivially); above-ceiling targets return the unbudgeted encode as best-effort) |
 | Bit-plane-count benchmark sweep | full (round 230; criterion suite extended with `encode_compressed_filter_q_bit_planes_64x64` + `decode_compressed_filter_q_bit_planes_64x64` groups sweeping `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 path, so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering is visible per-floor rather than hidden by the round-181 default-floor pin -- `bit_plane_count` is a floor on `q`, so raising it above the natural `needed` walks pure per-packet overhead) |
+| SSIM perceptual-quality metric | full (round 312; `analyze::ssim(original, decoded) -> [-1, 1]` mean structural-similarity over an unweighted 8x8 sliding window per Wang et al. 2004, plus a new `DistortionReport::ssim` field. Spec-neutral post-decode measurement -- no ICER spec / reference impl involved; ranks lossy filter-A below lossless filter-Q on the same input) |
 | Filter-A wavelet-depth benchmark sweep | full (round 262; criterion suite extended with `encode_compressed_filter_a_levels_64x64` + `decode_compressed_filter_a_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the lossy float 9/7 (`NineSevenA`) path -- the round-210 filter-Q counterpart for the float CDF lifting recursion. Slope difference vs. the round-210 integer-Q sweep isolates float-vs-integer lifting overhead per added dyadic level on the otherwise-shared bit-plane scanner + arithmetic coder.) |
 
 End-to-end round-trips:
@@ -413,6 +414,42 @@ flag is then a no-op.
 
 Composes with `with_auto_filter` / `with_auto_filter_rd`: the search
 runs after filter resolution, so each trial uses the chosen filter.
+
+## SSIM perceptual-quality metric (round 312)
+
+The round-272 `DistortionReport` bundles the point-wise error metrics
+(MSE / RMSE / MAE / max-abs-error / PSNR). Those are pure sums over the
+pixel difference and, for a *lossy* wavelet codec like ICER, PSNR is a
+known-poor predictor of perceived quality -- the float-filter (A-G) loss
+is structured, not white. Round 312 adds the structural-similarity index
+(SSIM), the standard full-reference perceptual metric that correlates
+local mean, variance, and covariance between the two images.
+
+```rust
+let s = oxideav_icer::ssim(&original, &decoded)?;   // [-1.0, 1.0]; 1.0 == identical
+let report = oxideav_icer::DistortionReport::compare(&original, &decoded)?;
+assert_eq!(report.ssim, s);                          // also bundled in the report
+```
+
+* **Formula**: the published definition (Wang, Bovik, Sheikh &
+  Simoncelli, *Image Quality Assessment: From Error Visibility to
+  Structural Similarity*, IEEE TIP 2004),
+  `SSIM = ((2*mu_x*mu_y + C1)(2*sigma_xy + C2)) /
+  ((mu_x^2 + mu_y^2 + C1)(sigma_x^2 + sigma_y^2 + C2))` with the
+  8-bit-domain constants `C1 = (0.01*255)^2`, `C2 = (0.03*255)^2`.
+* **Windowing**: an unweighted (uniform, no Gaussian kernel) 8x8 window
+  slid one pixel at a time; the per-window scores are averaged. An image
+  smaller than 8 px in either axis falls back to a single global window.
+* **Clean-room**: SSIM is independent of the ICER codec. No NASA
+  reference impl, no qccPack, no third-party ICER port, no FFmpeg SSIM
+  filter was consulted -- the metric is derived directly from the
+  published equation and depends only on std primitives, so it is
+  available on both the `registry` and `default-features = false` builds.
+
+A bit-exact lossless filter-Q round-trip scores `1.0`; the lossy
+filter-A path scores below it on the same input, so the metric ranks
+ICER's two real output paths correctly (verified end-to-end in
+`tests/distortion_report.rs`).
 
 ## Roadmap
 

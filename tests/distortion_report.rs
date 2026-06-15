@@ -15,8 +15,8 @@
 //! no wavelet / entropy machinery involved.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, region_mae, DistortionReport, EncodeOptions, IcerImage,
-    IcerPixelFormat,
+    encode_icer, parse_icer, region_mae, ssim, DistortionReport, EncodeOptions, IcerImage,
+    IcerPixelFormat, WaveletFilter,
 };
 
 /// Diagonal ramp identical to the round-trip tests' fixtures.
@@ -169,6 +169,64 @@ fn region_mae_out_of_bounds_errs() {
     assert!(region_mae(&original, &decoded, u32::MAX, 0, 1, 1).is_err());
     // Zero-area region is a trivial 0.0.
     assert_eq!(region_mae(&original, &decoded, 0, 0, 0, 4).unwrap(), 0.0);
+}
+
+#[test]
+fn ssim_bit_identical_lossless_roundtrip_is_one() {
+    // Filter Q (reversible 5/3) is bit-exact, so a full encode/decode
+    // round-trip must score SSIM 1.0 just like a bit-identical pair.
+    let img = ramp_image(48, 48);
+    let opts = EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        ..EncodeOptions::compressed()
+    };
+    let bytes = encode_icer(&img, &opts).unwrap();
+    let decoded = parse_icer(&bytes).unwrap();
+    let s = ssim(&img, &decoded).unwrap();
+    assert!((s - 1.0).abs() < 1e-9, "lossless ssim {s} should be 1.0");
+
+    let report = DistortionReport::compare(&img, &decoded).unwrap();
+    assert!((report.ssim - s).abs() < 1e-12);
+    assert!(report.psnr_db.is_infinite());
+}
+
+#[test]
+fn ssim_lossy_filter_a_scores_below_lossless() {
+    // The lossy float 9/7 (filter A) path loses structure through the
+    // float lifting + integer quantisation, so its SSIM must sit below
+    // the lossless filter-Q round-trip on the same input -- the metric
+    // ranks ICER's two real output paths correctly.
+    let img = ramp_image(48, 48);
+
+    let q_opts = EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        ..EncodeOptions::compressed()
+    };
+    let q_bytes = encode_icer(&img, &q_opts).unwrap();
+    let q_decoded = parse_icer(&q_bytes).unwrap();
+    let q_ssim = ssim(&img, &q_decoded).unwrap();
+
+    let a_opts = EncodeOptions {
+        filter: WaveletFilter::NineSevenA,
+        ..EncodeOptions::compressed()
+    };
+    let a_bytes = encode_icer(&img, &a_opts).unwrap();
+    let a_decoded = parse_icer(&a_bytes).unwrap();
+    let a_ssim = ssim(&img, &a_decoded).unwrap();
+
+    assert!((-1.0..=1.0).contains(&a_ssim), "ssim {a_ssim} out of range");
+    assert!(
+        a_ssim <= q_ssim,
+        "lossy filter-A ssim {a_ssim} should not exceed lossless filter-Q ssim {q_ssim}"
+    );
+}
+
+#[test]
+fn ssim_geometry_mismatch_errs_not_panics() {
+    let a = ramp_image(16, 16);
+    let b = ramp_image(8, 16);
+    let err = ssim(&a, &b).unwrap_err();
+    assert!(format!("{err}").contains("geometry mismatch"), "{err}");
 }
 
 #[test]

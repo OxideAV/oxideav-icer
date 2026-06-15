@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (round 312)
+
+- `analyze::ssim(original, decoded) -> Result<f64>` (re-exported at the
+  crate root) -- the mean structural-similarity index (SSIM) in the
+  closed interval `[-1.0, 1.0]` (`1.0` == structurally identical). SSIM
+  is the standard full-reference perceptual-quality metric (Wang, Bovik,
+  Sheikh & Simoncelli, IEEE TIP 2004); unlike PSNR / MSE it correlates
+  local structure (mean, variance, covariance) and is the natural
+  companion when evaluating ICER's *lossy* float-filter (A-G) output,
+  where the wavelet + quantisation loss is structured rather than white.
+  Computed over an unweighted 8x8 window slid one pixel at a time with
+  the standard 8-bit-domain constants `C1 = (0.01*255)^2`,
+  `C2 = (0.03*255)^2`; images smaller than the window fall back to a
+  single global window. Returns `IcerError::Unsupported` on a geometry
+  mismatch or a missing plane (same contract as `DistortionReport`); a
+  zero-pixel image scores `1.0`.
+- `DistortionReport` gains an `ssim` field, so `compare` now bundles the
+  structural metric alongside the existing point-wise MSE / RMSE / MAE /
+  max-abs-error / PSNR. (SSIM is windowed, so it is computed via a
+  follow-on scan rather than in the shared point-wise loop.)
+- Clean-room note: SSIM is independent of the ICER codec -- no NASA
+  reference impl, no qccPack, no third-party ICER port, no FFmpeg SSIM
+  filter was consulted; the metric depends only on std primitives and is
+  available on both the `registry` and `default-features = false` builds.
+- Tests: six `analyze` unit tests (identical == 1.0, zero-pixel == 1.0,
+  geometry-mismatch error, small-image global-window fallback, monotonic
+  degradation under increasing noise, `DistortionReport` carries SSIM)
+  plus three `tests/distortion_report.rs` integration tests (lossless
+  filter-Q round-trip scores 1.0, lossy filter-A scores below filter-Q
+  on the same input, geometry-mismatch error).
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-icer/compare/v0.0.3...v0.0.4) - 2026-06-10
 
 ### Other
