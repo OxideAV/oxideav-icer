@@ -7,8 +7,7 @@
 //! lifting families; the exact float coefficients are the symmetric
 //! biorthogonal 9/7 lifting parameters from Sweldens 1996, "The
 //! Lifting Scheme: A Custom-Design Construction of Biorthogonal
-//! Wavelets" -- well-known in the wavelet literature and not derived
-//! from any JPL flight code or reference implementation.
+//! Wavelets" -- well-known in the open wavelet literature.
 //!
 //! Filter G (IPN 42-155 §III.A) is the Le Gall 5/3 float variant: the
 //! same predict/update coefficients as the integer 5/3 (alpha=-0.5,

@@ -27,10 +27,7 @@
 //! tree thresholds in [`recommend_filter`] are derived from open
 //! wavelet-coding intuition (smooth -> reversible; high-frequency ->
 //! biorthogonal 9/7) plus the obvious property that filter `Q` is the
-//! only lossless option in the set.
-//!
-//! Clean-room note: no NASA reference impl, no qccPack, no third-party
-//! ICER port was consulted. The thresholds are deliberately
+//! only lossless option in the set. The thresholds are deliberately
 //! conservative + documented so callers can audit them.
 
 use crate::encoder::{encode_icer, EncodeOptions};
@@ -465,6 +462,129 @@ pub fn region_mae(
     Ok(abs_sum / n)
 }
 
+/// Edge length of the sliding window used by [`ssim`]. The structural
+/// similarity index is defined over local windows; an 8x8 block is the
+/// common choice for an 8-bit grey image and keeps the per-window
+/// statistics cheap (64 samples). Windows slide one pixel at a time and
+/// the per-window scores are averaged into the global (mean) SSIM.
+const SSIM_WINDOW: usize = 8;
+
+/// Compute the mean structural-similarity index (SSIM) of the first
+/// plane of `decoded` against `original`, returning a value in
+/// `-1.0..=1.0` where `1.0` is a perfect (bit-identical) match.
+///
+/// SSIM is a perceptual image-quality measure that compares local
+/// luminance, contrast, and structure rather than raw per-pixel error.
+/// Two images with the same [`psnr_db`] can differ markedly in SSIM
+/// when the error is structured (a shifted edge) versus diffuse
+/// (uniform noise), so it complements the MSE-family metrics in
+/// [`DistortionReport`].
+///
+/// This is a pure post-decode measurement over the reconstructed pixels:
+/// it is spec-neutral and involves no wavelet, entropy-coder, or
+/// framing machinery, so no ICER specification section is consulted.
+///
+/// Definition (8-bit luminance, dynamic range `L = 255`):
+///
+/// * For each `SSIM_WINDOW`x`SSIM_WINDOW` window the per-window score is
+///   `((2 mu_x mu_y + C1)(2 cov_xy + C2)) / ((mu_x^2 + mu_y^2 + C1)(var_x + var_y + C2))`
+///   where `mu` is the window mean, `var` the (population) variance,
+///   `cov` the covariance, `C1 = (0.01 L)^2`, `C2 = (0.03 L)^2`.
+/// * Windows slide one pixel at a time over every fully-contained
+///   position; the returned value is the mean of the per-window scores.
+///
+/// Returns `1.0` when the planes are bit-identical. For images smaller
+/// than one window in either axis, a single window covering the whole
+/// (zero-padded-free) overlap is used; a zero-pixel image is treated as
+/// a perfect match (`1.0`).
+///
+/// Returns [`IcerError::Unsupported`] on a width/height mismatch or when
+/// either image has no planes -- the same geometry contract as
+/// [`DistortionReport::compare`].
+pub fn ssim(original: &IcerImage, decoded: &IcerImage) -> Result<f64> {
+    if original.width != decoded.width || original.height != decoded.height {
+        return Err(crate::error::IcerError::unsupported(format!(
+            "ssim: geometry mismatch {}x{} vs {}x{}",
+            original.width, original.height, decoded.width, decoded.height
+        )));
+    }
+    let op = original
+        .planes
+        .first()
+        .ok_or_else(|| crate::error::IcerError::unsupported("ssim: original has no planes"))?;
+    let dp = decoded
+        .planes
+        .first()
+        .ok_or_else(|| crate::error::IcerError::unsupported("ssim: decoded has no planes"))?;
+
+    let w = original.width as usize;
+    let h = original.height as usize;
+    if w == 0 || h == 0 {
+        return Ok(1.0);
+    }
+
+    // Stabilisation constants from the standard SSIM definition for an
+    // 8-bit dynamic range (L = 255): C1 = (0.01 L)^2, C2 = (0.03 L)^2.
+    const L: f64 = 255.0;
+    let c1 = (0.01 * L) * (0.01 * L);
+    let c2 = (0.03 * L) * (0.03 * L);
+
+    // Window edge clamped to the image extent so sub-window images use a
+    // single full-image window rather than producing no scores at all.
+    let win_w = SSIM_WINDOW.min(w);
+    let win_h = SSIM_WINDOW.min(h);
+    let n_win = (win_w * win_h) as f64;
+
+    let mut score_sum = 0.0f64;
+    let mut score_count = 0u64;
+
+    // Slide the window one pixel at a time over every fully-contained
+    // position. `y_end` / `x_end` are the inclusive-start bounds.
+    let y_last = h - win_h;
+    let x_last = w - win_w;
+    for wy in 0..=y_last {
+        for wx in 0..=x_last {
+            let mut sum_x = 0.0f64;
+            let mut sum_y = 0.0f64;
+            let mut sum_xx = 0.0f64;
+            let mut sum_yy = 0.0f64;
+            let mut sum_xy = 0.0f64;
+            for dy in 0..win_h {
+                let orow = &op.data[(wy + dy) * op.stride..];
+                let drow = &dp.data[(wy + dy) * dp.stride..];
+                for dx in 0..win_w {
+                    let x = orow[wx + dx] as f64;
+                    let y = drow[wx + dx] as f64;
+                    sum_x += x;
+                    sum_y += y;
+                    sum_xx += x * x;
+                    sum_yy += y * y;
+                    sum_xy += x * y;
+                }
+            }
+            let mu_x = sum_x / n_win;
+            let mu_y = sum_y / n_win;
+            // Population variance / covariance (divide by N, not N-1):
+            // SSIM's reference definition uses the biased estimator.
+            let var_x = (sum_xx / n_win) - mu_x * mu_x;
+            let var_y = (sum_yy / n_win) - mu_y * mu_y;
+            let cov_xy = (sum_xy / n_win) - mu_x * mu_y;
+
+            let numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * cov_xy + c2);
+            let denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (var_x + var_y + c2);
+            score_sum += numerator / denominator;
+            score_count += 1;
+        }
+    }
+
+    if score_count == 0 {
+        // Defensive: the window clamp guarantees at least one position,
+        // so this is unreachable, but avoid a divide-by-zero regardless.
+        return Ok(1.0);
+    }
+    Ok(score_sum / score_count as f64)
+}
+
 /// Compute the bracket `(lo_bytes, hi_bytes)` used by the quality-target
 /// binary search.
 ///
@@ -745,5 +865,91 @@ mod tests {
     fn supported_for_analysis_basics() {
         let img = flat_image(4, 4, 128);
         assert!(supported_for_analysis(&img));
+    }
+
+    #[test]
+    fn ssim_identical_is_one() {
+        let img = ramp_image(32, 32);
+        let s = ssim(&img, &img).unwrap();
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "identical ssim should be 1.0, got {s}"
+        );
+    }
+
+    #[test]
+    fn ssim_flat_identical_is_one() {
+        let img = flat_image(16, 16, 100);
+        let s = ssim(&img, &img).unwrap();
+        assert!((s - 1.0).abs() < 1e-9, "flat identical ssim, got {s}");
+    }
+
+    #[test]
+    fn ssim_small_image_below_window_is_one() {
+        // 4x4 image is smaller than the 8x8 window; the clamp collapses to
+        // a single full-image window. Identical inputs still score 1.0.
+        let img = ramp_image(4, 4);
+        let s = ssim(&img, &img).unwrap();
+        assert!((s - 1.0).abs() < 1e-9, "sub-window identical ssim, got {s}");
+    }
+
+    #[test]
+    fn ssim_degraded_is_below_identical() {
+        // A noisy copy of a ramp must score strictly below a perfect 1.0.
+        let img = ramp_image(32, 32);
+        let mut noisy = img.clone();
+        let stride = noisy.planes[0].stride;
+        // Deterministic LCG so the test is reproducible.
+        let mut state: u32 = 0x1234_5678;
+        for y in 0..32usize {
+            for x in 0..32usize {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((state >> 24) as i32 % 41) - 20; // -20..=20
+                let v = img.planes[0].data[y * stride + x] as i32 + noise;
+                noisy.planes[0].data[y * stride + x] = v.clamp(0, 255) as u8;
+            }
+        }
+        let s = ssim(&img, &noisy).unwrap();
+        assert!(s < 1.0, "noisy ssim should be < 1.0, got {s}");
+        assert!(s > -1.0, "ssim should stay in range, got {s}");
+    }
+
+    #[test]
+    fn ssim_more_noise_scores_lower() {
+        // Monotonicity sanity: heavier corruption -> lower SSIM.
+        let img = ramp_image(48, 48);
+        let stride = img.planes[0].stride;
+        let make_offset = |delta: i32| {
+            let mut out = img.clone();
+            for y in 0..48usize {
+                for x in 0..48usize {
+                    // Alternating +/- so the structure is disrupted, not a
+                    // pure luminance shift (which SSIM partly tolerates).
+                    let sign = if (x ^ y) & 1 == 0 { 1 } else { -1 };
+                    let v = img.planes[0].data[y * stride + x] as i32 + sign * delta;
+                    out.planes[0].data[y * stride + x] = v.clamp(0, 255) as u8;
+                }
+            }
+            out
+        };
+        let light = ssim(&img, &make_offset(5)).unwrap();
+        let heavy = ssim(&img, &make_offset(30)).unwrap();
+        assert!(
+            heavy < light,
+            "heavier corruption should score lower: heavy {heavy} vs light {light}"
+        );
+    }
+
+    #[test]
+    fn ssim_geometry_mismatch_errs() {
+        let a = ramp_image(16, 16);
+        let b = ramp_image(16, 8);
+        assert!(ssim(&a, &b).is_err());
+    }
+
+    #[test]
+    fn ssim_zero_pixel_image_is_one() {
+        let a = IcerImage::zeros(0, 0, IcerPixelFormat::Gray8);
+        assert_eq!(ssim(&a, &a).unwrap(), 1.0);
     }
 }

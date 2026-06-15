@@ -8,9 +8,9 @@ Opportunity), continued on Mars Science Laboratory (Curiosity), Mars 2020
 This is a **clean-room** implementation. The only specification source
 consulted was the open Kiely & Klimesh paper "The ICER Progressive Wavelet
 Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
-(2003) -- abbreviated `IPN 42-155` in source comments.
-No JPL flight code, no DSN ground software, no `qccPack`, no third-party
-ICER re-implementation was consulted, paraphrased, or cross-checked.
+(2003) -- abbreviated `IPN 42-155` in source comments. That paper is the
+sole source; no other material was consulted, paraphrased, or
+cross-checked.
 
 ## Round-6 status
 
@@ -47,6 +47,7 @@ ICER re-implementation was consulted, paraphrased, or cross-checked.
 | Segment-count benchmark sweep | full (round 225; criterion suite extended with `encode_compressed_filter_q_segments_64x64` + `decode_compressed_filter_q_segments_64x64` groups sweeping `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp on the integer 5/3 path, so the per-strip overhead of the IPN 42-155 §III.E independent-segment partitioning is visible per-count rather than hidden by the round-181 single-segment default) |
 | Quality-target rate-control | full (round 233; `EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget` (byte-budget pins size + reports quality; quality-target pins quality + reports size). Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op (bit-exact round-trip satisfies any finite target trivially); above-ceiling targets return the unbudgeted encode as best-effort) |
 | Bit-plane-count benchmark sweep | full (round 230; criterion suite extended with `encode_compressed_filter_q_bit_planes_64x64` + `decode_compressed_filter_q_bit_planes_64x64` groups sweeping `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp on the integer 5/3 path, so the per-packet overhead of the IPN 42-155 §IV multi-packet ordering is visible per-floor rather than hidden by the round-181 default-floor pin -- `bit_plane_count` is a floor on `q`, so raising it above the natural `needed` walks pure per-packet overhead) |
+| Post-decode quality metrics | full (round 272 `DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae`; round 312 adds `ssim` -- mean structural-similarity index over a sliding 8x8 window, complements the MSE-family metrics on structured vs. diffuse error; all spec-neutral) |
 | Filter-A wavelet-depth benchmark sweep | full (round 262; criterion suite extended with `encode_compressed_filter_a_levels_64x64` + `decode_compressed_filter_a_levels_64x64` groups sweeping `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp on the lossy float 9/7 (`NineSevenA`) path -- the round-210 filter-Q counterpart for the float CDF lifting recursion. Slope difference vs. the round-210 integer-Q sweep isolates float-vs-integer lifting overhead per added dyadic level on the otherwise-shared bit-plane scanner + arithmetic coder.) |
 
 End-to-end round-trips:
@@ -505,7 +506,7 @@ OOM:
 * `parse_icer` -- full decode (arith coder + inverse DWT + stitch).
 
 The seed corpus under `fuzz/corpus/decode_segment/` is generated
-from icer's own encoder (no third-party ICER reference): an
+from icer's own encoder: an
 uncompressed ramp, compressed filter-Q ramps + flat, a two-segment
 split, and a byte-budget-truncated input covering the partial-
 packet path.

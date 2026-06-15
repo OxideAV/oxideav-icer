@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ssim(original, decoded)` in `analyze` (re-exported at the crate root):
+  the mean structural-similarity index of the decoded first plane against
+  the original, returned in `-1.0..=1.0` (`1.0` for a bit-identical
+  match). SSIM compares local luminance, contrast, and structure over a
+  sliding 8x8 window with the standard 8-bit stabilisation constants
+  (`C1 = (0.01 * 255)^2`, `C2 = (0.03 * 255)^2`) and complements the
+  MSE-family metrics in `DistortionReport`: a structured error (a shifted
+  edge) and a diffuse one (uniform noise) can share a PSNR yet differ
+  markedly in SSIM. Like `DistortionReport::compare`, it returns
+  `IcerError::Unsupported` on a geometry mismatch or a missing plane
+  rather than panicking. A pure post-decode measurement -- no wavelet,
+  entropy-coder, or framing machinery, and no ICER specification section
+  is involved.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-icer/compare/v0.0.3...v0.0.4) - 2026-06-10
 
 ### Other
@@ -675,8 +691,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Round-1 scaffold for ICER (JPL's progressive wavelet image compressor,
   Mars rover heritage). Clean-room from Kiely & Klimesh, IPN Progress
-  Report 42-155 (2003); no JPL flight code or third-party
-  re-implementation consulted.
+  Report 42-155 (2003) as the sole specification source.
 - Segment header + packet header parser/encoder pair (12-byte and
   4-byte fixed-width framings respectively).
 - `walk_segment` enumerator that returns per-packet body byte ranges

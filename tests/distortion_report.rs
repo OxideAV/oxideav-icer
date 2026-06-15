@@ -15,8 +15,8 @@
 //! no wavelet / entropy machinery involved.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, region_mae, DistortionReport, EncodeOptions, IcerImage,
-    IcerPixelFormat,
+    encode_icer, parse_icer, region_mae, ssim, DistortionReport, EncodeOptions, IcerImage,
+    IcerPixelFormat, WaveletFilter,
 };
 
 /// Diagonal ramp identical to the round-trip tests' fixtures.
@@ -169,6 +169,49 @@ fn region_mae_out_of_bounds_errs() {
     assert!(region_mae(&original, &decoded, u32::MAX, 0, 1, 1).is_err());
     // Zero-area region is a trivial 0.0.
     assert_eq!(region_mae(&original, &decoded, 0, 0, 0, 4).unwrap(), 0.0);
+}
+
+#[test]
+fn ssim_lossless_roundtrip_is_perfect() {
+    // Filter Q (reversible integer 5/3) round-trips bit-exactly, so the
+    // decoded image is identical to the original and SSIM is 1.0.
+    let img = ramp_image(48, 48);
+    let opts = EncodeOptions {
+        filter: WaveletFilter::Reversible53,
+        ..EncodeOptions::compressed()
+    };
+    let bytes = encode_icer(&img, &opts).unwrap();
+    let decoded = parse_icer(&bytes).unwrap();
+    let s = ssim(&img, &decoded).unwrap();
+    assert!(
+        (s - 1.0).abs() < 1e-9,
+        "lossless ssim should be 1.0, got {s}"
+    );
+}
+
+#[test]
+fn ssim_drops_under_tight_byte_budget() {
+    // A tight byte budget truncates the progressive stream, so the
+    // decoded image is degraded and SSIM falls below the perfect 1.0
+    // while staying in the valid range.
+    let w = 64u32;
+    let h = 64u32;
+    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);
+    let stride = img.planes[0].stride;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            img.planes[0].data[y * stride + x] = (((x as u32 + y as u32) * 7) & 0xFF) as u8;
+        }
+    }
+    let opts = EncodeOptions::compressed().with_byte_budget(120);
+    let bytes = encode_icer(&img, &opts).unwrap();
+    assert!(bytes.len() <= 120);
+    let decoded = parse_icer(&bytes).unwrap();
+    let s = ssim(&img, &decoded).unwrap();
+    assert!(
+        s < 1.0 && s > -1.0,
+        "truncated-stream ssim should be a degraded in-range value, got {s}"
+    );
 }
 
 #[test]

@@ -4,8 +4,7 @@
 //! Kiely & Klimesh "ICER Progressive Wavelet Image Compressor" paper
 //! (Jet Propulsion Laboratory, IPN Progress Report 42-155, 2003)
 //! — hereafter cited as `IPN 42-155`. Section / equation references
-//! point at that paper. No JPL flight code or third-party
-//! re-implementation was consulted in writing this module.
+//! point at that paper, which is the sole source for this module.
 //!
 //! ICER's transmission unit is a *segment*. Each segment is a
 //! self-contained, individually decodable region of the wavelet-domain

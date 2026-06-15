@@ -56,12 +56,11 @@
 //! Every section / equation reference in this crate cites Kiely &
 //! Klimesh, "The ICER Progressive Wavelet Image Compressor" — Jet
 //! Propulsion Laboratory, IPN Progress Report 42-155 (2003) — abbreviated
-//! "IPN 42-155" throughout. Public ICER reference implementations
-//! (JPL DSN ground software, MSL flight code, qccPack, third-party
-//! GitHub re-implementations) were **not** consulted during the
-//! clean-room write. Where the paper defers to "the implementation"
-//! (e.g. literal sync prefix value, exact context-pattern tables) the
-//! choice is documented + flagged as an interop risk for round 2.
+//! "IPN 42-155" throughout; that paper is the sole specification
+//! source for this crate's clean-room write. Where the paper defers to
+//! "the implementation" (e.g. literal sync prefix value, exact
+//! context-pattern tables) the choice is documented + flagged as an
+//! interop risk for round 2.
 //!
 //! ## Standalone vs registry-integrated
 //!
@@ -100,8 +99,8 @@ pub const CODEC_ID_STR: &str = "icer";
 // Standalone public surface — works whether or not `registry` is on.
 pub use analyze::{
     analyze, encode_to_quality_target, pick_filter_by_rate_distortion, psnr_db,
-    quality_search_bounds, recommend_filter, region_mae, supported_for_analysis, DistortionReport,
-    ImageStats, DEFAULT_RD_CANDIDATES,
+    quality_search_bounds, recommend_filter, region_mae, ssim, supported_for_analysis,
+    DistortionReport, ImageStats, DEFAULT_RD_CANDIDATES,
 };
 pub use bitplane::EncodedPacket;
 pub use decoder::{

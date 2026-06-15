@@ -21,11 +21,10 @@
 //! the estimator in round 2 will not require re-deriving the
 //! register-arithmetic side.
 //!
-//! No JPL / qccPack / ground-system code consulted — the WNC range
-//! coder is universally known and the variant here was written from
-//! the original 1987 Communications of the ACM paper by Witten,
-//! Neal and Cleary ("Arithmetic Coding for Data Compression") with
-//! modifications in §III.C of IPN 42-155 explicitly noted.
+//! The WNC range coder is universally known; the variant here was
+//! written from the original 1987 Communications of the ACM paper by
+//! Witten, Neal and Cleary ("Arithmetic Coding for Data Compression")
+//! with the modifications in §III.C of IPN 42-155 explicitly noted.
 
 use crate::error::{IcerError, Result};
 
