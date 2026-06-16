@@ -27,6 +27,7 @@ cross-checked.
 | Context model            | full (IPN 42-155 §III.B H/V/D classification; 9 significance + 5 sign + 3 refinement contexts) |
 | Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
 | Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
+| Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
 | Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target) |
@@ -140,6 +141,61 @@ Each compressed segment now emits one packet pair per bit-plane per IPN
 For a segment with bit-plane count Q, the encoder emits `2*Q` packets in
 MSB-first priority order. A decoder receiving a truncated stream can still
 reconstruct a lower-quality image from the packets it received.
+
+## Subband priority model (IPN 42-155 §III.A)
+
+ICER does not finish one subband before starting the next: it
+*interleaves* subband bit planes, always compressing next the subband
+bit plane with the highest **priority** so that a stream truncated at any
+point is the best image achievable for that many bytes (IPN 42-155
+§III.A "Subband Quantization and Priority Factors").
+
+Because ICER's wavelet transforms are not unitary, transform-domain MSE
+is not reconstructed-image MSE. §III.A scales the transform to the
+approximately-unitary form `l~ = sqrt(2)*l`, `h~ = (1/sqrt(2))*h` and
+reads off per-subband priority weights (Fig. 7). For a `D`-stage
+decomposition those weights are, with decomposition level `j` (`1` =
+outermost/largest stage, `D` = deepest/smallest):
+
+```text
+    w(HH_j)           = 2^(j-2)
+    w(HL_j) = w(LH_j) = 2^(j-1)
+    w(LL_D)           = 2^D        (LL exists only at the deepest level)
+```
+
+For `D = 3` this reproduces Fig. 7 exactly (LL=8; level-3 HL/LH=4,
+HH=2; level-2 HL/LH=2, HH=1; level-1 HL/LH=1, HH=1/2). The two worked
+examples in §III.A both fall out of the formula and are pinned by tests:
+LL has 16× (= 2^4) the weight of the level-1 HH subband, so the `i`th
+LSB plane of level-1 HH ties in priority with the `(i+4)`th LSB plane of
+LL.
+
+The `priority` module turns this into the cross-subband encode order.
+Each subband contributes `q` magnitude bit planes; each additional bit
+plane halves the priority (subtracts 1 from the `log2` priority), so the
+whole schedule lives on an exact integer `log2` scale (no float
+comparison). `encode_order(decomposition_levels, bit_planes)` returns
+every `(subband, bit-plane)` pair sorted by the §III.A rule set:
+
+1. higher priority first;
+2. ties broken by higher decomposition level;
+3. then by subband type order `LL, HL, LH, HH`.
+
+```rust
+use oxideav_icer::{encode_order, SubbandType};
+let plan = encode_order(3, 8);          // 3 stages, q = 8 bit planes
+assert_eq!(plan[0].subband.kind, SubbandType::Ll); // LL MSB encoded first
+assert_eq!(plan[0].bp_from_msb, 0);
+// 25 subbands * 8 bit planes for D=3:
+assert_eq!(plan.len(), (3 * 3 + 1) * 8);
+```
+
+The module is pure arithmetic over the subband geometry -- no entropy
+coder or wire-framing coupling -- so the bit-plane coder and packet
+emitter can adopt this interleaving order independently in a later
+round. The current packet emitter still uses the per-segment MSB-down
+order; wiring the §III.A interleaving into the emitter is the natural
+follow-on.
 
 ## What is *not* implemented
 
