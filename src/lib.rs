@@ -90,6 +90,7 @@ pub mod image;
 pub mod registry;
 pub mod wavelet;
 pub mod wavelet_float;
+pub mod wavelet_int;
 
 /// Codec identifier string used by the registry + by container demuxers
 /// when emitting `CodecId::new(CODEC_ID_STR)`. Kept lowercase to match

@@ -20,6 +20,7 @@ cross-checked.
 | Packet header parser     | full (4-byte fixed-width framing, both directions) |
 | Segment walker           | full (enumerates every packet body in a buffer) |
 | Integer 5/3 wavelet      | full (forward + inverse, 1-D, 2-D one-level, dyadic D-level) |
+| Spec-exact reversible integer filters A-F + Q | full (IPN 42-155 §II.A eqs (1)-(3) + Table 1; all seven filters bit-exact reversible, 1-D + interleaved + dyadic 2-D -- see `wavelet_int`) |
 | Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
@@ -58,9 +59,41 @@ End-to-end round-trips:
 * Multi-packet metadata: segment with q=4 bit-planes produces >= 8 packets
   (verified by `compressed_roundtrip_filter_q_multi_packet_metadata`).
 
+## Spec-exact reversible integer filters (IPN 42-155 §II.A)
+
+The staged IPN 42-155 §II.A "Wavelet Transform" section specifies that an ICER
+user selects **one of seven reversible integer wavelet transforms**: filters
+**A, B, C, D, E, F, Q**. Every one is a reversible integer-to-integer transform
+-- ICER's lossless mode works with *any* of the seven, not just Q. §II.A
+equations (1)-(3) give the exact integer high-pass recurrence, and **Table 1**
+publishes the per-filter parameters `(alpha_{-1}, alpha_0, alpha_1, beta)`
+directly (these are *not* deferred to a follow-up reference -- they are in the
+spec). The `wavelet_int` module transcribes §II.A verbatim:
+
+* `forward_1d` / `inverse_1d` -- one 1-D stage producing `ceil(N/2)` low-pass
+  and `floor(N/2)` high-pass outputs, exactly invertible.
+* `forward_1d_interleaved` / `inverse_1d_interleaved` -- the same stage in the
+  even/odd interleaved layout used by the rest of the crate.
+* `forward_2d_dyadic` / `inverse_2d_dyadic` -- the §II.B pyramidal D-level
+  decomposition (rows-then-columns forward; columns-then-rows inverse).
+
+All seven filters are proven **bit-exact reversible** across even/odd `N`, the
+interleaved layout, and 1..=5-level 2-D decompositions (see the `wavelet_int`
+tests). `WaveletFilter::int_params()` exposes the Table 1 parameters scaled to
+a common denominator of 32 so the equation-(3) predictor evaluates with a
+single floor-division.
+
+> **Errata note.** The older "float wavelet filters A-G" framing below predates
+> the staged spec. IPN 42-155 §II.A defines **seven** filters (A-F + Q), all
+> integer-reversible; there is no "filter G", and filters A-F are *not* lossy
+> float filters. The float path remains in the crate for backward-compatible
+> round-trip tests, but `wavelet_int` is the spec-conformant transform.
+
 ## Wavelet filter coverage
 
-IPN 42-155 §III.A enumerates eight candidate wavelet filters: A through G
+The pre-spec framing below describes the legacy float lifting path; see the
+section above for the spec-exact integer transform. IPN 42-155 §III.A
+enumerates eight candidate wavelet filters: A through G
 (float lifting variants) plus Q (integer 5/3). All eight are implemented:
 
 * Filter `Q` (the integer 5/3 reversible lifting filter) -- bit-exact integer
@@ -116,12 +149,11 @@ reconstruct a lower-quality image from the packets it received.
   in the paper. This crate implements a clean-room interpretation; the
   self-roundtrip is correct but may not be bit-equivalent to real Mars-rover
   ICER files.
-* **Per-filter lifting coefficients** for `A` through `G`. IPN 42-155 §III.A
-  names the filters but defers the numerical coefficients to reference [13].
-  The crate currently uses CDF 9/7 + Daubechies + Haar + Le Gall parameters
-  drawn from open wavelet literature (Sweldens 1996); Mars-rover interop will
-  need the JPL-specific numbers from reference [13] when those become
-  available.
+* **Per-filter lifting coefficients** -- *resolved by the staged spec.* The
+  IPN 42-155 §II.A Table 1 parameters for all seven filters (A-F + Q) are now
+  transcribed in `wavelet_int`; the legacy float path's CDF 9/7 + Daubechies +
+  Haar parameters were a pre-spec stand-in. The spec-exact integer transform is
+  the one to migrate the encode/decode pipeline onto.
 * **Colour plane support**. The encoder + decoder are Gray8 only; YCbCr and
   multi-plane ICER are deferred.
 

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `wavelet_int` -- spec-exact reversible integer wavelet transform for all
+  seven ICER filters (A, B, C, D, E, F, Q), transcribed directly from the
+  newly-staged IPN 42-155 §II.A equations (1)-(3) and Table 1. Every filter is
+  a reversible integer-to-integer transform (ICER's lossless mode works with
+  any of the seven, not just Q). Public surface: `forward_1d` / `inverse_1d`
+  (one 1-D stage, `ceil(N/2)` low-pass + `floor(N/2)` high-pass outputs);
+  `forward_1d_interleaved` / `inverse_1d_interleaved` (even/odd interleaved
+  layout matching the rest of the crate); `forward_2d_dyadic` /
+  `inverse_2d_dyadic` (the §II.B pyramidal D-level decomposition);
+  `WaveletFilter::int_params()` returning the Table 1 parameters
+  (`alpha_{-1}, alpha_0, alpha_1, beta`) scaled to a common denominator of 32.
+  All seven filters are proven bit-exact reversible across even/odd `N`, the
+  interleaved layout, and 1..=5-level 2-D decompositions. This closes the
+  previously-documented gap that claimed the per-filter coefficients were
+  deferred to an external reference -- they are published in §II.A Table 1.
+  README errata note added: IPN 42-155 defines seven reversible integer
+  filters (A-F + Q), not "eight float filters A-G plus Q"; the legacy float
+  lifting path is retained for backward-compatible round-trip tests but is
+  superseded by `wavelet_int` for spec conformance.
+
 - `ssim(original, decoded)` in `analyze` (re-exported at the crate root):
   the mean structural-similarity index of the decoded first plane against
   the original, returned in `-1.0..=1.0` (`1.0` for a bit-identical
