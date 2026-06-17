@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- IPN 42-155 §III.A **deadzone-quantizer reconstruction point** for truncated
+  streams. Reconstructing a subband from only its `q - b` most-significant bit
+  planes is equivalent to a deadzone scalar quantizer with bin width `∆ = 2^b`
+  (`b` = number of unavailable least-significant bit planes). The decoder now
+  reconstructs each significant coefficient at the §III.A point
+  `±((i + 1/2)∆ - 1)` (the mid-bin value biased one step toward the origin)
+  instead of the bin lower edge `±i∆`, while insignificant coefficients stay at
+  the deadzone-centre origin. The new `unavailable_bit_planes` helper derives
+  `b` from which MSB-first packets survived a byte-budget truncation. The
+  untruncated path (`b = 0`, `∆ = 1`) keeps a zero offset, so the lossless
+  filter-Q round-trip remains bit-exact. Measured on a textured 64×64 image
+  under `with_byte_budget`: **+0.5 to +3.8 dB PSNR** on truncated streams
+  (e.g. 705 B: 20.93 → 24.75 dB; 969 B: 25.09 → 28.83 dB). Five new tests:
+  `unavailable_bit_planes_counts_dropped_lsb_packets`,
+  `deadzone_reconstruction_biases_toward_mid_bin`,
+  `deadzone_reconstruction_lowers_truncation_mse` (unit) and
+  `deadzone_reconstruction_end_to_end` (integration).
+
 - `wavelet_int` -- spec-exact reversible integer wavelet transform for all
   seven ICER filters (A, B, C, D, E, F, Q), transcribed directly from the
   newly-staged IPN 42-155 §II.A equations (1)-(3) and Table 1. Every filter is

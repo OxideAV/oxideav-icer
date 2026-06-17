@@ -321,11 +321,40 @@ pub fn decode_bitplanes_multi(
         )?;
     }
 
+    // §III.A deadzone-quantizer reconstruction point. Reconstructing a
+    // subband from only its `q - b` most-significant bit planes is
+    // equivalent to applying a deadzone scalar quantizer with bin width
+    // `∆ = 2^b`, where `b` is the number of bit planes that are
+    // *unavailable* (not transmitted / not decoded). A truncated stream
+    // omits its trailing (least-significant) packets, so `b` is the
+    // number of low magnitude bit planes for which no packet survived.
+    //
+    // IPN 42-155 §III.A fixes the reconstruction point per bin:
+    //   * the central deadzone bin `[-(∆-1), ∆-1]` (insignificant
+    //     pixels) reconstructs to the origin, `0`;
+    //   * every other bin `±[i∆, (i+1)∆-1]` reconstructs to
+    //     `±((i + 1/2)∆ - 1)` -- the mid-bin value biased one step
+    //     toward the origin.
+    //
+    // A decoded significant magnitude `mag` carries bits only down to
+    // plane `b`, so `mag = i·∆` is the bin's lower edge; the spec point
+    // is `mag + ∆/2 - 1`. When `∆ = 1` (b == 0, the full stream is
+    // present) the offset is zero and the magnitude is exact -- so the
+    // lossless / untruncated path is bit-identical to before.
+    let b = unavailable_bit_planes(packets, q_usize);
+    let recon_offset: i32 = if b == 0 {
+        0
+    } else {
+        // ∆/2 - 1 = 2^(b-1) - 1.
+        (1i32 << (b - 1)) - 1
+    };
     let out = mag
         .iter()
         .zip(sign.iter())
         .map(|(&m, &s)| {
-            let v = m as i32;
+            // Insignificant pixels (mag == 0) sit in the central deadzone
+            // bin and reconstruct to the origin regardless of `∆`.
+            let v = if m == 0 { 0 } else { m as i32 + recon_offset };
             if s {
                 -v
             } else {
@@ -334,6 +363,32 @@ pub fn decode_bitplanes_multi(
         })
         .collect();
     Ok(out)
+}
+
+/// Number of least-significant magnitude bit planes that were *not*
+/// delivered to the decoder, i.e. the deadzone bin-width exponent `b`
+/// from IPN 42-155 §III.A (`∆ = 2^b`).
+///
+/// Every transmitted bit plane appears as at least one [`EncodedPacket`]
+/// (the significance pass always produces a flushed body, even when no
+/// pixel turned significant). A truncated progressive stream simply
+/// drops its trailing least-significant packets, so the lowest magnitude
+/// bit plane for which *any* packet (significance or refinement)
+/// survives marks the boundary: every plane below it is unavailable.
+///
+/// Packets carry `bit_plane` as an MSB-first index (`0` = MSB plane,
+/// `q-1` = LSB plane); the magnitude bit position is `q - 1 - bit_plane`.
+/// `b` is the smallest such magnitude position over all present packets;
+/// an empty packet set (handled by the caller) yields `q` here.
+fn unavailable_bit_planes(packets: &[EncodedPacket], q: usize) -> u32 {
+    let deepest_bit = packets
+        .iter()
+        .map(|p| q.saturating_sub(1 + p.bit_plane as usize))
+        .min();
+    match deepest_bit {
+        Some(b) => b as u32,
+        None => q as u32,
+    }
 }
 
 /// Significance + sign pass for one bit-plane, stripe-ordered.
@@ -1000,5 +1055,148 @@ mod tests {
         let multi_out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
         assert_eq!(single_out, coeffs, "single path must round-trip");
         assert_eq!(multi_out, coeffs, "multi path must round-trip");
+    }
+
+    /// `unavailable_bit_planes` maps the MSB-first packet `bit_plane`
+    /// indices back to the §III.A bin-width exponent `b`. With every
+    /// plane present `b == 0` (∆ = 1, exact); dropping the `k` trailing
+    /// (least-significant) packet pairs leaves `b == k`.
+    #[test]
+    fn unavailable_bit_planes_counts_dropped_lsb_packets() {
+        let q = 8usize;
+        // Synthesise the full 2*q packet list (bodies irrelevant here).
+        let full: Vec<EncodedPacket> = (0..q)
+            .flat_map(|bp_idx| {
+                [true, false].into_iter().map(move |sig| EncodedPacket {
+                    bit_plane: bp_idx as u8,
+                    is_significance: sig,
+                    body: vec![0u8],
+                    delta_distortion: 0.0,
+                })
+            })
+            .collect();
+        assert_eq!(unavailable_bit_planes(&full, q), 0, "full stream: b = 0");
+
+        for k in 0..q {
+            // Keep the highest-priority (smallest bit_plane index) packets:
+            // a truncation drops the LSB tail, i.e. the largest indices.
+            let kept: Vec<EncodedPacket> = full
+                .iter()
+                .filter(|p| (p.bit_plane as usize) < q - k)
+                .cloned()
+                .collect();
+            assert_eq!(
+                unavailable_bit_planes(&kept, q),
+                k as u32,
+                "dropping {k} trailing planes leaves b = {k}"
+            );
+        }
+
+        assert_eq!(
+            unavailable_bit_planes(&[], q),
+            q as u32,
+            "no packets: b = q"
+        );
+    }
+
+    /// §III.A reconstruction point. A coefficient known only to its
+    /// `q - b` most-significant bit planes reconstructs at the mid-bin
+    /// value biased toward the origin: `±((i + 1/2)∆ - 1)` for `∆ = 2^b`,
+    /// `i >= 1`; the central deadzone bin (insignificant) reconstructs to
+    /// `0`. Feeding a truncated packet set must move the reconstruction
+    /// off the bin's lower edge by exactly `∆/2 - 1`.
+    #[test]
+    fn deadzone_reconstruction_biases_toward_mid_bin() {
+        // A single non-zero coefficient with magnitude 0b1011_0 = 22,
+        // sign positive, in an 8x4 buffer so stripe scanning has shape.
+        let w = 8;
+        let h = 4;
+        let q = 6u8; // 22 < 32, MSB at bit 4 -> needs q >= 5; use 6.
+        let mut coeffs = vec![0i32; w * h];
+        coeffs[10] = 22;
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+
+        // Full stream: exact (b = 0).
+        let full = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        assert_eq!(full[10], 22, "untruncated decode is exact");
+
+        // Drop the 2 trailing (LSB) bit-plane pairs -> b = 2, ∆ = 4.
+        // The surviving magnitude bits are 22 & !0b11 = 20 (the bin lower
+        // edge i∆ with i = 5). Spec point = 20 + ∆/2 - 1 = 20 + 1 = 21.
+        let drop2: Vec<EncodedPacket> = packets
+            .iter()
+            .filter(|p| (p.bit_plane as usize) < (q as usize - 2))
+            .cloned()
+            .collect();
+        let trunc = decode_bitplanes_multi(&drop2, w, h, q).unwrap();
+        assert_eq!(trunc[10], 21, "mid-bin biased reconstruction (∆ = 4)");
+        // The bias strictly reduces the reconstruction error vs the bin
+        // lower edge (|22 - 21| = 1 < |22 - 20| = 2).
+        assert!((22 - trunc[10]).abs() < (22 - 20));
+
+        // Insignificant pixels stay at the origin (deadzone centre).
+        assert!(trunc.iter().enumerate().all(|(i, &v)| i == 10 || v == 0));
+    }
+
+    /// On a random signed buffer, truncating the stream and reconstructing
+    /// with the §III.A mid-bin point yields strictly lower total squared
+    /// error than reconstructing at the bin lower edge (zeroed low bits).
+    #[test]
+    fn deadzone_reconstruction_lowers_truncation_mse() {
+        let w = 8;
+        let h = 8;
+        let coeffs = lcg_signal(w * h, 256, 0x5151);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+
+        // Drop the 3 least-significant bit-plane pairs (b = 3, ∆ = 8).
+        let b = 3usize.min(q as usize - 1);
+        let kept: Vec<EncodedPacket> = packets
+            .iter()
+            .filter(|p| (p.bit_plane as usize) < (q as usize - b))
+            .cloned()
+            .collect();
+        let recon = decode_bitplanes_multi(&kept, w, h, q).unwrap();
+
+        // Lower-edge reference: same decode but with the mid-bin offset
+        // removed (mask off the unavailable low bits, keep the sign).
+        let delta = 1i32 << b;
+        let lower_edge: Vec<i32> = recon
+            .iter()
+            .map(|&v| {
+                let s = v.signum();
+                let mag = v.unsigned_abs() as i32;
+                // Strip the mid-bin bias back to the bin lower edge i∆.
+                s * (mag & !(delta - 1))
+            })
+            .collect();
+
+        let mse = |a: &[i32], b: &[i32]| -> i64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| {
+                    let d = (x - y) as i64;
+                    d * d
+                })
+                .sum()
+        };
+        let mid_mse = mse(&coeffs, &recon);
+        let edge_mse = mse(&coeffs, &lower_edge);
+        assert!(
+            mid_mse < edge_mse,
+            "mid-bin reconstruction MSE {mid_mse} must beat lower-edge MSE {edge_mse}"
+        );
     }
 }

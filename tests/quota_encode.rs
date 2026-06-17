@@ -254,3 +254,64 @@ fn no_budget_full_roundtrip() {
         "filter Q full roundtrip must be bit-exact"
     );
 }
+
+/// A textured 64x64 sinusoidal image: high enough coefficient dynamic
+/// range that byte-budget truncation drops several least-significant
+/// bit planes, exercising the IPN 42-155 §III.A deadzone mid-bin
+/// reconstruction point on truncated streams.
+fn textured_64x64() -> IcerImage {
+    let w = 64u32;
+    let h = 64u32;
+    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);
+    let plane = &mut img.planes[0];
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            // Two-frequency interference pattern spanning the full 0..255
+            // range, so the wavelet detail subbands carry real magnitude.
+            let a = ((x as f64 * 0.45).sin() * 90.0) as i32;
+            let b = ((y as f64 * 0.31).cos() * 90.0) as i32;
+            let v = (128 + a + b).clamp(0, 255) as u8;
+            plane.data[y * plane.stride + x] = v;
+        }
+    }
+    img
+}
+
+/// End-to-end check that the §III.A deadzone mid-bin reconstruction
+/// point is wired through `parse_icer`: a byte-budget-truncated stream
+/// still decodes to a sensible image, and the *full*-budget filter-Q
+/// path stays bit-exact (the b = 0 case where the mid-bin offset is
+/// zero, so the lossless guarantee is preserved).
+#[test]
+fn deadzone_reconstruction_end_to_end() {
+    let image = textured_64x64();
+
+    // Tight budget forces dropping several trailing bit-plane packets,
+    // so the surviving significant coefficients are reconstructed via
+    // the §III.A mid-bin point rather than the bin lower edge.
+    let opts = EncodeOptions::compressed().with_byte_budget(512);
+    let encoded = encode_icer(&image, &opts).expect("budgeted encode failed");
+    assert!(encoded.len() <= 512, "budget respected");
+    let decoded = parse_icer(&encoded).expect("truncated decode failed");
+    assert_eq!(decoded.width, 64);
+    assert_eq!(decoded.height, 64);
+    // The truncated reconstruction must be a real approximation, not the
+    // flat-128 placeholder (which would mean nothing decoded).
+    let nontrivial = decoded.planes[0].data.iter().any(|&p| p != 128);
+    assert!(nontrivial, "truncated stream should carry image detail");
+    let p_trunc = psnr(&image, &decoded);
+    assert!(
+        p_trunc.is_finite() && p_trunc > 10.0,
+        "truncated PSNR {p_trunc} should be a meaningful approximation"
+    );
+
+    // Full budget: filter Q is lossless and b = 0 keeps the mid-bin
+    // offset at zero, so the round-trip is bit-exact -- the deadzone
+    // change does not perturb the untruncated path.
+    let full = encode_icer(&image, &EncodeOptions::compressed()).expect("full encode failed");
+    let full_dec = parse_icer(&full).expect("full decode failed");
+    assert_eq!(
+        full_dec.planes[0].data, image.planes[0].data,
+        "untruncated filter-Q decode stays bit-exact"
+    );
+}

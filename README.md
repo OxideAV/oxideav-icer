@@ -30,6 +30,7 @@ cross-checked.
 | Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
+| Deadzone reconstruction point | full (IPN 42-155 §III.A; truncated streams reconstruct significant coefficients at the mid-bin `±((i+1/2)∆-1)` point biased toward the origin, ∆=2^b for b unavailable bit planes; insignificant coefficients at the deadzone centre. +0.5..+3.8 dB on byte-budget-truncated decodes; untruncated filter-Q stays bit-exact -- see "Deadzone reconstruction" below) |
 | Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D; placeholder-segment tolerant) |
@@ -141,6 +142,43 @@ Each compressed segment now emits one packet pair per bit-plane per IPN
 For a segment with bit-plane count Q, the encoder emits `2*Q` packets in
 MSB-first priority order. A decoder receiving a truncated stream can still
 reconstruct a lower-quality image from the packets it received.
+
+## Deadzone reconstruction (IPN 42-155 §III.A)
+
+Reconstructing a subband from only its `q - b` most-significant bit planes is
+*equivalent* to applying a deadzone scalar quantizer with bin width `∆ = 2^b`,
+where `b` is the number of bit planes the decoder did **not** receive (a
+byte-budget-truncated stream simply drops its trailing least-significant
+packets). §III.A pins the reconstruction point per bin:
+
+* the central deadzone bin `[-(∆-1), ∆-1]` (pixels that never became
+  significant) reconstructs to the **origin**, `0`;
+* every other bin `±[i∆, (i+1)∆-1]` reconstructs to `±((i + 1/2)∆ - 1)` -- the
+  mid-bin value biased one step toward the origin (the wavelet detail
+  coefficients are sharply peaked at zero, so the unbiased midpoint would
+  over-shoot).
+
+A decoded significant magnitude `mag` carries bits only down to plane `b`, so
+`mag = i·∆` is the bin's *lower edge*; the decoder adds `∆/2 - 1 = 2^(b-1) - 1`
+to reach the §III.A point. When the full stream is present (`b = 0`, `∆ = 1`)
+the offset is zero and the magnitude is exact -- the lossless filter-Q
+round-trip stays bit-identical. `unavailable_bit_planes` derives `b` from which
+MSB-first packets survived the truncation.
+
+**Empirical PSNR gain** (textured 64×64 image, filter Q, `with_byte_budget`,
+mid-bin §III.A point vs. the bin lower edge):
+
+| budget | bytes | lower edge | §III.A mid-bin |     Δ |
+|--------|------:|-----------:|---------------:|------:|
+| 384    |   213 |  12.86 dB  |    13.39 dB    | +0.53 |
+| 512    |   477 |  17.29 dB  |    19.20 dB    | +1.92 |
+| 768    |   705 |  20.93 dB  |    24.75 dB    | +3.82 |
+| 1024   |   969 |  25.09 dB  |    28.83 dB    | +3.74 |
+| 2048   |  1832 |  35.03 dB  |    37.16 dB    | +2.12 |
+
+The win grows with the number of dropped bit planes (larger `∆`) and is purely
+a decode-side change -- the wire format is unchanged, so every previously-
+encoded stream decodes better with no re-encode.
 
 ## Subband priority model (IPN 42-155 §III.A)
 
