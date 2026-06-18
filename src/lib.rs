@@ -86,6 +86,7 @@ pub mod encoder;
 pub mod error;
 pub mod header;
 pub mod image;
+pub mod plane_container;
 pub mod priority;
 #[cfg(feature = "registry")]
 pub mod registry;
@@ -117,6 +118,7 @@ pub use header::{
     WaveletFilter,
 };
 pub use image::{IcerImage, IcerPixelFormat, IcerPlane};
+pub use plane_container::{is_container, parse_container, ParsedContainer};
 pub use priority::{encode_order, subbands, Subband, SubbandBitPlane, SubbandType};
 
 // Registry-gated public surface.

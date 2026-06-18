@@ -162,6 +162,37 @@ pub fn parse_icer_metadata_with_limits(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<IcerMetadata> {
+    // Colour container: walk each plane substream and concatenate the
+    // per-plane segment metadata. Segment `offset` values are rebased to
+    // the original container buffer so callers see absolute positions.
+    if crate::plane_container::is_container(bytes) {
+        let parsed = crate::plane_container::parse_container(bytes)?;
+        let mut segments = Vec::new();
+        let mut total_pixels: u64 = 0;
+        for i in 0..parsed.format.plane_count() {
+            let (base, _end) = parsed.plane_ranges[i];
+            let sub = parsed.plane_bytes(bytes, i);
+            let sub_meta = parse_icer_metadata_with_limits(sub, limits)?;
+            for s in &sub_meta.segments {
+                total_pixels = total_pixels
+                    .checked_add(segment_pixels(&s.header))
+                    .ok_or_else(|| IcerError::invalid("colour pixel-count overflow"))?;
+                if total_pixels > limits.max_total_pixels {
+                    return Err(IcerError::Unsupported(format!(
+                        "colour image pixel-count {} exceeds total cap of {} pixels \
+                         (see DecodeLimits::max_total_pixels)",
+                        total_pixels, limits.max_total_pixels
+                    )));
+                }
+            }
+            for mut s in sub_meta.segments {
+                s.offset += base;
+                segments.push(s);
+            }
+        }
+        return Ok(IcerMetadata { segments });
+    }
+
     let mut segments = Vec::new();
     let mut total_pixels: u64 = 0;
     let mut cursor = 0;
@@ -212,6 +243,64 @@ pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
 /// [`DecodeLimits::unlimited`] to recover the pre-round-174 behaviour
 /// (trusted-input batch processing).
 pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+    if bytes.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+
+    // Colour images are framed as a multi-plane container (leading
+    // 0x0000 sentinel — see `crate::plane_container`). A single-plane
+    // Gray8 stream never starts with 0x0000, so the dispatch is
+    // unambiguous and every historical Gray8 stream falls through to the
+    // single-plane path below byte-for-byte unchanged.
+    if crate::plane_container::is_container(bytes) {
+        return parse_icer_multi_plane(bytes, limits);
+    }
+
+    parse_icer_single_plane(bytes, limits)
+}
+
+/// Decode a multi-plane (colour) container: each plane substream is a full
+/// single-plane ICER bitstream, decoded independently and re-assembled
+/// into the declared [`IcerPixelFormat`].
+fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+    let parsed = crate::plane_container::parse_container(bytes)?;
+    let n = parsed.format.plane_count();
+
+    let mut plane_images: Vec<IcerImage> = Vec::with_capacity(n);
+    for i in 0..n {
+        let sub = parsed.plane_bytes(bytes, i);
+        plane_images.push(parse_icer_single_plane(sub, limits)?);
+    }
+
+    // Every plane must agree on geometry — the container's planes are
+    // co-sited (4:4:4) views of one image.
+    let w = plane_images[0].width;
+    let h = plane_images[0].height;
+    for (i, p) in plane_images.iter().enumerate() {
+        if p.width != w || p.height != h {
+            return Err(IcerError::Unsupported(format!(
+                "colour plane {i} geometry {}x{} disagrees with plane 0 {}x{}",
+                p.width, p.height, w, h
+            )));
+        }
+    }
+
+    let mut out = IcerImage::zeros(w, h, parsed.format);
+    for (i, p) in plane_images.into_iter().enumerate() {
+        // Each decoded plane image is Gray8 with a single plane; move it
+        // into slot `i` of the colour image.
+        out.planes[i] = p
+            .planes
+            .into_iter()
+            .next()
+            .ok_or_else(|| IcerError::invalid("decoded colour plane has no data"))?;
+    }
+    Ok(out)
+}
+
+/// Decode a single-plane (Gray8) ICER bitstream. This is the historical
+/// `parse_icer_with_limits` body.
+fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -435,10 +524,65 @@ pub fn parse_icer_lenient(bytes: &[u8]) -> Result<LenientDecode> {
 }
 
 /// [`parse_icer_lenient`] with an explicit [`DecodeLimits`] policy.
+///
+/// For colour images, each plane substream is decoded leniently and
+/// re-assembled; the returned `received` / `missing_count` reflect the
+/// **luma** plane (plane 0), which is the canonical presence map for the
+/// colour image (the chroma planes are encoded with identical segment
+/// geometry, so their presence maps coincide on any well-formed stream).
 pub fn parse_icer_lenient_with_limits(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<LenientDecode> {
+    if bytes.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+
+    // Colour container: decode each plane substream leniently, assemble
+    // into the declared format. Geometry must agree across planes; the
+    // luma plane's presence map is reported.
+    if crate::plane_container::is_container(bytes) {
+        let parsed = crate::plane_container::parse_container(bytes)?;
+        let n = parsed.format.plane_count();
+        let mut plane_decodes: Vec<LenientDecode> = Vec::with_capacity(n);
+        for i in 0..n {
+            let sub = parsed.plane_bytes(bytes, i);
+            plane_decodes.push(parse_icer_lenient_single_plane(sub, limits)?);
+        }
+        let w = plane_decodes[0].image.width;
+        let h = plane_decodes[0].image.height;
+        for (i, d) in plane_decodes.iter().enumerate() {
+            if d.image.width != w || d.image.height != h {
+                return Err(IcerError::Unsupported(format!(
+                    "colour plane {i} geometry {}x{} disagrees with plane 0 {}x{}",
+                    d.image.width, d.image.height, w, h
+                )));
+            }
+        }
+        let received = plane_decodes[0].received.clone();
+        let missing_count = plane_decodes[0].missing_count;
+        let mut out = IcerImage::zeros(w, h, parsed.format);
+        for (i, d) in plane_decodes.into_iter().enumerate() {
+            out.planes[i] = d
+                .image
+                .planes
+                .into_iter()
+                .next()
+                .ok_or_else(|| IcerError::invalid("decoded colour plane has no data"))?;
+        }
+        return Ok(LenientDecode {
+            image: out,
+            received,
+            missing_count,
+        });
+    }
+
+    parse_icer_lenient_single_plane(bytes, limits)
+}
+
+/// Single-plane (Gray8) lenient decode — the historical
+/// `parse_icer_lenient_with_limits` body.
+fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<LenientDecode> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }

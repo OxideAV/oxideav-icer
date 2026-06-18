@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Colour (YUV 4:4:4) encode + decode** (IPN 42-155 §III). The paper
+  describes ICER as a single-component coder whose deployed colour scheme runs
+  one independent ICER instance per colour component, sharing only the outer
+  image metadata. `encode_icer` / `parse_icer` now honour
+  `IcerPixelFormat::Yuv444P`: each of the three planes is encoded as an
+  independent single-plane ICER bitstream, concatenated behind a small
+  multi-plane container header (new `plane_container` module, exported as
+  `is_container` / `parse_container` / `ParsedContainer`). The container is
+  marked by a leading `0x0000` sentinel, which a single-plane (Gray8) stream
+  can never begin with (segment sync prefixes are non-zero), so **every
+  previously-encoded Gray8 stream is byte-for-byte unchanged and decodes
+  exactly as before**. Colour support threads through `parse_icer`,
+  `parse_icer_with_limits`, `parse_icer_metadata`, `parse_icer_lenient`, and
+  the registry `Encoder` (a 3-plane `Frame::Video` now selects the colour
+  path; 1-plane stays Gray8). Filter-Q colour round-trips are bit-exact across
+  all three planes; the uncompressed §III.D path is bit-exact too. New
+  `tests/colour_roundtrip.rs` (6 tests) plus `plane_container` unit tests
+  cover round-trip fidelity, plane independence, Gray8 non-framing, multi-plane
+  metadata, and lenient decode.
+
 - IPN 42-155 §III.A **deadzone-quantizer reconstruction point** for truncated
   streams. Reconstructing a subband from only its `q - b` most-significant bit
   planes is equivalent to a deadzone scalar quantizer with bin width `∆ = 2^b`

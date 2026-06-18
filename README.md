@@ -48,6 +48,7 @@ cross-checked.
 | Quality-target rate-control | full (`EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget`. Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op; above-ceiling targets return the unbudgeted encode as best-effort) |
 | Post-decode quality metrics | full (`DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae` + `ssim` -- mean structural-similarity index over a sliding 8x8 window; all spec-neutral) |
 | Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on both the integer 5/3 (filter Q) and float 9/7 (filter A) paths -- see Benchmarks below) |
+| Colour (YUV 4:4:4) encode + decode | full (IPN 42-155 §III independent-per-component scheme; each plane is its own single-plane ICER bitstream behind a `plane_container` header; filter-Q + uncompressed round-trips bit-exact across all three planes; Gray8 wire form byte-for-byte unchanged -- see "Colour images" below) |
 
 End-to-end round-trips:
 
@@ -248,8 +249,11 @@ follow-on.
   transcribed in `wavelet_int`; the legacy float path's CDF 9/7 + Daubechies +
   Haar parameters were a pre-spec stand-in. The spec-exact integer transform is
   the one to migrate the encode/decode pipeline onto.
-* **Colour plane support**. The encoder + decoder are Gray8 only; YCbCr and
-  multi-plane ICER are deferred.
+* **Chroma subsampling**. Colour support (`IcerPixelFormat::Yuv444P`) is
+  implemented for co-sited 4:4:4 (see "Colour images" below). Subsampled
+  layouts (4:2:2 / 4:2:0) and the RGB↔YCbCr colour-transform stage are
+  deferred -- the deployed Mars-rover Bayer/colour pipeline applies the colour
+  transform *before* ICER, which sees three already-decorrelated 4:4:4 planes.
 
 ## Documentation gaps
 
@@ -747,6 +751,47 @@ The per-segment behaviour is tested in
 `tests/uncompressed_fallback.rs` against an LCG-driven noise tile
 (strict fallback win), a smooth diagonal ramp (compressed stays),
 and a stacked noise/ramp image (each strip independently decides).
+
+## Colour images
+
+IPN 42-155 §III describes ICER as fundamentally a **single-component**
+coder; the deployed colour scheme runs one independent ICER instance per
+colour component, sharing only the outer image metadata. This crate models
+that exactly. An `IcerPixelFormat::Yuv444P` image is encoded as **three
+independent single-plane ICER bitstreams** (luma + Cb + Cr, co-sited
+4:4:4), each carrying its own segments / packets / arithmetic-coded bodies,
+concatenated behind a small multi-plane container header (the
+`plane_container` module).
+
+```rust
+use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+
+let img = IcerImage::zeros(64, 64, IcerPixelFormat::Yuv444P); // 3 planes
+let bytes = encode_icer(&img, &EncodeOptions::compressed())?; // filter Q
+let decoded = parse_icer(&bytes)?;
+assert_eq!(decoded.pixel_format, IcerPixelFormat::Yuv444P);
+assert_eq!(decoded.planes.len(), 3);
+```
+
+**Backward compatibility.** The container is marked by a leading `0x0000`
+16-bit sentinel. A single-plane (Gray8) stream can never begin with
+`0x0000` -- the first two bytes of any valid segment are its non-zero
+synchronisation prefix (`SegmentHeader::parse` rejects a zero prefix as
+corruption). So the decoder dispatches on the first two bytes with zero
+ambiguity, and **every previously-encoded Gray8 stream is byte-for-byte
+unchanged** and decodes exactly as before -- the colour container is only
+emitted for multi-plane images.
+
+The colour path threads through every decode entry point
+(`parse_icer`, `parse_icer_with_limits`, `parse_icer_metadata`,
+`parse_icer_lenient`) and the registry `Encoder` (a 3-plane `Frame::Video`
+selects the colour path; a 1-plane frame stays Gray8). Filter-Q colour
+round-trips are bit-exact across all three planes; the uncompressed §III.D
+colour path is bit-exact too. The `DecodeLimits` DoS caps apply per plane
+*and* to the colour-image total. Chroma subsampling (4:2:2 / 4:2:0) and the
+RGB↔YCbCr colour-transform stage are not implemented (the deployed pipeline
+applies the colour transform before ICER -- this crate sees three
+already-decorrelated 4:4:4 planes).
 
 ## Benchmarks
 

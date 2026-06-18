@@ -451,9 +451,64 @@ impl EncodeOptions {
 
 /// Encode `image` into the on-the-wire ICER byte stream. Single or
 /// multiple segments depending on `opts.segment_count`.
+///
+/// # Colour images
+///
+/// A single-plane [`IcerPixelFormat::Gray8`] image produces a bare
+/// single-plane ICER bitstream (the historical wire form — byte-for-byte
+/// unchanged). A colour [`IcerPixelFormat::Yuv444P`] image is encoded as
+/// three **independent** single-plane ICER bitstreams (IPN 42-155 §III
+/// describes ICER as a single-component coder whose deployed colour scheme
+/// runs one ICER instance per component), concatenated behind the small
+/// [`crate::plane_container`] header. The decoder
+/// ([`crate::decoder::parse_icer`]) dispatches on the leading sentinel.
 pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    match image.pixel_format {
+        IcerPixelFormat::Gray8 => encode_icer_single_plane(image, opts),
+        IcerPixelFormat::Yuv444P => encode_icer_multi_plane(image, opts),
+    }
+}
+
+/// Encode a multi-plane (colour) image as N independent single-plane ICER
+/// bitstreams wrapped in a [`crate::plane_container`] header.
+///
+/// Each plane is run through the unchanged single-plane encoder with the
+/// same [`EncodeOptions`]; the per-plane streams are then concatenated
+/// behind the container header. This mirrors the deployed §III colour
+/// scheme: independent ICER instances sharing outer image metadata.
+fn encode_icer_multi_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let n = image.pixel_format.plane_count();
+    if image.planes.len() != n {
+        return Err(IcerError::invalid(format!(
+            "image declares {:?} ({n} planes) but carries {}",
+            image.pixel_format,
+            image.planes.len()
+        )));
+    }
+    let mut plane_streams: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for plane in &image.planes {
+        // Build a transient single-plane Gray8 view so the existing
+        // single-plane encoder (and its auto-filter / quality-target
+        // analysis, which take an `IcerImage`) operate per component.
+        let plane_image = IcerImage {
+            width: image.width,
+            height: image.height,
+            pixel_format: IcerPixelFormat::Gray8,
+            planes: vec![plane.clone()],
+            pts: image.pts,
+        };
+        plane_streams.push(encode_icer_single_plane(&plane_image, opts)?);
+    }
+    crate::plane_container::encode_container(image.pixel_format, &plane_streams)
+}
+
+/// Encode a single-plane (Gray8) image. This is the historical
+/// `encode_icer` body; the wire form it produces is unchanged.
+fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     if image.pixel_format != IcerPixelFormat::Gray8 {
-        return Err(IcerError::Unsupported("encoder only supports Gray8".into()));
+        return Err(IcerError::Unsupported(
+            "single-plane encoder requires Gray8".into(),
+        ));
     }
     let plane = image
         .planes

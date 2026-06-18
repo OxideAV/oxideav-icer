@@ -195,20 +195,35 @@ impl Encoder for IcerEncoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("icer encoder: expected Frame::Video")),
         };
-        // Build an IcerImage from the incoming video frame. Round 1
-        // only supports a single-plane Gray8 path.
-        let plane = video
+        // Build an IcerImage from the incoming video frame. A
+        // single-plane frame is Gray8; a three-plane frame is the
+        // co-sited 4:4:4 colour path (encoded as three independent ICER
+        // streams behind the plane container — see `encode_icer`).
+        if video.planes.is_empty() {
+            return Err(Error::invalid("icer encoder: video frame has no planes"));
+        }
+        let pixel_format = match video.planes.len() {
+            1 => IcerPixelFormat::Gray8,
+            3 => IcerPixelFormat::Yuv444P,
+            n => {
+                return Err(Error::unsupported(format!(
+                    "icer encoder: {n}-plane frame (only 1=Gray8 or 3=Yuv444P supported)"
+                )))
+            }
+        };
+        let planes = video
             .planes
-            .first()
-            .ok_or_else(|| Error::invalid("icer encoder: video frame has no planes"))?;
+            .iter()
+            .map(|p| crate::image::IcerPlane {
+                stride: p.stride,
+                data: p.data.clone(),
+            })
+            .collect();
         let img = IcerImage {
             width,
             height,
-            pixel_format: IcerPixelFormat::Gray8,
-            planes: vec![crate::image::IcerPlane {
-                stride: plane.stride,
-                data: plane.data.clone(),
-            }],
+            pixel_format,
+            planes,
             pts: video.pts.unwrap_or(0),
         };
         let bytes = encode_icer(&img, &self.opts)?;
