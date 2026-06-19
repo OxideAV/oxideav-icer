@@ -19,7 +19,10 @@
 //! The test below empirically demonstrates the gain on the canonical
 //! 256×256 gradient fixture used by the round-4 quota tests.
 
-use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{
+    encode_icer, parse_icer, subband_weight_map, EncodeOptions, IcerImage, IcerPixelFormat,
+    WaveletFilter,
+};
 
 /// Build a 256×256 8-bit gray gradient image with both horizontal and
 /// vertical structure -- richer than a pure horizontal ramp so the
@@ -258,5 +261,67 @@ fn rd_budget_matches_or_beats_strict_msb() {
         rd_wins >= 1,
         "R-D pruning expected to win at least one budget x fixture combination; \
          got {rd_wins} wins / {ties} ties"
+    );
+}
+
+/// §III.A image-domain weighting: the per-coefficient weight map must
+/// expose the non-unitary structure of ICER's wavelet transform — a unit
+/// error in a low-frequency (deeper-level / LL) coefficient injects more
+/// reconstructed-image distortion than the same error in a level-1
+/// high-frequency (HH) coefficient. We assert the deepest-level (LL)
+/// weight strictly exceeds the level-1 HH weight, since otherwise the
+/// weighting would be a no-op and could not steer the R-D selector.
+#[test]
+fn weight_map_reflects_non_unitary_subband_structure() {
+    let w = 32usize;
+    let h = 32usize;
+    let levels = 3u8;
+    let map = subband_weight_map(w, h, levels, WaveletFilter::Reversible53);
+    assert_eq!(map.len(), w * h);
+
+    // Level-1 HH lives at an odd/odd interior position, e.g. (5, 5).
+    let hh1 = map[5 * w + 5];
+    // LL3 lives where every coordinate stays even through 3 levels: a
+    // multiple of 8 away from the boundary, e.g. (8, 8).
+    let ll3 = map[8 * w + 8];
+    // HL1 (odd x, even y), e.g. (5, 8).
+    let hl1 = map[8 * w + 5];
+
+    assert!(
+        hh1 > 0.0 && ll3 > 0.0 && hl1 > 0.0,
+        "weights must be positive"
+    );
+    assert!(
+        ll3 > hh1,
+        "LL weight {ll3:.4} must exceed level-1 HH weight {hh1:.4} \
+         (§III.A non-unitary effect on reconstructed-image MSE)"
+    );
+    eprintln!("weights: LL3={ll3:.4} HL1={hl1:.4} HH1={hh1:.4}");
+}
+
+/// The §III.A image-domain weighting must never make the R-D selector
+/// produce an output that the strict-MSB path strictly beats, and on the
+/// high-frequency checkerboard fixture it should deliver a sizeable PSNR
+/// win at a tight budget (the canonical case where transform-domain MSE
+/// mis-ranks packets relative to reconstructed-image MSE).
+#[test]
+fn weighted_rd_beats_strict_on_checkerboard() {
+    let image = checker_64x64();
+    let budget = 400u64;
+    let strict = encode_icer(
+        &image,
+        &EncodeOptions::compressed().with_byte_budget(budget),
+    )
+    .expect("strict encode");
+    let rd = encode_icer(&image, &EncodeOptions::compressed().with_rd_budget(budget))
+        .expect("rd encode");
+    assert!(strict.len() as u64 <= budget && rd.len() as u64 <= budget);
+    let strict_psnr = psnr(&image, &parse_icer(&strict).unwrap());
+    let rd_psnr = psnr(&image, &parse_icer(&rd).unwrap());
+    eprintln!("checker64 b={budget}: strict={strict_psnr:.2} dB rd={rd_psnr:.2} dB");
+    assert!(
+        rd_psnr >= strict_psnr + 3.0,
+        "§III.A-weighted R-D should beat strict by >= 3 dB on checkerboard; \
+         strict={strict_psnr:.2} rd={rd_psnr:.2}"
     );
 }

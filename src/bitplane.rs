@@ -142,10 +142,52 @@ pub struct EncodedPacket {
 /// Returns one pair of [`EncodedPacket`] per bit-plane (significance
 /// first, then refinement). The `Q` value from `input.q` is the number
 /// of bit-planes processed.
+///
+/// This is the unweighted variant: every coefficient contributes the
+/// same per-coefficient distortion estimate regardless of its subband.
+/// The rate-distortion packet selector that consumes `delta_distortion`
+/// can instead optimise reconstructed-image MSE by passing a §III.A
+/// per-coefficient weight map to [`encode_bitplanes_weighted`].
 pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>> {
+    encode_bitplanes_weighted(input, None)
+}
+
+/// Like [`encode_bitplanes`], but accepts an optional per-coefficient
+/// image-domain distortion weight map (IPN 42-155 §III.A).
+///
+/// When `weights` is `Some(w)` (length `width * height`), each packet's
+/// `delta_distortion` accumulates `w[i]` for every coefficient `i` it
+/// touches instead of a flat per-coefficient count. `w[i]` is the
+/// image-domain MSE induced by a unit transform-domain error at
+/// coefficient `i` (see [`crate::priority::subband_weight_map`]), so the
+/// resulting `delta_distortion` estimates **reconstructed-image** MSE
+/// reduction rather than transform-domain MSE reduction. Because ICER's
+/// wavelet transforms are not unitary the two differ markedly: a unit
+/// error in a low-frequency coefficient injects far more image-domain
+/// distortion than the same error in a high-frequency coefficient, so
+/// weighting steers the rate-distortion selector toward the packets that
+/// matter most to image quality.
+///
+/// `weights = None` reproduces [`encode_bitplanes`] exactly (flat unit
+/// weight): the self-roundtrip wire form is byte-identical, since
+/// `delta_distortion` never reaches the wire — only the packet *bodies*
+/// do, and those are independent of the distortion estimate.
+pub fn encode_bitplanes_weighted(
+    input: &BitPlaneInput<'_>,
+    weights: Option<&[f64]>,
+) -> Result<Vec<EncodedPacket>> {
     input.validate()?;
     let n = input.coeffs.len();
     let q = input.q as usize;
+    if let Some(w) = weights {
+        if w.len() != n {
+            return Err(IcerError::invalid(format!(
+                "weight map length {} != coeff count {}",
+                w.len(),
+                n
+            )));
+        }
+    }
 
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
@@ -159,7 +201,7 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
         // --- Significance + sign pass (fresh coder, stripe order) ---
         let mut sig_model = ContextModel::new();
         let mut sig_enc = ArithEncoder::new();
-        let sig_before = significant.iter().filter(|&&s| s).count();
+        let sig_before: Vec<bool> = significant.clone();
 
         encode_significance_pass(
             &mut sig_enc,
@@ -172,14 +214,29 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
             bp,
         );
 
-        let sig_after = significant.iter().filter(|&&s| s).count();
-        let newly_sig = sig_after.saturating_sub(sig_before);
         // Distortion-reduction model: each newly-significant coefficient
         // moves reconstruction from 0 to mid-bin `1.5 * 2^bp`; per-coef
         // MSE drop ≈ 2.17 * 4^bp (see EncodedPacket::delta_distortion
         // docstring). We approximate by `2.0 * 4^bp`. Round-91 R-D
-        // pruning per IPN 42-155 §IV.B rate-allocation principle.
-        let sig_dist = (newly_sig as f64) * 2.0 * bp_weight;
+        // pruning per IPN 42-155 §IV.B rate-allocation principle. When a
+        // §III.A weight map is supplied, each coefficient's contribution
+        // is scaled by its image-domain weight `w[i]` so the estimate is
+        // reconstructed-image MSE, not transform-domain MSE.
+        let sig_weight_sum: f64 = match weights {
+            Some(w) => significant
+                .iter()
+                .zip(sig_before.iter())
+                .enumerate()
+                .filter(|(_, (now, before))| **now && !**before)
+                .map(|(i, _)| w[i])
+                .sum(),
+            None => significant
+                .iter()
+                .zip(sig_before.iter())
+                .filter(|(now, before)| **now && !**before)
+                .count() as f64,
+        };
+        let sig_dist = sig_weight_sum * 2.0 * bp_weight;
 
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
@@ -191,12 +248,13 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
         // --- Refinement pass (fresh coder, stripe order) ---
         let mut ref_model = ContextModel::new();
         let mut ref_enc = ArithEncoder::new();
-        let refined_count = count_refinement_coefficients(
+        let ref_weight_sum = refinement_weight_sum(
             input.coeffs,
             &significant,
             input.width,
             input.height,
             bp,
+            weights,
         );
 
         encode_refinement_pass(
@@ -211,7 +269,8 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
 
         // Distortion-reduction model: each refined coefficient halves
         // its quantisation bin, dropping per-coef MSE by `4^bp / 4`.
-        let ref_dist = (refined_count as f64) * 0.25 * bp_weight;
+        // Scaled by the §III.A image-domain weight when supplied.
+        let ref_dist = ref_weight_sum * 0.25 * bp_weight;
 
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
@@ -224,17 +283,20 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
     Ok(packets)
 }
 
-/// Count the coefficients that will be visited by the refinement pass at
-/// bit-plane `bp` (round 91 helper for the R-D distortion estimate).
-/// Matches the iteration inside [`encode_refinement_pass`] exactly.
-fn count_refinement_coefficients(
+/// Sum the §III.A image-domain weights of the coefficients that the
+/// refinement pass at bit-plane `bp` will visit (round 91 helper for the
+/// R-D distortion estimate). Matches the iteration inside
+/// [`encode_refinement_pass`] exactly. With `weights = None` this is a
+/// plain count of refined coefficients (each weight 1.0).
+fn refinement_weight_sum(
     coeffs: &[i32],
     significant: &[bool],
     width: usize,
     height: usize,
     bp: usize,
-) -> usize {
-    let mut count = 0usize;
+    weights: Option<&[f64]>,
+) -> f64 {
+    let mut sum = 0.0f64;
     let mut stripe_start = 0;
     while stripe_start < height {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
@@ -248,12 +310,15 @@ fn count_refinement_coefficients(
                 if highest_set_bit(m) == Some(bp as u32) {
                     continue;
                 }
-                count += 1;
+                sum += match weights {
+                    Some(w) => w[i],
+                    None => 1.0,
+                };
             }
         }
         stripe_start += STRIPE_HEIGHT;
     }
-    count
+    sum
 }
 
 /// Decode coefficient buffer from per-bit-plane packets produced by

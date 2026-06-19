@@ -882,13 +882,27 @@ fn encode_one_segment_compressed(
     let needed = select_bit_plane_count(&coeffs);
     let q = needed.max(opts.bit_plane_count.min(31)).min(31);
 
-    // Encode as per-bit-plane packets (IPN 42-155 §IV multi-packet ordering).
-    let packets = encode_bitplanes(&BitPlaneInput {
+    // Encode as per-bit-plane packets (IPN 42-155 §IV multi-packet
+    // ordering). When rate-distortion pruning is active, weight each
+    // packet's distortion estimate by the §III.A per-coefficient
+    // image-domain weight map so the selector optimises
+    // reconstructed-image MSE rather than transform-domain MSE (the two
+    // differ because ICER's wavelet transforms are not unitary). The
+    // weight map is only needed for the R-D path; the strict-MSB and
+    // unbudgeted paths ignore `delta_distortion` entirely, so we skip the
+    // (one inverse-DWT-per-subband-class) probe cost there.
+    let bp_input = BitPlaneInput {
         coeffs: &coeffs,
         width: img_w,
         height: strip_h,
         q,
-    })?;
+    };
+    let packets = if opts.rd_pruning {
+        let weights = crate::priority::subband_weight_map(img_w, strip_h, levels, opts.filter);
+        crate::bitplane::encode_bitplanes_weighted(&bp_input, Some(&weights))?
+    } else {
+        encode_bitplanes(&bp_input)?
+    };
 
     // Round 91: rate-distortion-driven packet selection (IPN 42-155
     // §IV.B rate-allocation principle). When enabled, the packet

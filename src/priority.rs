@@ -235,6 +235,154 @@ pub fn encode_order(decomposition_levels: u8, bit_planes: u32) -> Vec<SubbandBit
     plan
 }
 
+/// Classify the transform-coefficient position `(x, y)` into its
+/// `(SubbandType, level)` under the crate's interleaved-sub-rectangle
+/// dyadic layout (the one produced by
+/// [`crate::wavelet_float::forward_2d`]).
+///
+/// The crate's dyadic transform leaves each level in Mallat-interleaved
+/// form (low-pass at even indices, high-pass at odd indices per axis)
+/// and then applies the next level to the **top-left sub-rectangle** of
+/// the active region. So a coefficient's subband is found by repeatedly
+/// halving: at the current level, if both coordinates are even the
+/// coefficient belongs to the low/low band that the next level
+/// re-transforms (descend); otherwise the parity pair `(x%2, y%2)` names
+/// the detail subband (`(1,0) = HL`, `(0,1) = LH`, `(1,1) = HH`). A
+/// position that stays even/even through every level is the final `LL`.
+///
+/// Returns `(subband_type, level)` where `level` is `1..=levels`.
+pub fn classify_position(mut x: usize, mut y: usize, levels: u8) -> (SubbandType, u8) {
+    let mut level = 1u8;
+    loop {
+        if level > levels {
+            return (SubbandType::Ll, levels);
+        }
+        match (x % 2, y % 2) {
+            (0, 0) => {
+                x /= 2;
+                y /= 2;
+                level += 1;
+            }
+            (1, 0) => return (SubbandType::Hl, level),
+            (0, 1) => return (SubbandType::Lh, level),
+            _ => return (SubbandType::Hh, level),
+        }
+    }
+}
+
+/// Per-coefficient image-domain distortion weight for a `levels`-stage
+/// decomposition of a `width * height` strip under `filter`.
+///
+/// # §III.A image-domain weighting
+///
+/// IPN 42-155 §III.A observes that, because ICER's wavelet transforms
+/// are *not* unitary, transform-domain mean-square error is **not** equal
+/// to reconstructed-image MSE: "the weights shown in Fig. 7 ... indicate
+/// the approximate relative effect (per pixel of the subband) on the
+/// reconstructed image of root-mean-squared distortion values in the
+/// subbands". Fig. 7 publishes those weights for the *idealised*
+/// approximately-unitary scaled transform. This crate's integer /
+/// float lifting transforms are a concrete, non-standard realisation
+/// whose actual per-subband effect differs from the idealised figure,
+/// so rather than assume the Fig. 7 numbers literally this routine
+/// **measures** the §III.A effect directly from the transform in use.
+///
+/// The image-domain energy injected by a unit error in transform
+/// coefficient `i` is `||T^{-1} e_i||^2` — the squared norm of the
+/// inverse transform of a unit basis vector at position `i`. That is
+/// exactly the "effect on the reconstructed image of distortion in the
+/// subband" §III.A weights quantify, computed for the implemented
+/// (non-unitary) `T^{-1}` with no dependency on resolving the scrambled
+/// subband identity. The energy is constant within a subband class away
+/// from the strip boundary, so we evaluate one representative basis
+/// vector per `(SubbandType, level)` class and broadcast it to every
+/// coefficient of that class.
+///
+/// The returned weights multiply the per-coefficient transform-domain
+/// squared-error terms in the rate-distortion packet selector
+/// ([`crate::bitplane`]) so the selector optimises **reconstructed-image**
+/// MSE rather than transform-domain MSE.
+pub fn subband_weight_map(
+    width: usize,
+    height: usize,
+    levels: u8,
+    filter: crate::header::WaveletFilter,
+) -> Vec<f64> {
+    let levels = levels.clamp(1, 6);
+    // One representative weight per (SubbandType, level) class. Probe a
+    // near-centre coefficient of each class so the §III.A basis energy is
+    // measured away from the boundary-extension transient.
+    let mut class_weight: std::collections::HashMap<(SubbandType, u8), f64> =
+        std::collections::HashMap::new();
+
+    // Pick an interior probe position for each class by scanning the
+    // central region once; the first interior hit per class is used.
+    let margin = 4usize;
+    let (x0, x1) = if width > 2 * margin {
+        (margin, width - margin)
+    } else {
+        (0, width)
+    };
+    let (y0, y1) = if height > 2 * margin {
+        (margin, height - margin)
+    } else {
+        (0, height)
+    };
+    'scan: for y in y0..y1 {
+        for x in x0..x1 {
+            let class = classify_position(x, y, levels);
+            if class_weight.contains_key(&class) {
+                continue;
+            }
+            class_weight.insert(class, basis_energy(width, height, levels, filter, x, y));
+            // 3*levels detail classes + 1 LL = full set; stop once seen.
+            if class_weight.len() == 3 * levels as usize + 1 {
+                break 'scan;
+            }
+        }
+    }
+
+    // Build the per-coefficient map. Any class not hit by the interior
+    // scan (tiny strips) falls back to a fresh probe at its position.
+    let mut out = vec![1.0f64; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let class = classify_position(x, y, levels);
+            let w = *class_weight
+                .entry(class)
+                .or_insert_with(|| basis_energy(width, height, levels, filter, x, y));
+            out[y * width + x] = w;
+        }
+    }
+    out
+}
+
+/// Inverse-DWT basis energy `||T^{-1} e_i||^2` for a unit error at
+/// `(px, py)`, normalised so the weight is the image-domain MSE per unit
+/// transform-domain MSE (IPN 42-155 §III.A; see [`subband_weight_map`]).
+fn basis_energy(
+    width: usize,
+    height: usize,
+    levels: u8,
+    filter: crate::header::WaveletFilter,
+    px: usize,
+    py: usize,
+) -> f64 {
+    // A scaled delta survives the integer-rounding step inside the float
+    // dispatch path; the energy is normalised back by the delta squared
+    // so the result is per-unit-coefficient.
+    const DELTA: i32 = 64;
+    let mut buf = vec![0i32; width * height];
+    buf[py * width + px] = DELTA;
+    // inverse_2d is infallible for width,height >= 2 (validated by the
+    // caller's segment-size guard); fall back to a unit weight otherwise.
+    if crate::wavelet_float::inverse_2d(&mut buf, width, height, levels, filter).is_err() {
+        return 1.0;
+    }
+    let energy: f64 = buf.iter().map(|&v| (v as f64).powi(2)).sum();
+    energy / ((DELTA as f64) * (DELTA as f64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +542,47 @@ mod tests {
     fn levels_clamped_to_1_6() {
         assert_eq!(subbands(0).len(), subbands(1).len());
         assert_eq!(subbands(9).len(), subbands(6).len());
+    }
+
+    /// `classify_position` follows the interleaved sub-rectangle dyadic
+    /// layout: odd parity on either axis names a detail subband at the
+    /// current level; even/even descends to the next level; all-even
+    /// through every level is the final LL.
+    #[test]
+    fn classify_position_basic_parities() {
+        let d = 3u8;
+        // Level-1 detail bands: parity at level 1.
+        assert_eq!(classify_position(1, 0, d), (SubbandType::Hl, 1));
+        assert_eq!(classify_position(0, 1, d), (SubbandType::Lh, 1));
+        assert_eq!(classify_position(1, 1, d), (SubbandType::Hh, 1));
+        // (2,2) is even/even at level 1 -> descends; (1,1) in level-2
+        // coords -> HH at level 2. (2,2)/2 = (1,1).
+        assert_eq!(classify_position(2, 2, d), (SubbandType::Hh, 2));
+        // (4,0): /2=(2,0) even/even -> /2=(1,0) -> HL level 3.
+        assert_eq!(classify_position(4, 0, d), (SubbandType::Hl, 3));
+        // (0,0) stays even through all levels -> LL at deepest level.
+        assert_eq!(classify_position(0, 0, d), (SubbandType::Ll, d));
+        // (8,8) all-even through 3 levels -> LL.
+        assert_eq!(classify_position(8, 8, d), (SubbandType::Ll, d));
+    }
+
+    /// The §III.A weight map is well-formed (one positive weight per
+    /// coefficient) and the unweighted-vs-weighted distinction is real:
+    /// the deepest-level LL weight differs from the level-1 HH weight
+    /// (the transform is not unitary, so the per-subband image-domain
+    /// effect is not flat).
+    #[test]
+    fn weight_map_is_positive_and_non_flat() {
+        let w = 32usize;
+        let h = 32usize;
+        let map = subband_weight_map(w, h, 3, crate::header::WaveletFilter::Reversible53);
+        assert_eq!(map.len(), w * h);
+        assert!(map.iter().all(|&v| v > 0.0), "all weights positive");
+        let ll = map[8 * w + 8];
+        let hh1 = map[5 * w + 5];
+        assert!(
+            (ll - hh1).abs() > 1e-3,
+            "LL ({ll:.4}) and HH1 ({hh1:.4}) weights must differ (non-unitary)"
+        );
     }
 }

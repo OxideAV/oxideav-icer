@@ -119,7 +119,10 @@ pub use header::{
 };
 pub use image::{IcerImage, IcerPixelFormat, IcerPlane};
 pub use plane_container::{is_container, parse_container, ParsedContainer};
-pub use priority::{encode_order, subbands, Subband, SubbandBitPlane, SubbandType};
+pub use priority::{
+    classify_position, encode_order, subband_weight_map, subbands, Subband, SubbandBitPlane,
+    SubbandType,
+};
 
 // Registry-gated public surface.
 #[cfg(feature = "registry")]
