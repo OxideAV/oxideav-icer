@@ -3,7 +3,7 @@
 //! Rovers (Spirit, Opportunity), continued on Mars Science Laboratory
 //! (Curiosity), Mars 2020 (Perseverance), and follow-ons.
 //!
-//! Round-6 status:
+//! Current status:
 //!
 //! * **Framing parser** -- segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
@@ -42,7 +42,7 @@
 //!   `with_auto_filter_rd()` trials every candidate filter and picks
 //!   the byte-smallest output via [`analyze::pick_filter_by_rate_distortion`].
 //!   Both compose with the quota options.
-//! * **ROI segment prioritisation** (round 6) --
+//! * **ROI segment prioritisation** --
 //!   `with_segment_priorities(Vec<u16>)` attaches a per-segment priority
 //!   permutation; `with_center_roi()` builds a centre-out priority
 //!   permutation for the current `segment_count`. Combined with
@@ -50,6 +50,13 @@
 //!   low-priority strips can be dropped to zero-body placeholders. The
 //!   decoder reconstructs dropped strips as flat 128 (IPN 42-155
 //!   §III.E independent-segment scheduling).
+//! * **Geometry-preserving budget truncation** -- on *every* budget
+//!   path (with or without ROI priorities), a strip that does not fit
+//!   the byte budget is emitted as a zero-body placeholder header rather
+//!   than dropped, so a budget-truncated stream always frames the full
+//!   image geometry (IPN 42-155 §V.B). `DecodeLimits` additionally
+//!   bounds decode *compute*, not just allocation: a header declaring a
+//!   geometry over the cap is refused before any inverse DWT runs.
 //!
 //! ## Specification source
 //!

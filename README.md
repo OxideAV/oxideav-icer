@@ -31,7 +31,7 @@ cross-checked.
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
 | Deadzone reconstruction point | full (IPN 42-155 §III.A; truncated streams reconstruct significant coefficients at the mid-bin `±((i+1/2)∆-1)` point biased toward the origin, ∆=2^b for b unavailable bit planes; insignificant coefficients at the deadzone centre. +0.5..+3.8 dB on byte-budget-truncated decodes; untruncated filter-Q stays bit-exact -- see "Deadzone reconstruction" below) |
-| Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target) |
+| Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target; budget-truncated multi-segment encodes emit a zero-body placeholder header for every dropped strip so the decoded image always frames the full geometry -- a tiny budget no longer shrinks the image height, IPN 42-155 §V.B) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D; placeholder-segment tolerant) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
@@ -41,7 +41,7 @@ cross-checked.
 | ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
 | R-D budget pruning | full (`EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
-| Decode-side resource limits | full (`DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits) |
+| Decode-side resource limits | full (`DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits; `DecodeLimits` bounds decode *compute* as well as allocation -- the `decode_segment` fuzz harness uses a tight 1 MPx/segment budget so a single crafted header declaring multi-MPx geometry cannot spend tens of seconds in the inverse DWT + bit-plane scan) |
 | Per-segment uncompressed fallback | full (`EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
 | Lenient multi-segment decode | full (`parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128; segment 0 must be present to pin canonical strip height) |
 | Encode-side fuzz harness | full (`fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
