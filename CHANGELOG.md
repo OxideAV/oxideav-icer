@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`decode_segment` fuzz harness bounded decode compute, not just
+  allocation.** A 12-byte segment header can declare a multi-megapixel
+  geometry that sits under the 64 MPx default per-segment
+  [`DecodeLimits`] cap yet costs tens of seconds of inverse-DWT +
+  bit-plane work — even with a near-empty packet body (a tiny body is a
+  legitimate progressive-truncation case, so the geometry cannot be
+  rejected by body size). Two scheduled-Fuzz slow-units declared ~34 MPx
+  (4160×8240) and took 24–59 s through `parse_icer` /
+  `parse_icer_lenient`, drowning out the framing/entropy exploration the
+  target exists for. The harness now drives the full-decode layer through
+  `parse_icer_with_limits` / `parse_icer_lenient_with_limits` with a
+  tight per-run budget (1 MPx/segment, 4 MPx total), turning the
+  50-second decode into a sub-millisecond geometry refusal while still
+  exercising the allocator, inverse DWT, arithmetic coder and
+  multi-segment stitch. The header-only `walk_segment` /
+  `parse_icer_metadata` layers keep the default-limits public entry
+  points for coverage of the geometry-validation refusal path. Both
+  slow-units added to `fuzz/corpus/decode_segment/` as
+  `seed_giant_geometry_34mpx_{a,b}.bin`; new `tests/geometry_limits.rs`
+  (2 tests) pins the sub-millisecond refusal and the sub-cap-admitted
+  behaviour. No public-API or default-limits change.
+
 - **Budget-truncated multi-segment encode dropped image rows** (IPN
   42-155 §V.B independent-segment scheduling). On the legacy
   `segment_index`-order budget path (no ROI priorities), when the byte
