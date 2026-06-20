@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Budget-truncated multi-segment encode dropped image rows** (IPN
+  42-155 §V.B independent-segment scheduling). On the legacy
+  `segment_index`-order budget path (no ROI priorities), when the byte
+  budget ran out the encoder stopped emitting segments without leaving a
+  placeholder header for the strips it skipped. Because the strict
+  decoder reconstructs the total image height by summing the heights of
+  the segments physically present on the wire, the decoded image shrank:
+  a 128×64 16-segment image under a 38-byte budget self-roundtripped to
+  128×4 (a single 4-row strip). The encoder now emits a zero-body
+  placeholder header for every skipped strip — sharing the new
+  `emit_skipped_placeholders` helper with the ROI-priority path that
+  already did this — and reserves header bytes for the not-yet-decided
+  strips while spending the budget so framing the geometry never starves
+  itself. The decoder reconstructs each placeholder strip as flat-128 at
+  the correct row offset, so geometry is preserved at every budget.
+  Found by the scheduled `encode_roundtrip` cargo-fuzz target (crash
+  added to the corpus as
+  `fuzz/corpus/encode_roundtrip/seed_budget_geometry_16seg_64rows.bin`);
+  new `tests/budget_geometry.rs` (3 tests) pins the fuzz repro plus a
+  budget sweep and the unchanged unbudgeted path. Unbudgeted encodes are
+  byte-for-byte unchanged.
+
 ### Added
 
 - **Colour (YUV 4:4:4) encode + decode** (IPN 42-155 §III). The paper

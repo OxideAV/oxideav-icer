@@ -673,16 +673,34 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     if !priorities_active {
         // Legacy path: encode + emit in index order, respect the budget
         // strip-by-strip via per-segment budget propagation.
+        //
+        // When a segment does not fit the remaining budget we MUST NOT
+        // drop it silently: the strict decoder reconstructs the total
+        // image height by summing the heights of the segments present
+        // on the wire, so a missing trailing strip would shrink the
+        // decoded image (e.g. a 64-row 16-segment image truncated to a
+        // single 4-row strip). Instead we emit a zero-body placeholder
+        // header for every skipped strip — identical to the ROI-priority
+        // second pass below — so the decoder accounts for the strip at
+        // the correct y-offset (reconstructed as the flat-128 §V.B
+        // placeholder) and the contiguous segment_index sequence the
+        // decoder requires is preserved.
+        let mut kept = vec![false; n_segs];
         for &seg_idx in &emission_order {
             let (y_start, this_h) = starts_heights[seg_idx as usize];
 
-            if let Some(budget) = opts.byte_budget {
+            // Reserve a placeholder header for every later strip that has
+            // not yet been written, so that committing this segment never
+            // starves the budget needed to frame the rest of the image.
+            let inner_opts = if let Some(budget) = opts.byte_budget {
                 if out.len() as u64 >= budget {
                     break;
                 }
-            }
-            let inner_opts = if let Some(budget) = opts.byte_budget {
-                let remaining = budget.saturating_sub(out.len() as u64);
+                let reserve =
+                    (n_segs - 1 - seg_idx as usize) as u64 * (SegmentHeader::ENCODED_BYTES as u64);
+                let remaining = budget
+                    .saturating_sub(out.len() as u64)
+                    .saturating_sub(reserve);
                 let mut o = opts.clone();
                 o.byte_budget = Some(remaining);
                 o
@@ -692,12 +710,17 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
             let bytes =
                 encode_one_segment(plane, w, y_start, this_h, seg_idx, &inner_opts, levels)?;
             if let Some(budget) = opts.byte_budget {
-                if out.len() as u64 + bytes.len() as u64 > budget {
-                    break;
+                let reserve =
+                    (n_segs - 1 - seg_idx as usize) as u64 * (SegmentHeader::ENCODED_BYTES as u64);
+                if out.len() as u64 + bytes.len() as u64 + reserve > budget {
+                    // Skip this strip; a placeholder is emitted below.
+                    continue;
                 }
             }
             out.extend_from_slice(&bytes);
+            kept[seg_idx as usize] = true;
         }
+        emit_skipped_placeholders(&mut out, &kept, &starts_heights, w, levels, opts);
         return Ok(out);
     }
 
@@ -731,16 +754,36 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
         kept[seg_idx as usize] = true;
     }
     // Second pass: emit placeholder headers for every segment that was
-    // skipped, in segment_index order. The header carries the strip's
-    // width + height so the decoder knows the row offset; segment_length
-    // is zero so no packets follow.
+    // skipped, in segment_index order.
+    emit_skipped_placeholders(&mut out, &kept, &starts_heights, w, levels, opts);
+    Ok(out)
+}
+
+/// Append a zero-body placeholder segment header for every strip whose
+/// `kept[seg_idx]` flag is `false`, in ascending `segment_index` order.
+///
+/// A placeholder carries the strip's width + height (so the decoder knows
+/// the row offset) with `segment_length = 0` and no packets, so the
+/// decoder reconstructs the strip as the flat-128 §V.B placeholder while
+/// still accounting for its rows in the total image height. This is shared
+/// by both the legacy index-order budget path and the ROI-priority path so
+/// a budget-truncated stream always frames the full image geometry.
+fn emit_skipped_placeholders(
+    out: &mut Vec<u8>,
+    kept: &[bool],
+    starts_heights: &[(usize, usize)],
+    w: usize,
+    levels: u8,
+    opts: &EncodeOptions,
+) {
     for (seg_idx, &was_kept) in kept.iter().enumerate() {
         if was_kept {
             continue;
         }
         let (_y_start, this_h) = starts_heights[seg_idx];
-        // A placeholder uses bit_plane_count=1 so the field validates,
-        // and the compressed flag matches the rest of the segments.
+        // A placeholder uses bit_plane_count clamped into range so the
+        // field validates, and the compressed flag matches the rest of
+        // the segments.
         let placeholder = SegmentHeader {
             sync_prefix: opts.sync_prefix,
             filter: opts.filter,
@@ -754,7 +797,6 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
         };
         out.extend_from_slice(&placeholder.encode());
     }
-    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -897,9 +939,18 @@ fn encode_one_segment_compressed(
         height: strip_h,
         q,
     };
-    let packets = if opts.rd_pruning {
-        let weights = crate::priority::subband_weight_map(img_w, strip_h, levels, opts.filter);
-        crate::bitplane::encode_bitplanes_weighted(&bp_input, Some(&weights))?
+    let rd_weights: Option<Vec<f64>> = if opts.rd_pruning {
+        Some(crate::priority::subband_weight_map(
+            img_w,
+            strip_h,
+            levels,
+            opts.filter,
+        ))
+    } else {
+        None
+    };
+    let packets = if let Some(weights) = &rd_weights {
+        crate::bitplane::encode_bitplanes_weighted(&bp_input, Some(weights))?
     } else {
         encode_bitplanes(&bp_input)?
     };
@@ -909,11 +960,42 @@ fn encode_one_segment_compressed(
     // *set* is chosen by greedy ΔD/byte ranking before serialisation,
     // rather than walked MSB-down with a strict truncation cut-off.
     // See `select_packets_by_rd` below for the algorithm.
+    //
+    // The greedy ΔD/byte plan is then validated against the plain
+    // strict-MSB prefix plan by *actual* decoded distortion (decode each
+    // candidate, measure the §III.A image-domain weighted MSE against the
+    // pre-truncation coefficients) and the lower-distortion plan wins.
+    // The ΔD estimate is approximate, so without this guard the greedy
+    // plan can decode worse than strict on some content; the guard makes
+    // the R-D mode provably never worse than strict-MSB truncation.
     let kept_mask: Option<Vec<bool>> = match (opts.rd_pruning, opts.byte_budget) {
         (true, Some(budget)) => {
             let seg_hdr_bytes = SegmentHeader::ENCODED_BYTES as u64;
             let body_budget = budget.saturating_sub(seg_hdr_bytes);
-            Some(select_packets_by_rd(&packets, q, body_budget))
+            let greedy = select_packets_by_rd(&packets, q, body_budget);
+            let strict = strict_msb_prefix_mask(&packets, q, body_budget);
+            // Original strip pixels (level-shifted to match the decoder's
+            // pre-inverse-shift domain) so the candidate comparison can
+            // measure *exact* reconstructed-image MSE.
+            let mut orig: Vec<i32> = Vec::with_capacity(img_w * strip_h);
+            for y in 0..strip_h {
+                let src_y = y_start + y;
+                let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
+                for &px in row {
+                    orig.push(px as i32 - 128);
+                }
+            }
+            Some(pick_lower_distortion_mask(
+                &packets,
+                q,
+                img_w,
+                strip_h,
+                levels,
+                opts.filter,
+                &orig,
+                greedy,
+                strict,
+            ))
         }
         _ => None,
     };
@@ -1240,6 +1322,90 @@ fn select_packets_by_rd(packets: &[EncodedPacket], q: u8, body_budget: u64) -> V
     }
 
     best_mask
+}
+
+/// Build the packet mask the strict-MSB truncation path would emit for
+/// `body_budget` bytes: walk packets in `(sig_0, ref_0, sig_1, ref_1,
+/// ...)` order, including each while it fits, stopping at the first
+/// packet that would overflow. This is the baseline the §IV.B R-D plan
+/// must never decode worse than.
+fn strict_msb_prefix_mask(packets: &[EncodedPacket], q: u8, body_budget: u64) -> Vec<bool> {
+    let mut mask = vec![false; packets.len()];
+    let mut used: u64 = 0;
+    'outer: for bp_idx in 0..q as usize {
+        for is_sig in [true, false] {
+            if let Some(i) = packets
+                .iter()
+                .position(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig)
+            {
+                let cost = PacketHeader::ENCODED_BYTES as u64 + packets[i].body.len() as u64;
+                if used + cost > body_budget {
+                    break 'outer;
+                }
+                used += cost;
+                mask[i] = true;
+            }
+        }
+    }
+    mask
+}
+
+/// Decode both candidate packet masks through the full inverse pipeline
+/// (multi-packet decode + inverse DWT) and return the one whose
+/// reconstruction has the lower **exact reconstructed-image** MSE against
+/// the (level-shifted) original strip pixels `orig`.
+///
+/// The greedy ΔD/byte selector ([`select_packets_by_rd`]) optimises an
+/// *estimate* of the distortion reduction, and even a §III.A weighted
+/// coefficient-domain estimate is only an approximation because ICER's
+/// transform is not unitary (its basis vectors are not orthogonal, so the
+/// true image MSE carries cross terms the per-coefficient weight ignores).
+/// Comparing the genuine inverse-DWT reconstruction MSE is exact, and
+/// makes the R-D mode provably never worse than strict-MSB truncation
+/// (IPN 42-155 §IV.B: minimum reconstructed-image distortion for the
+/// rate). The inverse DWT is the same transform the decoder runs, so the
+/// comparison sees exactly what the receiver will.
+///
+/// Ties (equal MSE) and any decode failure fall back to the greedy plan,
+/// which is byte-minimal among equal-quality plans.
+#[allow(clippy::too_many_arguments)]
+fn pick_lower_distortion_mask(
+    packets: &[EncodedPacket],
+    q: u8,
+    width: usize,
+    height: usize,
+    levels: u8,
+    filter: WaveletFilter,
+    orig: &[i32],
+    greedy: Vec<bool>,
+    strict: Vec<bool>,
+) -> Vec<bool> {
+    // If the two plans are identical there is nothing to choose.
+    if greedy == strict {
+        return greedy;
+    }
+    let recon_mse = |mask: &[bool]| -> Option<f64> {
+        let kept: Vec<EncodedPacket> = packets
+            .iter()
+            .zip(mask.iter())
+            .filter(|(_, &m)| m)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut coeffs = crate::bitplane::decode_bitplanes_multi(&kept, width, height, q).ok()?;
+        wavelet_float::inverse_2d(&mut coeffs, width, height, levels, filter).ok()?;
+        let mut acc = 0.0f64;
+        for (&o, &r) in orig.iter().zip(coeffs.iter()) {
+            let d = (o - r) as f64;
+            acc += d * d;
+        }
+        Some(acc)
+    };
+    match (recon_mse(&greedy), recon_mse(&strict)) {
+        (Some(g), Some(s)) if s < g => strict,
+        // Greedy wins ties (byte-minimal at equal quality) and is the
+        // fallback when either decode fails.
+        _ => greedy,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
