@@ -30,7 +30,7 @@ cross-checked.
 | Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
-| Deadzone reconstruction point | full (IPN 42-155 §III.A; truncated streams reconstruct significant coefficients at the mid-bin `±((i+1/2)∆-1)` point biased toward the origin, ∆=2^b for b unavailable bit planes; insignificant coefficients at the deadzone centre. +0.5..+3.8 dB on byte-budget-truncated decodes; untruncated filter-Q stays bit-exact -- see "Deadzone reconstruction" below) |
+| Deadzone reconstruction point | full (IPN 42-155 §III.A; truncated streams reconstruct significant coefficients at the mid-bin `±((i+1/2)∆-1)` point biased toward the origin, ∆=2^b; the deadzone exponent `b` is tracked **per coefficient** so a budget cut that lands between a plane's significance and refinement packets reconstructs newly-significant and already-significant coefficients at their own bin widths; insignificant coefficients at the deadzone centre. +0.5..+3.8 dB on bit-plane-boundary truncation, a further +1.4..+3.0 dB on mid-plane (refinement-dropped) cuts; untruncated filter-Q stays bit-exact -- see "Deadzone reconstruction" below) |
 | Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target; budget-truncated multi-segment encodes emit a zero-body placeholder header for every dropped strip so the decoded image always frames the full geometry -- a tiny budget no longer shrinks the image height, IPN 42-155 §V.B) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D; placeholder-segment tolerant) |
@@ -163,19 +163,45 @@ A decoded significant magnitude `mag` carries bits only down to plane `b`, so
 `mag = i·∆` is the bin's *lower edge*; the decoder adds `∆/2 - 1 = 2^(b-1) - 1`
 to reach the §III.A point. When the full stream is present (`b = 0`, `∆ = 1`)
 the offset is zero and the magnitude is exact -- the lossless filter-Q
-round-trip stays bit-identical. `unavailable_bit_planes` derives `b` from which
-MSB-first packets survived the truncation.
+round-trip stays bit-identical.
 
-**Empirical PSNR gain** (textured 64×64 image, filter Q, `with_byte_budget`,
-mid-bin §III.A point vs. the bin lower edge):
+### Per-coefficient deadzone width
 
-| budget | bytes | lower edge | §III.A mid-bin |     Δ |
-|--------|------:|-----------:|---------------:|------:|
-| 384    |   213 |  12.86 dB  |    13.39 dB    | +0.53 |
-| 512    |   477 |  17.29 dB  |    19.20 dB    | +1.92 |
-| 768    |   705 |  20.93 dB  |    24.75 dB    | +3.82 |
-| 1024   |   969 |  25.09 dB  |    28.83 dB    | +3.74 |
-| 2048   |  1832 |  35.03 dB  |    37.16 dB    | +2.12 |
+`b` is **not** a single strip-global value. A byte-budget truncation cuts the
+progressive packet stream at packet granularity, and a plane's significance and
+refinement passes are *separate* packets emitted MSB-down (sig before ref). So
+a cut frequently lands *between* a plane's significance and refinement packets:
+`sig(bp)` is delivered but `ref(bp)` is dropped. The two coefficient classes
+then have different deadzone widths:
+
+* a coefficient made **newly significant** in the surviving `sig(bp)` knows its
+  most-significant magnitude bit -- its deadzone is `b = bp`, `∆ = 2^bp`;
+* a coefficient that was **already significant** at a higher plane but whose
+  `ref(bp)` refinement bit was dropped is known only down to plane `bp + 1` --
+  its deadzone is `b = bp + 1`, `∆ = 2^(bp+1)`, a bin twice as wide.
+
+The decoder tracks, per coefficient, the deepest magnitude bit plane that was
+actually delivered for it (a magnitude bit decode in either the significance or
+the refinement pass), and applies each coefficient's own `∆/2 - 1` offset. A
+missing refinement packet is *skipped entirely* (never decoded from an empty
+body), so it cannot inject spurious magnitude bits, and the already-significant
+coefficients keep their wider bin. On a clean bit-plane-boundary truncation
+every coefficient shares the same `b`, so this reduces exactly to the earlier
+strip-global behaviour; the gain is on the common mid-plane cut.
+
+**Empirical PSNR gain on mid-plane cuts** (textured 64×64 image, filter Q,
+3-level DWT, `with_byte_budget`; per-coefficient deadzone vs. the strip-global
+single-`b` reconstruction). Boundary budgets (output 841 / 1477 / 2096 / 3791
+bytes) are unchanged; the rows below are the budgets whose cut drops a
+refinement packet:
+
+| output bytes | strip-global | per-coefficient |     Δ |
+|-------------:|-------------:|----------------:|------:|
+| 1325         |   22.63 dB   |     22.91 dB    | +0.28 |
+| 1792         |   27.01 dB   |     28.42 dB    | +1.41 |
+| 2258         |   31.62 dB   |     33.66 dB    | +2.05 |
+| 2758         |   36.64 dB   |     39.30 dB    | +2.66 |
+| 3275         |   41.16 dB   |     44.16 dB    | +3.00 |
 
 The win grows with the number of dropped bit planes (larger `∆`) and is purely
 a decode-side change -- the wire format is unchanged, so every previously-

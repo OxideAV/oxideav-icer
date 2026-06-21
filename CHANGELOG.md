@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Per-coefficient §III.A deadzone reconstruction on mid-plane
+  truncation.** The truncated-stream reconstruction point (IPN 42-155
+  §III.A) now derives the deadzone bin-width exponent `b` **per
+  coefficient** instead of once per strip. A byte-budget cut routinely
+  lands between a plane's significance and refinement packets (they are
+  separate MSB-down packets): `sig(bp)` survives, `ref(bp)` is dropped.
+  Coefficients made newly significant in the surviving `sig(bp)` know
+  their MSB (`b = bp`), but coefficients already significant at a higher
+  plane never received their plane-`bp` refinement bit and are known only
+  down to `bp + 1` (`b = bp + 1`, a bin twice as wide). The decoder now
+  tracks the deepest delivered magnitude bit plane for each coefficient
+  and applies that coefficient's own `∆/2 - 1` mid-bin offset; a missing
+  refinement packet is skipped entirely rather than decoded from an empty
+  body, so it injects no spurious magnitude bits. Clean bit-plane-boundary
+  truncations are unchanged (every coefficient shares one `b`); mid-plane
+  cuts gain **+1.4..+3.0 dB** PSNR (textured 64×64, filter Q, 3-level
+  DWT). Decode-side only — the wire format is unchanged and every
+  previously-encoded stream decodes better with no re-encode. Two new
+  `bitplane` regression tests pin the per-coefficient arithmetic and the
+  MSE improvement vs. the strip-global reconstruction.
+
 ### Fixed
 
 - **`decode_segment` fuzz harness bounded decode compute, not just

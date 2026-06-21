@@ -340,16 +340,33 @@ pub fn decode_bitplanes_multi(
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
     let mut mag = vec![0u32; n];
+    // Per-coefficient deepest delivered magnitude bit-plane (the §III.A
+    // per-coefficient deadzone exponent). `q` means "no bit delivered"
+    // (sentinel for an insignificant coefficient). A coefficient that
+    // became significant at plane `s` but whose plane-`bp < s` refinement
+    // packet was dropped keeps `last_bit = s`, so its reconstruction bin
+    // is wider than a coefficient whose refinement survived. See the
+    // per-coefficient reconstruction loop below.
+    let mut last_bit = vec![q; n];
 
     for bp_idx in 0..q_usize {
         let bp = q_usize - 1 - bp_idx;
 
-        // Find the significance packet for this bit-plane index.
+        // Find the significance packet for this bit-plane index. A
+        // truncated stream simply omits trailing packets; a missing
+        // significance packet means this and every lower plane were never
+        // delivered, so nothing more can be decoded and `last_bit` must
+        // not be lowered.
         let sig_body = packets
             .iter()
             .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance)
-            .map(|p| p.body.as_slice())
-            .unwrap_or(&[]);
+            .map(|p| p.body.as_slice());
+        let Some(sig_body) = sig_body else {
+            // No significance packet at this depth -> the stream is
+            // truncated here. Decoding lower planes from absent bodies
+            // would inject spurious magnitude bits, so stop.
+            break;
+        };
 
         let mut sig_model = ContextModel::new();
         let mut sig_dec = ArithDecoder::new(sig_body)?;
@@ -360,39 +377,52 @@ pub fn decode_bitplanes_multi(
             &mut significant,
             &mut sign,
             &mut mag,
+            &mut last_bit,
             width,
             height,
             bp,
         )?;
 
-        // Find the refinement packet for this bit-plane index.
-        let ref_body = packets
+        // Find the refinement packet for this bit-plane index. When it is
+        // absent (the budget cut fell between this plane's significance
+        // and refinement packets) the refinement pass is skipped entirely
+        // -- the already-significant coefficients keep their coarser
+        // `last_bit` and a wider reconstruction bin, which is exactly the
+        // §III.A deadzone the dropped plane implies for them.
+        if let Some(ref_body) = packets
             .iter()
             .find(|p| p.bit_plane == bp_idx as u8 && !p.is_significance)
             .map(|p| p.body.as_slice())
-            .unwrap_or(&[]);
+        {
+            let mut ref_model = ContextModel::new();
+            let mut ref_dec = ArithDecoder::new(ref_body)?;
 
-        let mut ref_model = ContextModel::new();
-        let mut ref_dec = ArithDecoder::new(ref_body)?;
-
-        decode_refinement_pass(
-            &mut ref_dec,
-            &mut ref_model,
-            &significant,
-            &mut mag,
-            width,
-            height,
-            bp,
-        )?;
+            decode_refinement_pass(
+                &mut ref_dec,
+                &mut ref_model,
+                &significant,
+                &mut mag,
+                &mut last_bit,
+                width,
+                height,
+                bp,
+            )?;
+        }
     }
 
-    // §III.A deadzone-quantizer reconstruction point. Reconstructing a
-    // subband from only its `q - b` most-significant bit planes is
-    // equivalent to applying a deadzone scalar quantizer with bin width
-    // `∆ = 2^b`, where `b` is the number of bit planes that are
-    // *unavailable* (not transmitted / not decoded). A truncated stream
-    // omits its trailing (least-significant) packets, so `b` is the
-    // number of low magnitude bit planes for which no packet survived.
+    // §III.A deadzone-quantizer reconstruction point, applied
+    // *per coefficient*. Reconstructing a coefficient from only its `q -
+    // b` most-significant bit planes is equivalent to a deadzone scalar
+    // quantizer with bin width `∆ = 2^b`, where `b` is the number of low
+    // magnitude bit planes that were never delivered *for that
+    // coefficient*. A budget cut can land between a plane's significance
+    // and refinement packets, so two coefficients in the same strip can
+    // have different `b`: one made newly significant at the cut plane
+    // knows its MSB (`b = bp`); one that was already significant but whose
+    // plane-`bp` refinement was dropped only knows down to `bp + 1`
+    // (`b = bp + 1`), i.e. a bin twice as wide. The earlier global-`b`
+    // approximation under-reconstructed the latter class. `last_bit[i]`
+    // carries each coefficient's true deepest delivered plane.
     //
     // IPN 42-155 §III.A fixes the reconstruction point per bin:
     //   * the central deadzone bin `[-(∆-1), ∆-1]` (insignificant
@@ -406,20 +436,24 @@ pub fn decode_bitplanes_multi(
     // is `mag + ∆/2 - 1`. When `∆ = 1` (b == 0, the full stream is
     // present) the offset is zero and the magnitude is exact -- so the
     // lossless / untruncated path is bit-identical to before.
-    let b = unavailable_bit_planes(packets, q_usize);
-    let recon_offset: i32 = if b == 0 {
-        0
-    } else {
-        // ∆/2 - 1 = 2^(b-1) - 1.
-        (1i32 << (b - 1)) - 1
-    };
     let out = mag
         .iter()
         .zip(sign.iter())
-        .map(|(&m, &s)| {
+        .zip(last_bit.iter())
+        .map(|((&m, &s), &b)| {
             // Insignificant pixels (mag == 0) sit in the central deadzone
             // bin and reconstruct to the origin regardless of `∆`.
-            let v = if m == 0 { 0 } else { m as i32 + recon_offset };
+            let v = if m == 0 {
+                0
+            } else {
+                let off: i32 = if b == 0 {
+                    0
+                } else {
+                    // ∆/2 - 1 = 2^(b-1) - 1.
+                    (1i32 << (b - 1)) - 1
+                };
+                m as i32 + off
+            };
             if s {
                 -v
             } else {
@@ -445,6 +479,13 @@ pub fn decode_bitplanes_multi(
 /// `q-1` = LSB plane); the magnitude bit position is `q - 1 - bit_plane`.
 /// `b` is the smallest such magnitude position over all present packets;
 /// an empty packet set (handled by the caller) yields `q` here.
+///
+/// Superseded for reconstruction by the per-coefficient `last_bit`
+/// tracking in [`decode_bitplanes_multi`] (which handles the
+/// significance-survives / refinement-dropped case the strip-global `b`
+/// could not distinguish); retained as the clean-boundary characterisation
+/// the unit test pins.
+#[cfg(test)]
 fn unavailable_bit_planes(packets: &[EncodedPacket], q: usize) -> u32 {
     let deepest_bit = packets
         .iter()
@@ -513,6 +554,13 @@ fn encode_significance_pass(
 }
 
 /// Significance + sign decode pass for one bit-plane, stripe-ordered.
+///
+/// `last_bit[i]` records, for every coefficient that received a magnitude
+/// bit, the deepest (smallest) bit-plane `bp` at which a bit was decoded
+/// for it. A coefficient that becomes significant in this pass has its
+/// MSB plane `bp` recorded here; the refinement pass lowers it further as
+/// refinement packets survive. This drives the per-coefficient §III.A
+/// deadzone reconstruction point (see [`decode_bitplanes_multi`]).
 #[allow(clippy::too_many_arguments)]
 fn decode_significance_pass(
     dec: &mut ArithDecoder<'_>,
@@ -520,6 +568,7 @@ fn decode_significance_pass(
     significant: &mut [bool],
     sign: &mut [bool],
     mag: &mut [u32],
+    last_bit: &mut [u8],
     width: usize,
     height: usize,
     bp: usize,
@@ -542,6 +591,7 @@ fn decode_significance_pass(
                 if bit == 1 {
                     significant[i] = true;
                     mag[i] |= 1u32 << bp;
+                    last_bit[i] = bp as u8;
                     let (h_pat, v_pat) =
                         neighbour_sign_pattern(significant, sign, width, height, x, y);
                     let sctx = sign_context(h_pat, v_pat);
@@ -600,11 +650,21 @@ fn encode_refinement_pass(
 }
 
 /// Refinement decode pass for one bit-plane, stripe-ordered.
+///
+/// Every coefficient *visited* in this pass (already significant, not at
+/// its MSB plane) has its magnitude confirmed down to bit-plane `bp`
+/// regardless of whether the decoded bit was 0 or 1, so `last_bit[i]` is
+/// lowered to `bp`. This is what makes the per-coefficient deadzone
+/// reconstruction (see [`decode_bitplanes_multi`]) exact: a coefficient
+/// whose refinement at `bp` was *not* delivered keeps a coarser
+/// `last_bit` and therefore a wider reconstruction bin than one that was.
+#[allow(clippy::too_many_arguments)]
 fn decode_refinement_pass(
     dec: &mut ArithDecoder<'_>,
     model: &mut ContextModel,
     significant: &[bool],
     mag: &mut [u32],
+    last_bit: &mut [u8],
     width: usize,
     height: usize,
     bp: usize,
@@ -630,6 +690,9 @@ fn decode_refinement_pass(
                 if bit == 1 {
                     mag[i] |= 1u32 << bp;
                 }
+                // The refinement bit (0 or 1) confirms the magnitude down
+                // to plane `bp` for this coefficient.
+                last_bit[i] = bp as u8;
             }
         }
         stripe_start += STRIPE_HEIGHT;
@@ -1262,6 +1325,150 @@ mod tests {
         assert!(
             mid_mse < edge_mse,
             "mid-bin reconstruction MSE {mid_mse} must beat lower-edge MSE {edge_mse}"
+        );
+    }
+
+    /// Per-coefficient §III.A deadzone: when a budget cut lands *between*
+    /// a plane's significance and refinement packets (sig(bp) survives,
+    /// ref(bp) dropped), coefficients carry two different deadzone widths.
+    /// A coefficient made newly significant at plane `bp` knows its MSB
+    /// (`b = bp`); one already significant at a higher plane but missing
+    /// its plane-`bp` refinement bit only knows down to `bp + 1`
+    /// (`b = bp + 1`, a bin twice as wide). The reconstruction must place
+    /// each at its own mid-bin point, not a single strip-global one.
+    #[test]
+    fn per_coefficient_deadzone_when_refinement_dropped() {
+        // Two coefficients, far apart so their stripe neighbourhoods don't
+        // interact. `big` becomes significant at a high plane; `small`
+        // becomes significant exactly at the cut plane.
+        let w = 8;
+        let h = 8;
+        let q = 7u8; // magnitudes < 128
+        let mut coeffs = vec![0i32; w * h];
+        // big = 0b101_0110 = 86: MSB at bit 6, refinement bits below.
+        coeffs[3] = 86;
+        // small = 0b000_1010 = 10: MSB at bit 3.
+        coeffs[44] = 10;
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+        // Full stream reconstructs exactly.
+        let full = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        assert_eq!(full[3], 86);
+        assert_eq!(full[44], 10);
+
+        // Cut at magnitude plane bp = 3: keep every sig/ref packet for
+        // planes 4,5,6 (bit_plane idx 0..=2 from MSB) plus *only* the
+        // significance packet of plane 3 (bit_plane idx 3). Drop ref(3)
+        // and everything below.
+        let cut: Vec<EncodedPacket> = packets
+            .iter()
+            .filter(|p| {
+                let idx = p.bit_plane as usize;
+                idx < 3 || (idx == 3 && p.is_significance)
+            })
+            .cloned()
+            .collect();
+        let recon = decode_bitplanes_multi(&cut, w, h, q).unwrap();
+
+        // `small` (10) became significant at plane 3 in the surviving sig
+        // packet: its MSB is known, b = 3, ∆ = 8, lower edge 8, point
+        // 8 + ∆/2 - 1 = 11.
+        assert_eq!(recon[44], 11, "newly-significant coef: b = 3 (∆ = 8)");
+
+        // `big` (86) was already significant before plane 3; its plane-3
+        // refinement bit was dropped, so it is known only down to plane 4:
+        // b = 4, ∆ = 16. Surviving magnitude bits 86 & !0b1111 = 80 (lower
+        // edge), point 80 + ∆/2 - 1 = 80 + 7 = 87.
+        assert_eq!(recon[3], 87, "already-significant coef: b = 4 (∆ = 16)");
+
+        // The strip-global approximation would have used b = 3 for *both*
+        // (the deepest surviving packet is sig(3)), reconstructing `big`
+        // at (86 & !0b111) + 3 = 80 + 3 = 83 -- |86 - 83| = 3, worse than
+        // the per-coefficient |86 - 87| = 1.
+        assert!(
+            (86 - recon[3]).abs() < (86i32 - 83).abs(),
+            "per-coef reconstruction must beat strip-global for the \
+             refinement-dropped coefficient"
+        );
+    }
+
+    /// On a textured buffer truncated mid-bit-plane (sig of the cut plane
+    /// kept, its refinement dropped), the per-coefficient deadzone yields
+    /// strictly lower MSE than the strip-global deadzone that applies one
+    /// shared offset to every coefficient.
+    #[test]
+    fn per_coefficient_deadzone_beats_strip_global_mse() {
+        let w = 8;
+        let h = 8;
+        let coeffs = lcg_signal(w * h, 200, 0xBEEF);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+        };
+        let packets = encode_bitplanes(&input).unwrap();
+
+        // Pick a cut plane mid-way and keep its significance but not its
+        // refinement.
+        let cut_idx = (q as usize) / 2;
+        let cut: Vec<EncodedPacket> = packets
+            .iter()
+            .filter(|p| {
+                let idx = p.bit_plane as usize;
+                idx < cut_idx || (idx == cut_idx && p.is_significance)
+            })
+            .cloned()
+            .collect();
+        let recon = decode_bitplanes_multi(&cut, w, h, q).unwrap();
+
+        // Strip-global reference: the old behaviour applied a single b
+        // (= deepest surviving packet's plane) to every significant coef.
+        // The deepest surviving packet here is sig(cut_idx) at magnitude
+        // position b_g = q - 1 - cut_idx.
+        let b_g = (q as usize) - 1 - cut_idx;
+        let off_g: i32 = if b_g == 0 { 0 } else { (1i32 << (b_g - 1)) - 1 };
+        let global: Vec<i32> = recon
+            .iter()
+            .map(|&v| {
+                if v == 0 {
+                    return 0;
+                }
+                let s = v.signum();
+                let mag = v.unsigned_abs() as i32;
+                // Strip whatever per-coef offset was applied, re-quantise
+                // to the global lower edge, then add the global offset.
+                let lower = mag & !((1i32 << b_g) - 1);
+                s * (lower + off_g)
+            })
+            .collect();
+
+        let mse = |a: &[i32], b: &[i32]| -> i64 {
+            a.iter()
+                .zip(b)
+                .map(|(&x, &y)| {
+                    let d = (x - y) as i64;
+                    d * d
+                })
+                .sum()
+        };
+        let per_coef_mse = mse(&coeffs, &recon);
+        let global_mse = mse(&coeffs, &global);
+        assert!(
+            per_coef_mse <= global_mse,
+            "per-coefficient deadzone MSE {per_coef_mse} must not exceed \
+             strip-global MSE {global_mse}"
+        );
+        assert!(
+            per_coef_mse < global_mse,
+            "with a mid-plane cut the per-coefficient deadzone should \
+             strictly beat strip-global (got {per_coef_mse} vs {global_mse})"
         );
     }
 }
