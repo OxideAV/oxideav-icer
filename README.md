@@ -61,6 +61,13 @@ End-to-end round-trips:
   bit-identical for compressed filter `Q`.
 * Multi-packet metadata: segment with q=4 bit-planes produces >= 8 packets
   (verified by `compressed_roundtrip_filter_q_multi_packet_metadata`).
+* **Decode-configuration matrix** (`tests/decode_configurations.rs`):
+  filter-Q full-quality decode is bit-exact across geometries
+  17×13 / 31×31 / 64×64 / 5×200 / 200×5 and decomposition levels 1..=5
+  (including odd / thin strips and over-deep pyramids); progressive
+  truncation is monotone in budget in every cell; the float 9/7 (filter
+  A) path stays within a bounded error; and an oversized `bit_plane_count`
+  (8 / 12 / 16) still decodes bit-exact.
 
 ## Spec-exact reversible integer filters (IPN 42-155 §II.A)
 
