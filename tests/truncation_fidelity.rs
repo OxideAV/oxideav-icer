@@ -119,6 +119,43 @@ fn truncated_psnr_is_monotone_in_budget() {
     }
 }
 
+/// A 64×64 checkerboard: the canonical high-frequency fixture. The
+/// IPN 42-155 §III.B four-category context model (category-3 magnitude
+/// bits left uncoded; category-1/2 coded against contexts 9/10/11) makes
+/// the *strict-MSB* budget-truncated decode markedly better than the
+/// pre-r359 model on this content. These floors pin that improvement so a
+/// regression in the context model fails CI.
+#[test]
+fn checkerboard_strict_truncation_clears_category_model_floor() {
+    let (w, h) = (64u32, 64u32);
+    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);
+    let stride = img.planes[0].stride;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            img.planes[0].data[y * stride + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
+        }
+    }
+    // (budget, PSNR floor). Floors are set ~0.5 dB below the measured
+    // r359 strict-MSB result, which is itself several dB above the
+    // pre-r359 model on this fixture.
+    let cases: &[(u64, f64)] = &[(400, 24.5), (600, 30.5), (800, 37.0)];
+    for &(budget, floor) in cases {
+        let bytes = encode_at(&img, budget);
+        assert!(bytes.len() as u64 <= budget);
+        let dec = parse_icer(&bytes).expect("decode failed");
+        let p = psnr(&img, &dec);
+        eprintln!(
+            "checkerboard strict b={budget}: {} bytes -> {p:.3} dB (floor {floor})",
+            bytes.len()
+        );
+        assert!(
+            p >= floor,
+            "checkerboard strict b={budget}: PSNR {p:.3} dB below the §III.B category-model \
+             floor {floor} dB"
+        );
+    }
+}
+
 /// An untruncated (generous-budget) filter-Q encode of an integer image
 /// still reconstructs bit-exactly: the per-coefficient deadzone offset is
 /// zero for every coefficient when every plane is delivered (`b = 0`).
