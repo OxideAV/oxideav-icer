@@ -3,7 +3,8 @@
 
 use oxideav_icer::arith::{ArithDecoder, ArithEncoder};
 use oxideav_icer::context::{
-    refinement_context, sign_context, significance_context, ContextModel, CONTEXT_COUNT,
+    magnitude_context, sign_context, significance_context, ContextModel, MagnitudeContext,
+    CONTEXT_COUNT,
 };
 
 fn deterministic_bits(n: usize, seed: u64) -> Vec<u8> {
@@ -85,9 +86,24 @@ fn context_helpers_return_in_range_indices() {
             assert!(sign_context(h, v) < CONTEXT_COUNT);
         }
     }
-    for js in [false, true] {
-        for hs in [false, true] {
-            assert!(refinement_context(js, hs) < CONTEXT_COUNT);
+    // Category-aware magnitude (refinement) contexts: categories 1 and 2
+    // map to coded contexts in range; category 3+ is left uncoded.
+    for cat in 0..=4u8 {
+        for hv in [false, true] {
+            match magnitude_context(cat, hv) {
+                MagnitudeContext::Coded(c) => assert!(c < CONTEXT_COUNT),
+                MagnitudeContext::Uncoded => {}
+            }
         }
     }
+    // Category 1/2 must be coded; category 3 must be uncoded.
+    assert!(matches!(
+        magnitude_context(1, false),
+        MagnitudeContext::Coded(_)
+    ));
+    assert!(matches!(
+        magnitude_context(2, true),
+        MagnitudeContext::Coded(_)
+    ));
+    assert_eq!(magnitude_context(3, true), MagnitudeContext::Uncoded);
 }

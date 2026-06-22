@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Spec-exact IPN 42-155 §III.B four-category context model with
+  category-3 uncoded magnitude bits.** The bit-plane coder now tracks the
+  §III.B *category* of every pixel (0 = insignificant; 1 = the first '1'
+  bit was coded; 2 = one more magnitude bit; 3 = one more again, stays 3
+  permanently) and selects each refinement (magnitude) bit's coding mode
+  from the category, replacing the prior `(just_significant,
+  has_neighbour)` 3-context heuristic:
+  - category 1 → context 9 (no horizontally / vertically adjacent
+    significant pixel) or context 10;
+  - category 2 → context 11;
+  - category 3 → **left uncoded** (fed to the arithmetic coder at a fixed
+    probability-of-zero of 1/2 with no model adaptation), matching §III.B
+    "Bits of pixels in category 3 are empirically nearly incompressible …
+    therefore … left uncoded in the compressor's output."
+  The sign contexts are now the exact IPN 42-155 §III.B **Table 8** sign
+  prediction + context grid (indices 12..=16) addressed by the horizontal
+  and vertical neighbour sign sums, replacing the earlier collapsed 5-way
+  `axis_sign_contribution` scheme. The 17-context layout is now the
+  spec's: 0..=8 significance, 9/10 category-1 + 11 category-2 refinement,
+  12..=16 sign. Encoder and decoder run the identical category
+  transitions (including a category-advance fast path when a refinement
+  packet is dropped mid-stream), so the change is fully roundtrip-safe:
+  filter-Q full-quality and colour (YUV 4:4:4) decodes stay bit-exact,
+  and progressive truncation stays monotone. The improved contexts make
+  the *strict-MSB* truncated decode markedly better on high-frequency
+  content (e.g. the 64×64 checkerboard at a 400-byte budget rose from
+  ~19 dB to ~26 dB), which in turn collapsed the old strict-vs-R-D gap on
+  that fixture — a baseline improvement, with the R-D selector still
+  never regressing. New `tests/category_model.rs` (4 tests) pins the
+  category→context mapping, the category-3 uncoded round-trip on a
+  high-dynamic-range fixture, progressive monotonicity, and colour
+  bit-exactness; `tests/arith_roundtrip.rs` and the `rd_budget`
+  checkerboard test were updated to the new model. New public
+  `context::{magnitude_context, MagnitudeContext, CATEGORY2_CONTEXT,
+  UNCODED_P1}`; `context::refinement_context` removed.
 - **Per-coefficient §III.A deadzone reconstruction on mid-plane
   truncation.** The truncated-stream reconstruction point (IPN 42-155
   §III.A) now derives the deadzone bin-width exponent `b` **per

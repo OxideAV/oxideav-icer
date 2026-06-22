@@ -109,19 +109,43 @@ enumerates eight candidate wavelet filters: A through G
   floating point with an orthonormal post-scale (zeta = sqrt(2)/2). Lossy
   like filters A-F. Completes the full A-G filter set.
 
-## Context model
+## Context model (IPN 42-155 §III.B)
 
-The significance context table uses the IPN 42-155 §III.B H/V/D
-neighbour-count classification:
+ICER's bit-plane coder keeps a **category** for every pixel that
+summarises how many magnitude bits have already been coded (§III.B):
 
-* **9 significance contexts** -- determined by the count of significant
-  horizontal neighbours (H: 0, 1, or 2+), vertical neighbours (V: 0 or 1+),
-  and diagonal neighbours (D: 0 or 1+).
-* **5 sign contexts** -- determined by the horizontal and vertical neighbour
-  sign contributions (clipped to {-1, 0, +1} per axis) per §III.B, with
-  sign-flip coding convention applied (the coder always codes the sign
-  relative to the prediction, not the raw sign).
-* **3 refinement contexts**.
+* **category 0** -- not yet significant;
+* **category 1** -- the first `1` magnitude bit was coded (the pixel just
+  became significant);
+* **category 2** -- one more magnitude bit coded;
+* **category 3** -- one more again, and stays 3 permanently.
+
+The 17 contexts split exactly as the paper specifies:
+
+* **9 significance contexts** (indices 0..=8, category 0) -- determined
+  by the count of significant horizontal neighbours (H: 0, 1, or 2+),
+  vertical neighbours (V: 0 or 1+), and diagonal neighbours (D: 0 or 1+).
+* **Category-aware refinement contexts** -- a category-1 magnitude bit
+  uses context 9 (no horizontally / vertically adjacent significant
+  pixel) or 10; a category-2 magnitude bit uses context 11; a
+  **category-3 magnitude bit is left uncoded** -- empirically nearly
+  incompressible, so it is fed to the arithmetic coder at a fixed
+  probability-of-zero of 1/2 with no model adaptation (§III.B). This both
+  matches the spec and frees bytes for the packets that carry real
+  information, so a budget-truncated decode reconstructs at higher quality
+  for the same byte count.
+* **5 sign contexts** (indices 12..=16) -- the exact §III.B **Table 8**
+  sign-prediction + context grid, addressed by the horizontal and
+  vertical neighbour sign sums (`h1 + h2`, `v1 + v2`). Sign bits are
+  coded as the "agreement" XOR of the raw sign and the Table 8
+  prediction, so the model always sees a bit whose `1` means "agrees with
+  prediction".
+
+The category transitions run identically on the encoder and decoder
+(including a category-advance fast path when a budget cut drops a
+refinement packet mid-stream), so the model stays in lockstep and the
+filter-Q full-quality + colour round-trips remain bit-exact through the
+category-3 uncoded path.
 
 ## Stripe-ordered scan
 
@@ -292,12 +316,18 @@ to "the implementation":
 * The **probability estimator window size** for the adaptive arithmetic coder
   (§III.C says "windowed counting"; window size unspecified). This crate uses
   64.
-* The **exact neighbourhood-pattern to context-index tables** for the
-  significance + sign passes (§III.B Table 1 lists the context counts but not
-  the per-pattern lookup). The crate ships the H/V/D classification scheme
-  described in §III.B; the supplemental tables in the
-  `descanso.jpl.nasa.gov` ICER white papers (reference [13]) are not yet
-  in `docs/image/icer/`.
+* The **per-subband significance context tables** (§III.B Table 6 for
+  LL/LH/HL and Table 7 for HH, plus the HL context-template transpose).
+  These require the bit-plane scanner to know which subband each
+  coefficient belongs to; the current scanner runs over the whole strip
+  without per-subband partitioning, so it ships the H/V/D classification
+  of §III.B applied uniformly rather than the subband-specific Table 6/7
+  indices and the HL transpose. The sign contexts now follow §III.B
+  **Table 8 exactly**, and the four-category magnitude scheme (contexts
+  9/10/11 + category-3 uncoded) is implemented. Wiring the per-subband
+  Table 6/7 dispatch is the natural follow-on once the scanner is made
+  subband-aware (the `priority` module already computes the subband
+  geometry it would need).
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
 
 ## Automatic filter selection

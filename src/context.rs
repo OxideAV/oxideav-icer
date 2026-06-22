@@ -19,24 +19,41 @@
 //!     merged (H=0,V=0,D=0 merges with symmetry constraints).
 //!     Implementation below uses the 9-context table that matches the
 //!     "H-card-ternary x V-card-binary x D-card-binary" scheme.
-//!   * **Sign contexts** (5 total, indices 9..=13). Derived from the
+//!   * **Category-aware refinement contexts** (3 total, indices 9, 10,
+//!     11) per the IPN 42-155 §III.B four-category pixel scheme. ICER
+//!     keeps a *category* for each pixel that counts the magnitude bits
+//!     already encoded: category 0 = not yet significant; category 1 =
+//!     just became significant (the first magnitude '1' bit was coded);
+//!     category 2 = one more magnitude bit coded; category 3 = one more
+//!     again, and stays 3 permanently. The magnitude-bit context is then:
+//!       - category 1 -> context 9 if no horizontally / vertically
+//!         adjacent pixel is significant, else context 10;
+//!       - category 2 -> context 11 regardless of neighbours;
+//!       - category 3 -> the bit is empirically incompressible and is
+//!         **left uncoded** (sent at a fixed probability-of-zero of 1/2,
+//!         with no model update) per §III.B.
+//!   * **Sign contexts** (5 total, indices 12..=16). Derived from the
 //!     horizontal and vertical neighbour sign contributions per
-//!     IPN 42-155 §III.B: each axis's "sign contribution" `hc`/`vc`
-//!     is clamped to {-1, 0, +1} (sign of significant-positive minus
-//!     significant-negative neighbour counts). The 5 contexts are
-//!     assigned by `(|hc|, |vc|, sign(hc)*sign(vc))` collapsing.
-//!   * **Refinement contexts** (3 total, indices 14..=16). Distinguished
-//!     by whether the coefficient just became significant (most uncertain)
-//!     vs has been significant for one or more prior bit-planes.
+//!     IPN 42-155 §III.B Table 8: each axis's signed sum `h1 + h2` /
+//!     `v1 + v2` (neighbours contribute +1 positive-significant, -1
+//!     negative-significant, 0 insignificant) selects both a predicted
+//!     sign and one of contexts 12..=16.
 //!
 //! The estimator is a Laplace-rule windowed-counting adaptive
 //! probability model (IPN 42-155 §III.C "windowed counting") with a
 //! 64-symbol halving window.
 
-/// Total number of contexts maintained by the model. Fixed
-/// upper-bound covering significance (9) + sign (5) + refinement (3)
-/// per IPN 42-155 §III.B Table 1.
+/// Total number of contexts maintained by the model. The IPN 42-155
+/// §III.B layout uses exactly 17 contexts: 0..=8 significance (category
+/// 0), 9 and 10 category-1 refinement, 11 category-2 refinement, and
+/// 12..=16 sign. Category-3 magnitude bits are left uncoded and use no
+/// context (see [`MagnitudeContext::Uncoded`]).
 pub const CONTEXT_COUNT: usize = 17;
+
+/// Index of the lone category-2 refinement context (IPN 42-155 §III.B:
+/// "A bit of a pixel in category 2 is assigned context 11 regardless of
+/// the categories of adjacent pixels").
+pub const CATEGORY2_CONTEXT: usize = 11;
 
 /// Window length for the Laplace-rule probability estimator. A
 /// power-of-two keeps the renormalisation step a shift; 64 is the
@@ -160,105 +177,113 @@ pub fn significance_context(pattern: u8) -> usize {
     }
 }
 
-/// Sign-context lookup per IPN 42-155 §III.B.
+/// Sign-context lookup per IPN 42-155 §III.B **Table 8**.
 ///
-/// Each axis (horizontal and vertical) contributes a signed "contribution"
-/// that is the count of significant-positive neighbours minus the count of
-/// significant-negative neighbours, clipped to {-1, 0, +1}.
+/// ICER uses the two horizontally adjacent (W, E) and the two vertically
+/// adjacent (N, S) pixels. Each contributes +1 if significant-positive,
+/// -1 if significant-negative, 0 if insignificant. The axis sums
+/// `h1 + h2` and `v1 + v2` (each in {-2,-1,0,+1,+2}) select both a
+/// predicted sign and a context per Table 8:
 ///
-/// `h_pattern` and `v_pattern` each encode:
-///   * bits 0,1 -- (neighbour-A significant, neighbour-A sign)
-///   * bits 2,3 -- (neighbour-B significant, neighbour-B sign)
+/// |              | h1+h2 < 0 | h1+h2 = 0 | h1+h2 > 0 |
+/// |--------------|-----------|-----------|-----------|
+/// | v1+v2 < 0    |  -, 16    |  +, 13    |  +, 14    |
+/// | v1+v2 = 0    |  -, 15    |  +, 12    |  +, 15    |
+/// | v1+v2 > 0    |  -, 14    |  -, 13    |  +, 16    |
+///
+/// `h_pattern` / `v_pattern` each pack the two axis neighbours:
+///   * bits 0,1 -- (neighbour-A significant, neighbour-A negative)
+///   * bits 2,3 -- (neighbour-B significant, neighbour-B negative)
 ///
 /// For horizontal: A=W, B=E. For vertical: A=N, B=S.
-///
-/// The 5 sign contexts (indices 9..=13) are assigned as:
-///
-/// | ctx | hc  | vc  |
-/// |-----|-----|-----|
-/// |  9  |  0  |  0  |  no significant H or V neighbours
-/// | 10  | +1  |  0  |  H positive contribution, no V
-/// | 11  |  0  | +1  |  no H, V positive contribution
-/// | 12  | -1  |  0  |  H negative contribution, no V
-/// | 13  | ±1  | ±1  |  both axes active (sign convention applied)
-///
-/// Per IPN 42-155 §III.B, when both axes have a contribution, the
-/// context index is adjusted by a sign-flip of the predicted sign when
-/// the contributions disagree (XOR).
 pub fn sign_context(h_pattern: u8, v_pattern: u8) -> usize {
-    // Decode horizontal contribution.
-    let hc = axis_sign_contribution(h_pattern);
-    // Decode vertical contribution.
-    let vc = axis_sign_contribution(v_pattern);
-
-    match (hc, vc) {
-        (0, 0) => 9,
-        (h, 0) if h > 0 => 10,
-        (0, v) if v > 0 => 11,
-        (h, 0) if h < 0 => 12,
-        // Both axes active: context 13; the sign flip to the predicted
-        // sign is handled by the caller via the returned XOR bit, not
-        // by choosing a different context (IPN 42-155 §III.B).
-        _ => 13,
-    }
+    let h = axis_sign_sum(h_pattern);
+    let v = axis_sign_sum(v_pattern);
+    sign_table8(h, v).1
 }
 
-/// Compute the sign contribution of one axis given its two-neighbour
-/// significance/sign packed byte. Returns -1, 0, or +1.
-///
-/// Layout: bits 0,1 = (A-significant, A-negative); bits 2,3 = (B-significant, B-negative).
-/// Positive = significant and not negative; negative = significant and negative.
-fn axis_sign_contribution(pattern: u8) -> i8 {
-    let mut contrib = 0i8;
-    // Neighbour A: bits 0 = significant, bit 1 = negative
-    if pattern & 0b0001 != 0 {
-        if pattern & 0b0010 != 0 {
-            contrib -= 1;
-        } else {
-            contrib += 1;
-        }
-    }
-    // Neighbour B: bits 2 = significant, bit 3 = negative
-    if pattern & 0b0100 != 0 {
-        if pattern & 0b1000 != 0 {
-            contrib -= 1;
-        } else {
-            contrib += 1;
-        }
-    }
-    contrib.signum()
-}
-
-/// Return the predicted sign bit for the arithmetic coder based on the
-/// horizontal and vertical neighbour contributions. When the prediction
-/// is negative, the encoder flips the sign bit before coding it
-/// (IPN 42-155 §III.B sign-flip convention), so the model always sees
-/// a bit coded as "1 = agrees with prediction". Returns `true` if the
-/// predicted sign is negative (i.e., the coder should flip the bit).
+/// Return the predicted sign bit per IPN 42-155 §III.B Table 8. When the
+/// prediction is negative the encoder flips the sign bit before coding
+/// it (the "agreement bit" convention), so the model always sees a bit
+/// whose `1` means "agrees with prediction". Returns `true` if the
+/// predicted sign is negative (i.e. the coder should flip the bit).
 pub fn sign_prediction_flip(h_pattern: u8, v_pattern: u8) -> bool {
-    let hc = axis_sign_contribution(h_pattern);
-    let vc = axis_sign_contribution(v_pattern);
-    // The combined prediction is sign(hc + vc) where ties (0) predict positive.
-    let combined = i16::from(hc) + i16::from(vc);
-    combined < 0
+    let h = axis_sign_sum(h_pattern);
+    let v = axis_sign_sum(v_pattern);
+    sign_table8(h, v).0
 }
 
-/// Refinement-context lookup per IPN 42-155 §III.B Table 1.
-///
-/// Three refinement contexts (indices 14..=16):
-///   * 14 -- coefficient just became significant this bit-plane
-///     (highest uncertainty about refinement bits).
-///   * 15 -- already significant, no significant neighbours
-///     (medium uncertainty).
-///   * 16 -- already significant, has at least one significant
-///     neighbour (lower uncertainty).
-pub fn refinement_context(just_significant: bool, has_significant_neighbour: bool) -> usize {
-    match (just_significant, has_significant_neighbour) {
-        (true, _) => 14,
-        (false, false) => 15,
-        (false, true) => 16,
+/// IPN 42-155 §III.B Table 8 — `(predicted_sign_is_negative, context)`
+/// as a function of the horizontal and vertical axis sign sums.
+fn sign_table8(h: i8, v: i8) -> (bool, usize) {
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    match (h.cmp(&0), v.cmp(&0)) {
+        // v1+v2 < 0
+        (Less, Less) => (true, 16),
+        (Equal, Less) => (false, 13),
+        (Greater, Less) => (false, 14),
+        // v1+v2 = 0
+        (Less, Equal) => (true, 15),
+        (Equal, Equal) => (false, 12),
+        (Greater, Equal) => (false, 15),
+        // v1+v2 > 0
+        (Less, Greater) => (true, 14),
+        (Equal, Greater) => (true, 13),
+        (Greater, Greater) => (false, 16),
     }
 }
+
+/// Signed sum of one axis's two neighbours, in {-2,-1,0,+1,+2}.
+///
+/// Layout: bits 0,1 = (A-significant, A-negative); bits 2,3 =
+/// (B-significant, B-negative). A significant-positive neighbour adds
+/// +1, a significant-negative neighbour adds -1, an insignificant one 0.
+fn axis_sign_sum(pattern: u8) -> i8 {
+    let mut sum = 0i8;
+    if pattern & 0b0001 != 0 {
+        sum += if pattern & 0b0010 != 0 { -1 } else { 1 };
+    }
+    if pattern & 0b0100 != 0 {
+        sum += if pattern & 0b1000 != 0 { -1 } else { 1 };
+    }
+    sum
+}
+
+/// How a magnitude (significance-pass-survivor) refinement bit is coded,
+/// driven by the pixel's IPN 42-155 §III.B category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagnitudeContext {
+    /// Code the bit adaptively against the given context index
+    /// (category 1 -> 9 or 10, category 2 -> 11).
+    Coded(usize),
+    /// Category-3 bit: empirically incompressible, left uncoded — coded
+    /// at a fixed probability-of-zero of 1/2 with no model update.
+    Uncoded,
+}
+
+/// Select the magnitude-bit coding mode for a refinement bit from the
+/// pixel's category and whether any horizontally / vertically adjacent
+/// pixel is significant (IPN 42-155 §III.B):
+///
+///   * category 1 -> context 9 (no H/V significant neighbour) or 10;
+///   * category 2 -> context 11;
+///   * category 3 -> uncoded.
+///
+/// Categories 0 (insignificant — handled by the significance pass) and
+/// any value `>= 3` map to [`MagnitudeContext::Uncoded`]; only categories
+/// 1 and 2 are adaptively coded.
+pub fn magnitude_context(category: u8, has_hv_significant_neighbour: bool) -> MagnitudeContext {
+    match category {
+        1 => MagnitudeContext::Coded(if has_hv_significant_neighbour { 10 } else { 9 }),
+        2 => MagnitudeContext::Coded(CATEGORY2_CONTEXT),
+        _ => MagnitudeContext::Uncoded,
+    }
+}
+
+/// Probability-of-one numerator / denominator for an uncoded bit: a flat
+/// 1/2 (`1` out of `2`). Fed straight to the arithmetic coder for
+/// category-3 magnitude bits with no model adaptation.
+pub const UNCODED_P1: (u32, u32) = (1, 2);
 
 #[cfg(test)]
 mod tests {
@@ -307,7 +332,7 @@ mod tests {
             for v in 0u8..=15 {
                 let c = sign_context(h, v);
                 assert!(
-                    (9..=13).contains(&c),
+                    (12..=16).contains(&c),
                     "h={h} v={v} produced out-of-range sign context {c}"
                 );
             }
@@ -315,10 +340,57 @@ mod tests {
     }
 
     #[test]
-    fn refinement_context_values() {
-        assert_eq!(refinement_context(true, false), 14);
-        assert_eq!(refinement_context(true, true), 14);
-        assert_eq!(refinement_context(false, false), 15);
-        assert_eq!(refinement_context(false, true), 16);
+    fn sign_table8_corners() {
+        // The nine Table 8 cells, addressed via the packed neighbour
+        // bytes. Helpers: pos = significant-positive (0b01), neg =
+        // significant-negative (0b11) for neighbour A; same shifted for B.
+        let pos = 0b0001u8; // A significant, positive
+        let neg = 0b0011u8; // A significant, negative
+        let both_pos = 0b0101u8; // A + B both significant-positive (sum +2)
+        let both_neg = 0b1111u8; // A + B both significant-negative (sum -2)
+        let zero = 0u8;
+
+        // h>0, v>0 -> +,16 ; h<0,v<0 -> -,16
+        assert_eq!(sign_context(both_pos, both_pos), 16);
+        assert!(!sign_prediction_flip(both_pos, both_pos));
+        assert_eq!(sign_context(both_neg, both_neg), 16);
+        assert!(sign_prediction_flip(both_neg, both_neg));
+        // h=0,v=0 -> +,12
+        assert_eq!(sign_context(zero, zero), 12);
+        assert!(!sign_prediction_flip(zero, zero));
+        // h<0,v=0 -> -,15 ; h>0,v=0 -> +,15
+        assert_eq!(sign_context(neg, zero), 15);
+        assert!(sign_prediction_flip(neg, zero));
+        assert_eq!(sign_context(pos, zero), 15);
+        assert!(!sign_prediction_flip(pos, zero));
+        // h=0,v<0 -> +,13 ; h=0,v>0 -> -,13
+        assert_eq!(sign_context(zero, neg), 13);
+        assert!(!sign_prediction_flip(zero, neg));
+        assert_eq!(sign_context(zero, pos), 13);
+        assert!(sign_prediction_flip(zero, pos));
+        // h>0,v<0 -> +,14 ; h<0,v>0 -> -,14
+        assert_eq!(sign_context(pos, neg), 14);
+        assert!(!sign_prediction_flip(pos, neg));
+        assert_eq!(sign_context(neg, pos), 14);
+        assert!(sign_prediction_flip(neg, pos));
+    }
+
+    #[test]
+    fn magnitude_context_categories() {
+        // Category 1: 9 with no H/V neighbour, 10 with one.
+        assert_eq!(magnitude_context(1, false), MagnitudeContext::Coded(9));
+        assert_eq!(magnitude_context(1, true), MagnitudeContext::Coded(10));
+        // Category 2: always 11.
+        assert_eq!(
+            magnitude_context(2, false),
+            MagnitudeContext::Coded(CATEGORY2_CONTEXT)
+        );
+        assert_eq!(
+            magnitude_context(2, true),
+            MagnitudeContext::Coded(CATEGORY2_CONTEXT)
+        );
+        // Category 3 (and beyond): uncoded.
+        assert_eq!(magnitude_context(3, true), MagnitudeContext::Uncoded);
+        assert_eq!(magnitude_context(4, false), MagnitudeContext::Uncoded);
     }
 }

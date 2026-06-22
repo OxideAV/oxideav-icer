@@ -50,13 +50,27 @@
 
 use crate::arith::{ArithDecoder, ArithEncoder};
 use crate::context::{
-    refinement_context, sign_context, sign_prediction_flip, significance_context, ContextModel,
-    CONTEXT_COUNT,
+    magnitude_context, sign_context, sign_prediction_flip, significance_context, ContextModel,
+    MagnitudeContext, CONTEXT_COUNT, UNCODED_P1,
 };
 use crate::error::{IcerError, Result};
 
 /// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
 pub const STRIPE_HEIGHT: usize = 4;
+
+/// Bit mask (within the 8-neighbour significance pattern produced by
+/// [`neighbour_significance_pattern`]) selecting the four horizontally /
+/// vertically adjacent pixels: N=bit1, W=bit3, E=bit4, S=bit6. The
+/// IPN 42-155 §III.B category-1 magnitude context (9 vs 10) keys on
+/// whether *any* of these four (not the diagonals) is significant.
+const HV_NEIGHBOUR_MASK: u8 = 0b0100_1010;
+
+/// `true` iff at least one horizontally or vertically adjacent pixel is
+/// significant, given the packed 8-neighbour pattern.
+#[inline]
+fn has_hv_significant(pattern: u8) -> bool {
+    pattern & HV_NEIGHBOUR_MASK != 0
+}
 
 /// Describes one wavelet coefficient sub-band's bit-plane scan input.
 /// `coeffs` holds the signed wavelet coefficients in raster scan
@@ -191,6 +205,10 @@ pub fn encode_bitplanes_weighted(
 
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
+    // IPN 42-155 §III.B per-pixel category (0=insignificant, 1/2/3 =
+    // magnitude bits coded so far). Persists across bit-planes; drives
+    // the category-aware refinement context + category-3 uncoded bits.
+    let mut cat = vec![0u8; n];
 
     let mut packets = Vec::with_capacity(2 * q);
 
@@ -209,6 +227,7 @@ pub fn encode_bitplanes_weighted(
             input.coeffs,
             &mut significant,
             &mut sign,
+            &mut cat,
             input.width,
             input.height,
             bp,
@@ -262,6 +281,7 @@ pub fn encode_bitplanes_weighted(
             &mut ref_model,
             input.coeffs,
             &significant,
+            &mut cat,
             input.width,
             input.height,
             bp,
@@ -340,6 +360,10 @@ pub fn decode_bitplanes_multi(
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
     let mut mag = vec![0u32; n];
+    // IPN 42-155 §III.B per-pixel category, advanced in lockstep with the
+    // encoder so the category-aware refinement contexts + category-3
+    // uncoded bits decode identically.
+    let mut cat = vec![0u8; n];
     // Per-coefficient deepest delivered magnitude bit-plane (the §III.A
     // per-coefficient deadzone exponent). `q` means "no bit delivered"
     // (sentinel for an insignificant coefficient). A coefficient that
@@ -377,6 +401,7 @@ pub fn decode_bitplanes_multi(
             &mut significant,
             &mut sign,
             &mut mag,
+            &mut cat,
             &mut last_bit,
             width,
             height,
@@ -402,11 +427,24 @@ pub fn decode_bitplanes_multi(
                 &mut ref_model,
                 &significant,
                 &mut mag,
+                &mut cat,
                 &mut last_bit,
                 width,
                 height,
                 bp,
             )?;
+        } else {
+            // No refinement packet at this depth (the budget cut fell
+            // between this plane's significance and refinement packets).
+            // The encoder still ran a refinement pass for this plane, so
+            // its category transitions happened there; to keep the
+            // decoder's categories aligned for the *lower* planes that
+            // may still arrive, advance every visited coefficient's
+            // category exactly as the refinement pass would have. (A
+            // truncated stream usually has no lower planes either, but
+            // this keeps the model exact when only the refinement packet
+            // of an intermediate plane is missing.)
+            advance_refinement_categories(&significant, &mag, &mut cat, width, height, bp);
         }
     }
 
@@ -498,7 +536,10 @@ fn unavailable_bit_planes(packets: &[EncodedPacket], q: usize) -> u32 {
 }
 
 /// Significance + sign pass for one bit-plane, stripe-ordered.
-/// Modifies `significant` and `sign` in place.
+/// Modifies `significant`, `sign`, and `cat` in place. A coefficient
+/// that becomes significant here transitions to category 1 (IPN 42-155
+/// §III.B: "after the first '1' bit from the pixel is encoded, the
+/// pixel's category becomes 1").
 #[allow(clippy::too_many_arguments)]
 fn encode_significance_pass(
     enc: &mut ArithEncoder,
@@ -506,6 +547,7 @@ fn encode_significance_pass(
     coeffs: &[i32],
     significant: &mut [bool],
     sign: &mut [bool],
+    cat: &mut [u8],
     width: usize,
     height: usize,
     bp: usize,
@@ -532,6 +574,7 @@ fn encode_significance_pass(
 
                 if bit == 1 {
                     significant[i] = true;
+                    cat[i] = 1;
                     sign[i] = coeffs[i] < 0;
 
                     // Sign bit with sign-flip convention (IPN 42-155 §III.B).
@@ -568,6 +611,7 @@ fn decode_significance_pass(
     significant: &mut [bool],
     sign: &mut [bool],
     mag: &mut [u32],
+    cat: &mut [u8],
     last_bit: &mut [u8],
     width: usize,
     height: usize,
@@ -590,6 +634,7 @@ fn decode_significance_pass(
 
                 if bit == 1 {
                     significant[i] = true;
+                    cat[i] = 1;
                     mag[i] |= 1u32 << bp;
                     last_bit[i] = bp as u8;
                     let (h_pat, v_pat) =
@@ -610,12 +655,25 @@ fn decode_significance_pass(
     Ok(())
 }
 
-/// Refinement pass for one bit-plane, stripe-ordered.
+/// Refinement pass for one bit-plane, stripe-ordered, with the
+/// IPN 42-155 §III.B four-category coding scheme:
+///
+///   * category 1 (first refinement bit after becoming significant) ->
+///     context 9 (no H/V significant neighbour) or 10;
+///   * category 2 (second refinement bit) -> context 11;
+///   * category 3 (third and later refinement bits) -> **uncoded** (fed
+///     to the arithmetic coder at a fixed P(0)=1/2 with no model update).
+///
+/// `cat[i]` is advanced by one (saturating at 3) for every coefficient
+/// visited, so the next bit-plane sees the next category. The decoder
+/// runs the identical category transitions, keeping the two in lockstep.
+#[allow(clippy::too_many_arguments)]
 fn encode_refinement_pass(
     enc: &mut ArithEncoder,
     model: &mut ContextModel,
     coeffs: &[i32],
     significant: &[bool],
+    cat: &mut [u8],
     width: usize,
     height: usize,
     bp: usize,
@@ -635,14 +693,59 @@ fn encode_refinement_pass(
                 if highest_set_bit(m) == Some(bp as u32) {
                     continue;
                 }
-                let has_sig_neighbour =
-                    neighbour_significance_pattern(significant, width, height, x, y) != 0;
-                let rctx = refinement_context(false, has_sig_neighbour);
-                debug_assert!(rctx < CONTEXT_COUNT);
+                let has_hv = has_hv_significant(neighbour_significance_pattern(
+                    significant,
+                    width,
+                    height,
+                    x,
+                    y,
+                ));
                 let bit = ((m >> bp) & 1) as u8;
-                let (num, den) = model.probability(rctx);
-                enc.encode_bit(bit, num, den);
-                model.observe(rctx, bit);
+                match magnitude_context(cat[i], has_hv) {
+                    MagnitudeContext::Coded(rctx) => {
+                        debug_assert!(rctx < CONTEXT_COUNT);
+                        let (num, den) = model.probability(rctx);
+                        enc.encode_bit(bit, num, den);
+                        model.observe(rctx, bit);
+                    }
+                    MagnitudeContext::Uncoded => {
+                        let (num, den) = UNCODED_P1;
+                        enc.encode_bit(bit, num, den);
+                    }
+                }
+                cat[i] = cat[i].saturating_add(1).min(3);
+            }
+        }
+        stripe_start += STRIPE_HEIGHT;
+    }
+}
+
+/// Advance per-pixel categories exactly as [`decode_refinement_pass`]
+/// would, without decoding any bits. Used when the refinement packet for
+/// a bit-plane is absent (budget cut between this plane's significance
+/// and refinement packets) so the decoder's category state stays aligned
+/// with the encoder for any lower planes that still arrive.
+fn advance_refinement_categories(
+    significant: &[bool],
+    mag: &[u32],
+    cat: &mut [u8],
+    width: usize,
+    height: usize,
+    bp: usize,
+) {
+    let mut stripe_start = 0;
+    while stripe_start < height {
+        let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
+        for y in stripe_start..stripe_end {
+            for x in 0..width {
+                let i = y * width + x;
+                if !significant[i] {
+                    continue;
+                }
+                if highest_set_bit(mag[i]) == Some(bp as u32) {
+                    continue;
+                }
+                cat[i] = cat[i].saturating_add(1).min(3);
             }
         }
         stripe_start += STRIPE_HEIGHT;
@@ -664,6 +767,7 @@ fn decode_refinement_pass(
     model: &mut ContextModel,
     significant: &[bool],
     mag: &mut [u32],
+    cat: &mut [u8],
     last_bit: &mut [u8],
     width: usize,
     height: usize,
@@ -681,15 +785,29 @@ fn decode_refinement_pass(
                 if highest_set_bit(mag[i]) == Some(bp as u32) {
                     continue;
                 }
-                let has_sig_neighbour =
-                    neighbour_significance_pattern(significant, width, height, x, y) != 0;
-                let rctx = refinement_context(false, has_sig_neighbour);
-                let (num, den) = model.probability(rctx);
-                let bit = dec.decode_bit(num, den)?;
-                model.observe(rctx, bit);
+                let has_hv = has_hv_significant(neighbour_significance_pattern(
+                    significant,
+                    width,
+                    height,
+                    x,
+                    y,
+                ));
+                let bit = match magnitude_context(cat[i], has_hv) {
+                    MagnitudeContext::Coded(rctx) => {
+                        let (num, den) = model.probability(rctx);
+                        let bit = dec.decode_bit(num, den)?;
+                        model.observe(rctx, bit);
+                        bit
+                    }
+                    MagnitudeContext::Uncoded => {
+                        let (num, den) = UNCODED_P1;
+                        dec.decode_bit(num, den)?
+                    }
+                };
                 if bit == 1 {
                     mag[i] |= 1u32 << bp;
                 }
+                cat[i] = cat[i].saturating_add(1).min(3);
                 // The refinement bit (0 or 1) confirms the magnitude down
                 // to plane `bp` for this coefficient.
                 last_bit[i] = bp as u8;
@@ -719,6 +837,7 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
 
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
+    let mut cat = vec![0u8; n];
     let mut model = ContextModel::new();
     let mut enc = ArithEncoder::new();
 
@@ -751,6 +870,7 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
                     model.observe(ctx, bit);
                     if bit == 1 {
                         significant[i] = true;
+                        cat[i] = 1;
                         sign[i] = input.coeffs[i] < 0;
                         let (h_pat, v_pat) = neighbour_sign_pattern(
                             &significant,
@@ -788,19 +908,27 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
                     if highest_set_bit(mag) == Some(bp as u32) {
                         continue;
                     }
-                    let has_sig_neighbour = neighbour_significance_pattern(
+                    let has_hv = has_hv_significant(neighbour_significance_pattern(
                         &significant,
                         input.width,
                         input.height,
                         x,
                         y,
-                    ) != 0;
-                    let rctx = refinement_context(false, has_sig_neighbour);
-                    debug_assert!(rctx < CONTEXT_COUNT);
+                    ));
                     let bit = ((mag >> bp) & 1) as u8;
-                    let (num, den) = model.probability(rctx);
-                    enc.encode_bit(bit, num, den);
-                    model.observe(rctx, bit);
+                    match magnitude_context(cat[i], has_hv) {
+                        MagnitudeContext::Coded(rctx) => {
+                            debug_assert!(rctx < CONTEXT_COUNT);
+                            let (num, den) = model.probability(rctx);
+                            enc.encode_bit(bit, num, den);
+                            model.observe(rctx, bit);
+                        }
+                        MagnitudeContext::Uncoded => {
+                            let (num, den) = UNCODED_P1;
+                            enc.encode_bit(bit, num, den);
+                        }
+                    }
+                    cat[i] = cat[i].saturating_add(1).min(3);
                 }
             }
             stripe_start += STRIPE_HEIGHT;
@@ -824,6 +952,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
     let mut significant = vec![false; n];
     let mut sign = vec![false; n];
     let mut mag = vec![0u32; n];
+    let mut cat = vec![0u8; n];
 
     let mut model = ContextModel::new();
     let mut dec = ArithDecoder::new(bytes)?;
@@ -848,6 +977,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     model.observe(ctx, bit);
                     if bit == 1 {
                         significant[i] = true;
+                        cat[i] = 1;
                         mag[i] |= 1u32 << bp;
                         let (h_pat, v_pat) =
                             neighbour_sign_pattern(&significant, &sign, width, height, x, y);
@@ -877,15 +1007,29 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     if highest_set_bit(mag[i]) == Some(bp as u32) {
                         continue;
                     }
-                    let has_sig_neighbour =
-                        neighbour_significance_pattern(&significant, width, height, x, y) != 0;
-                    let rctx = refinement_context(false, has_sig_neighbour);
-                    let (num, den) = model.probability(rctx);
-                    let bit = dec.decode_bit(num, den)?;
-                    model.observe(rctx, bit);
+                    let has_hv = has_hv_significant(neighbour_significance_pattern(
+                        &significant,
+                        width,
+                        height,
+                        x,
+                        y,
+                    ));
+                    let bit = match magnitude_context(cat[i], has_hv) {
+                        MagnitudeContext::Coded(rctx) => {
+                            let (num, den) = model.probability(rctx);
+                            let bit = dec.decode_bit(num, den)?;
+                            model.observe(rctx, bit);
+                            bit
+                        }
+                        MagnitudeContext::Uncoded => {
+                            let (num, den) = UNCODED_P1;
+                            dec.decode_bit(num, den)?
+                        }
+                    };
                     if bit == 1 {
                         mag[i] |= 1u32 << bp;
                     }
+                    cat[i] = cat[i].saturating_add(1).min(3);
                 }
             }
             stripe_start += STRIPE_HEIGHT;
