@@ -39,9 +39,10 @@
 //!     negative-significant, 0 insignificant) selects both a predicted
 //!     sign and one of contexts 12..=16.
 //!
-//! The estimator is a Laplace-rule windowed-counting adaptive
-//! probability model (IPN 42-155 §III.C "windowed counting") with a
-//! 64-symbol halving window.
+//! The estimator is the IPN 42-155 §III.C "Probability Estimation" MER
+//! windowed-counting model: per-context zero/total counts initialised to
+//! 2/4 (P = 1/2), halved when the total reaches 500 with the count rounded
+//! toward keeping the estimate nearer 1/2. See [`ContextModel`].
 
 /// Total number of contexts maintained by the model. The IPN 42-155
 /// §III.B layout uses exactly 17 contexts: 0..=8 significance (category
