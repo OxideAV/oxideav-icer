@@ -120,7 +120,7 @@ fn truncated_psnr_is_monotone_in_budget() {
 }
 
 /// A 64×64 checkerboard: the canonical high-frequency fixture, which is
-/// pure level-1 HH energy after the DWT. Two §III.B properties are pinned:
+/// pure level-1 HH energy after the DWT. Three §III.B properties are pinned:
 ///
 /// 1. **Subband-aware contexts (r365).** The significance pass selects the
 ///    spec-exact §III.B **Table 7** (HH) context for these all-HH
@@ -133,9 +133,17 @@ fn truncated_psnr_is_monotone_in_budget() {
 ///    magnitude bits left uncoded; category-1/2 coded against contexts
 ///    9/10/11) keeps the strict-MSB truncated decode well above the
 ///    pre-r359 model.
+/// 3. **Same-subband neighbour walk (r368).** The §III.B same-subband
+///    neighbourhood (stride `2^level`) replaces the cross-subband
+///    spatial-raster walk. On the all-HH checkerboard the level-1 HH
+///    coefficients now see genuinely correlated HH neighbours (stride 2),
+///    sharply improving the strict-MSB truncated fidelity per byte: the
+///    b=600 cut, which the r365 model decoded at ~25.4 dB, now reaches
+///    ~31.5 dB (the b=700 quality at b=600).
 ///
-/// The floors below sit ~0.5 dB under the r365 measured strict-MSB result
-/// at each budget.
+/// The floors below sit ~0.5 dB under the r368 measured strict-MSB result
+/// at each budget; a regression to the cross-subband walk drops b=600 by
+/// ~6 dB and fails here.
 #[test]
 fn checkerboard_strict_truncation_clears_category_model_floor() {
     let (w, h) = (64u32, 64u32);
@@ -146,10 +154,11 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
             img.planes[0].data[y * stride + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
         }
     }
-    // (budget, PSNR floor). r365 measured strict-MSB (spec-exact Table 6/7
-    // contexts + §III.C MER estimator): b=600 -> 25.4 dB, b=700 -> 31.5 dB,
-    // b=900 -> 37.9 dB. Floors set ~0.5 dB below the measured value.
-    let cases: &[(u64, f64)] = &[(600, 24.9), (700, 31.0), (900, 37.4)];
+    // (budget, PSNR floor). r368 measured strict-MSB (spec-exact Table 6/7
+    // contexts + §III.C MER estimator + §III.B same-subband neighbour walk):
+    // b=600 -> 31.5 dB, b=700 -> 37.9 dB, b=900 -> 37.9 dB. Floors set
+    // ~0.5 dB below the measured value.
+    let cases: &[(u64, f64)] = &[(600, 31.0), (700, 37.4), (900, 37.4)];
     for &(budget, floor) in cases {
         let bytes = encode_at(&img, budget);
         assert!(bytes.len() as u64 <= budget);
@@ -163,6 +172,53 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
             p >= floor,
             "checkerboard strict b={budget}: PSNR {p:.3} dB below the §III.B subband-aware \
              context-model floor {floor} dB"
+        );
+    }
+}
+
+/// The §III.B same-subband neighbour walk (r368) measurably shrinks the
+/// filter-Q lossless output on structured content, because the context
+/// model now sees genuinely correlated same-subband neighbours instead of
+/// the cross-subband spatial-raster neighbours. These ceilings sit ~3% above
+/// the r368 measured lossless sizes; a regression to the cross-subband walk
+/// (ramp 2076 B, checkerboard 1839 B) blows past them.
+#[test]
+fn same_subband_walk_shrinks_lossless_output() {
+    // Diagonal ramp -- low-frequency, LL-dominated (stride 2^D).
+    let mut ramp = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
+    let rs = ramp.planes[0].stride;
+    for y in 0..64usize {
+        for x in 0..64usize {
+            ramp.planes[0].data[y * rs + x] = ((x + y) as u32 * 2 % 256) as u8;
+        }
+    }
+    // Checkerboard -- high-frequency, level-1 HH (stride 2).
+    let mut checker = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
+    let cs = checker.planes[0].stride;
+    for y in 0..64usize {
+        for x in 0..64usize {
+            checker.planes[0].data[y * cs + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
+        }
+    }
+    let mut opts = EncodeOptions::compressed();
+    opts.filter = WaveletFilter::Reversible53;
+    opts.wavelet_levels = 3;
+    for (name, img, ceiling) in [("ramp", &ramp, 1480usize), ("checker", &checker, 1680)] {
+        let bytes = encode_icer(img, &opts).expect("encode failed");
+        let dec = parse_icer(&bytes).expect("decode failed");
+        assert_eq!(
+            dec.planes[0].data, img.planes[0].data,
+            "{name}: filter-Q lossless must be bit-exact"
+        );
+        eprintln!(
+            "{name}: filter-Q lossless {} bytes (ceiling {ceiling})",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() <= ceiling,
+            "{name}: lossless {} bytes exceeds the same-subband-walk ceiling {ceiling} \
+             (regression to the cross-subband spatial-raster walk?)",
+            bytes.len()
         );
     }
 }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **End-to-end fidelity regression coverage for the §III.B same-subband
+  walk.** `truncation_fidelity` gains `same_subband_walk_shrinks_lossless_output`
+  (filter-Q lossless byte ceilings on the diagonal-ramp and checkerboard
+  fixtures, with a bit-exact decode assertion) so a regression to the
+  cross-subband spatial-raster walk fails CI. The checkerboard strict-MSB
+  PSNR floors are tightened to the r368 measurements (b=600 now clears
+  31.0 dB, up from the r365 floor of 24.9 dB — a ~6 dB improvement from the
+  same-subband HH neighbourhood).
+
 ### Changed
 
 - **Spec-exact §III.B same-subband neighbour walk.** The bit-plane
