@@ -445,7 +445,7 @@ fn decode_compressed_segment_into(
                 delta_distortion: 0.0,
             })
             .collect();
-        decode_bitplanes_multi(&encoded_packets, width, height, q)?
+        decode_bitplanes_multi(&encoded_packets, width, height, q, levels)?
     };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
     // Inverse level-shift + clamp to 0..=255.

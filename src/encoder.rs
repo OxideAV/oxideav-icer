@@ -938,6 +938,7 @@ fn encode_one_segment_compressed(
         width: img_w,
         height: strip_h,
         q,
+        levels,
     };
     let rd_weights: Option<Vec<f64>> = if opts.rd_pruning {
         Some(crate::priority::subband_weight_map(
@@ -1391,7 +1392,8 @@ fn pick_lower_distortion_mask(
             .filter(|(_, &m)| m)
             .map(|(p, _)| p.clone())
             .collect();
-        let mut coeffs = crate::bitplane::decode_bitplanes_multi(&kept, width, height, q).ok()?;
+        let mut coeffs =
+            crate::bitplane::decode_bitplanes_multi(&kept, width, height, q, levels).ok()?;
         wavelet_float::inverse_2d(&mut coeffs, width, height, levels, filter).ok()?;
         let mut acc = 0.0f64;
         for (&o, &r) in orig.iter().zip(coeffs.iter()) {

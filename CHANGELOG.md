@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Subband-aware bit-plane scanner — wires the §III.B Table 6/7 contexts
+  + HL transpose into encode + decode.** `BitPlaneInput` gains a `levels`
+  field (the dyadic decomposition depth); when `levels >= 1` the
+  significance pass classifies each coefficient's `(SubbandType, level)`
+  via `priority::classify_position` and selects the spec-exact §III.B
+  context — **Table 6** for LL/LH/HL (with the **HL context-template
+  transpose**, swapping the `h`/`v` neighbour roles) and **Table 7** for
+  HH (keyed on `h + v`). The sign pass applies the matching HL axis-swap
+  to the Table 8 prediction. `levels = 0` preserves the prior
+  subband-agnostic uniform classification (legacy single-body path + the
+  subband-agnostic unit tests). The encoder threads its
+  `wavelet_levels` through; the decoder reads `decomp_levels` from the
+  segment header, so encoder and decoder dispatch the identical contexts
+  and the arithmetic coder stays in lockstep. `decode_bitplanes_multi`
+  gains a `levels` parameter. Filter-Q full-quality and colour decodes
+  remain bit-exact (the change is a context-selection refinement, not a
+  wire-format change); on the all-HH 64×64 checkerboard the spec-exact
+  Table-7 HH model now reaches lossless in fewer bytes than the uniform
+  model. New `bitplane` tests pin the subband-aware round-trip across
+  levels 1..=4 and that the aware path changes the entropy-coded byte
+  total vs. the agnostic path (proving the dispatch is wired);
+  `tests/truncation_fidelity.rs` checkerboard floors re-pinned to the
+  r365 measurements.
+
 ### Added
 
 - **Spec-exact IPN 42-155 §III.B per-subband significance context tables

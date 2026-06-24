@@ -24,7 +24,8 @@ cross-checked.
 | Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
-| Context model            | full (IPN 42-155 §III.B H/V/D classification; 9 significance + 5 sign + 3 refinement contexts) |
+| Context model            | full (IPN 42-155 §III.B; 9 significance + 5 sign + 3 refinement contexts) |
+| Per-subband context tables | full (IPN 42-155 §III.B **Table 6** LL/LH/HL + **Table 7** HH, keyed on the full `(h, v, d)` neighbour counts, with the **HL context-template transpose** + matching Table 8 sign transpose; the bit-plane scanner is subband-aware via `priority::classify_position`, dispatching the correct table per coefficient -- see "Per-subband context tables" below) |
 | Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
 | Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
 | Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
@@ -153,6 +154,43 @@ The category transitions run identically on the encoder and decoder
 refinement packet mid-stream), so the model stays in lockstep and the
 filter-Q full-quality + colour round-trips remain bit-exact through the
 category-3 uncoded path.
+
+## Per-subband context tables (IPN 42-155 §III.B Tables 6 + 7)
+
+The §III.B category-0 significance context is **subband-dependent**, and
+the bit-plane scanner now dispatches it per coefficient. Each
+coefficient's `(SubbandType, level)` is resolved from its `(x, y)`
+position via `priority::classify_position`, then the significance context
+is selected from:
+
+* **Table 6** — LL, LH, and HL subbands, indexed by the full horizontal
+  `h` (0/1/2), vertical `v` (0/1/2), and diagonal `d` (0..4) significant-
+  neighbour counts (`context::significance_context_table6`). Unlike the
+  earlier uniform classification, which collapsed V and D to a binary
+  "0 / 1+", the spec table keys on the full counts.
+* **Table 7** — HH subbands, indexed by `h + v` and `d`
+  (`context::significance_context_table7`). HH has no preferred
+  orientation, so the horizontal and vertical counts are summed.
+* the **HL context-template transpose** — for an HL subband §III.B
+  reverses the roles of `h` and `v` before the Table 6 lookup
+  (`significance_context_subband(.., is_hl = true)`).
+
+The sign pass applies the matching HL axis-swap to the §III.B **Table 8**
+prediction (`sign_context_subband` / `sign_prediction_flip_subband`).
+
+The encoder threads its `wavelet_levels` into `BitPlaneInput::levels`; the
+decoder reads `decomp_levels` from the segment header, so both sides
+dispatch the identical contexts and the arithmetic coder stays in
+lockstep. The change is a context-*selection* refinement, not a
+wire-format change: filter-Q full-quality and colour decodes stay
+bit-exact, and on the all-HH 64×64 checkerboard the spec-exact Table-7 HH
+model now reaches lossless in fewer bytes than the uniform model.
+
+One §III.B simplification remains: "neighbours from the same subband
+segment" is approximated by spatial-raster neighbours in the
+Mallat-interleaved coefficient buffer (encoder and decoder share the
+identical neighbour function, so the self-roundtrip is exact). A fully
+de-interleaved per-subband neighbour walk is the next refinement.
 
 ## Stripe-ordered scan
 
@@ -325,16 +363,21 @@ to "the implementation":
   64.
 * The **per-subband significance context tables** (§III.B Table 6 for
   LL/LH/HL and Table 7 for HH, plus the HL context-template transpose).
-  These require the bit-plane scanner to know which subband each
-  coefficient belongs to; the current scanner runs over the whole strip
-  without per-subband partitioning, so it ships the H/V/D classification
-  of §III.B applied uniformly rather than the subband-specific Table 6/7
-  indices and the HL transpose. The sign contexts now follow §III.B
-  **Table 8 exactly**, and the four-category magnitude scheme (contexts
-  9/10/11 + category-3 uncoded) is implemented. Wiring the per-subband
-  Table 6/7 dispatch is the natural follow-on once the scanner is made
-  subband-aware (the `priority` module already computes the subband
-  geometry it would need).
+  **Resolved (r365).** The bit-plane scanner is now subband-aware: each
+  coefficient's `(SubbandType, level)` is resolved via
+  `priority::classify_position`, and the significance pass selects the
+  spec-exact §III.B **Table 6** (LL/LH/HL, keyed on the full `(h, v, d)`
+  counts) or **Table 7** (HH, keyed on `h + v` and `d`), with the **HL
+  context-template transpose** (swap `h`/`v` before the Table 6 lookup).
+  The sign pass applies the matching HL axis-swap to the Table 8
+  prediction. The sign contexts already followed §III.B **Table 8
+  exactly**, and the four-category magnitude scheme (contexts 9/10/11 +
+  category-3 uncoded) was implemented in r359. The one remaining
+  simplification is that the §III.B "neighbours from the *same subband
+  segment*" rule is approximated by spatial-raster neighbours in the
+  Mallat-interleaved buffer (encoder and decoder use the identical
+  neighbour function, so the self-roundtrip stays exact; a fully
+  de-interleaved per-subband neighbour walk is the next refinement).
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
 
 ## Automatic filter selection

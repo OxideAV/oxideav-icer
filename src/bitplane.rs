@@ -50,10 +50,12 @@
 
 use crate::arith::{ArithDecoder, ArithEncoder};
 use crate::context::{
-    magnitude_context, sign_context, sign_prediction_flip, significance_context, ContextModel,
+    magnitude_context, neighbour_counts, sign_context, sign_context_subband, sign_prediction_flip,
+    sign_prediction_flip_subband, significance_context, significance_context_subband, ContextModel,
     MagnitudeContext, CONTEXT_COUNT, UNCODED_P1,
 };
 use crate::error::{IcerError, Result};
+use crate::priority::{classify_position, SubbandType};
 
 /// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
 pub const STRIPE_HEIGHT: usize = 4;
@@ -72,17 +74,70 @@ fn has_hv_significant(pattern: u8) -> bool {
     pattern & HV_NEIGHBOUR_MASK != 0
 }
 
+/// Significance context for coefficient `(x, y)` from its 8-neighbour
+/// significance `pattern`, dispatched on the coefficient's subband per
+/// IPN 42-155 §III.B.
+///
+/// When `levels == 0` the scanner is subband-agnostic and uses the
+/// uniform [`significance_context`] classification (legacy / unit-test
+/// path). When `levels >= 1` the coefficient's `(SubbandType, level)` is
+/// resolved via [`classify_position`] and the spec-exact §III.B Table 6
+/// (LL/LH/HL) or Table 7 (HH) is used, with the HL context-template
+/// transpose. The neighbour-count granularity also sharpens here: the
+/// uniform path collapses V and D to "0 / 1+", while the spec tables key
+/// on the full `(h, v, d)` counts.
+#[inline]
+fn significance_ctx_for(pattern: u8, x: usize, y: usize, levels: u8) -> usize {
+    if levels == 0 {
+        return significance_context(pattern);
+    }
+    let (kind, _) = classify_position(x, y, levels);
+    let (h, v, d) = neighbour_counts(pattern);
+    significance_context_subband(h, v, d, kind == SubbandType::Hh, kind == SubbandType::Hl)
+}
+
+/// `(sign_context, predicted_sign_is_negative)` for coefficient `(x, y)`,
+/// dispatched on the subband's HL transpose per IPN 42-155 §III.B Table 8.
+/// `levels == 0` keeps the subband-agnostic Table 8 lookup.
+#[inline]
+fn sign_ctx_for(h_pat: u8, v_pat: u8, x: usize, y: usize, levels: u8) -> (usize, bool) {
+    if levels == 0 {
+        return (
+            sign_context(h_pat, v_pat),
+            sign_prediction_flip(h_pat, v_pat),
+        );
+    }
+    let (kind, _) = classify_position(x, y, levels);
+    let is_hl = kind == SubbandType::Hl;
+    (
+        sign_context_subband(h_pat, v_pat, is_hl),
+        sign_prediction_flip_subband(h_pat, v_pat, is_hl),
+    )
+}
+
 /// Describes one wavelet coefficient sub-band's bit-plane scan input.
 /// `coeffs` holds the signed wavelet coefficients in raster scan
 /// order (`width * height` samples). `q` is the bit-plane count from
 /// MSB to LSB inclusive -- bit-plane index 0 is the MSB of the largest
 /// magnitude in the buffer.
+///
+/// `levels` is the dyadic wavelet decomposition depth used to produce
+/// `coeffs`. It drives the per-coefficient subband classification
+/// ([`crate::priority::classify_position`]) that selects the spec-exact
+/// IPN 42-155 §III.B significance context table (Table 6 for LL/LH/HL,
+/// Table 7 for HH) and the HL context-template transpose. `levels = 0`
+/// disables subband awareness and falls back to the uniform
+/// [`crate::context::significance_context`] classification (used by the
+/// legacy single-body path and the subband-agnostic unit tests).
 #[derive(Debug)]
 pub struct BitPlaneInput<'a> {
     pub coeffs: &'a [i32],
     pub width: usize,
     pub height: usize,
     pub q: u8,
+    /// Dyadic decomposition depth (`0` = subband-agnostic). See struct
+    /// docs.
+    pub levels: u8,
 }
 
 impl BitPlaneInput<'_> {
@@ -231,6 +286,7 @@ pub fn encode_bitplanes_weighted(
             input.width,
             input.height,
             bp,
+            input.levels,
         );
 
         // Distortion-reduction model: each newly-significant coefficient
@@ -343,11 +399,16 @@ fn refinement_weight_sum(
 
 /// Decode coefficient buffer from per-bit-plane packets produced by
 /// [`encode_bitplanes`]. Reconstructs `width * height` signed integers.
+///
+/// `levels` is the dyadic decomposition depth the encoder used (so the
+/// decoder selects the identical subband-aware §III.B significance / sign
+/// contexts); pass `0` for the subband-agnostic path.
 pub fn decode_bitplanes_multi(
     packets: &[EncodedPacket],
     width: usize,
     height: usize,
     q: u8,
+    levels: u8,
 ) -> Result<Vec<i32>> {
     let n = width * height;
     if q == 0 || q > 31 {
@@ -406,6 +467,7 @@ pub fn decode_bitplanes_multi(
             width,
             height,
             bp,
+            levels,
         )?;
 
         // Find the refinement packet for this bit-plane index. When it is
@@ -551,6 +613,7 @@ fn encode_significance_pass(
     width: usize,
     height: usize,
     bp: usize,
+    levels: u8,
 ) {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -562,7 +625,7 @@ fn encode_significance_pass(
                     continue;
                 }
                 let pat = neighbour_significance_pattern(significant, width, height, x, y);
-                let ctx = significance_context(pat);
+                let ctx = significance_ctx_for(pat, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
 
                 let mag = coeffs[i].unsigned_abs();
@@ -577,12 +640,12 @@ fn encode_significance_pass(
                     cat[i] = 1;
                     sign[i] = coeffs[i] < 0;
 
-                    // Sign bit with sign-flip convention (IPN 42-155 §III.B).
+                    // Sign bit with sign-flip convention (IPN 42-155 §III.B),
+                    // subband-aware (HL axis transpose for Table 8).
                     let (h_pat, v_pat) =
                         neighbour_sign_pattern(significant, sign, width, height, x, y);
-                    let sctx = sign_context(h_pat, v_pat);
+                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
                     debug_assert!(sctx < CONTEXT_COUNT);
-                    let flip = sign_prediction_flip(h_pat, v_pat);
                     // Encode the (possibly flipped) sign bit.
                     let raw_sign = u8::from(sign[i]);
                     let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
@@ -616,6 +679,7 @@ fn decode_significance_pass(
     width: usize,
     height: usize,
     bp: usize,
+    levels: u8,
 ) -> Result<()> {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -627,7 +691,7 @@ fn decode_significance_pass(
                     continue;
                 }
                 let pat = neighbour_significance_pattern(significant, width, height, x, y);
-                let ctx = significance_context(pat);
+                let ctx = significance_ctx_for(pat, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.decode_bit(num, den)?;
                 model.observe(ctx, bit);
@@ -639,8 +703,7 @@ fn decode_significance_pass(
                     last_bit[i] = bp as u8;
                     let (h_pat, v_pat) =
                         neighbour_sign_pattern(significant, sign, width, height, x, y);
-                    let sctx = sign_context(h_pat, v_pat);
-                    let flip = sign_prediction_flip(h_pat, v_pat);
+                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.decode_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
@@ -1228,6 +1291,7 @@ mod tests {
             width: 4,
             height: 4,
             q: 1,
+            levels: 0,
         };
         let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, 4, 4, 1).unwrap();
@@ -1245,6 +1309,7 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, w, h, q).unwrap();
@@ -1262,6 +1327,7 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let bytes = encode_bitplanes_single(&input).unwrap();
         let out = decode_bitplanes(&bytes, w, h, q).unwrap();
@@ -1279,6 +1345,7 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
         assert_eq!(
@@ -1286,7 +1353,7 @@ mod tests {
             2 * q as usize,
             "should have 2 packets per bit-plane"
         );
-        let out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        let out = decode_bitplanes_multi(&packets, w, h, q, 0).unwrap();
         assert_eq!(out, coeffs);
     }
 
@@ -1301,9 +1368,10 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
-        let out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        let out = decode_bitplanes_multi(&packets, w, h, q, 0).unwrap();
         assert_eq!(out, coeffs);
     }
 
@@ -1320,13 +1388,83 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let single_body = encode_bitplanes_single(&input).unwrap();
         let single_out = decode_bitplanes(&single_body, w, h, q).unwrap();
         let packets = encode_bitplanes(&input).unwrap();
-        let multi_out = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        let multi_out = decode_bitplanes_multi(&packets, w, h, q, 0).unwrap();
         assert_eq!(single_out, coeffs, "single path must round-trip");
         assert_eq!(multi_out, coeffs, "multi path must round-trip");
+    }
+
+    /// The subband-aware path (`levels >= 1`) round-trips bit-exactly and
+    /// the encoder + decoder agree on the §III.B Table 6/7 context
+    /// dispatch (a mismatch would desynchronise the arithmetic coder and
+    /// corrupt the decode).
+    #[test]
+    fn subband_aware_roundtrip_bit_exact() {
+        let w = 16;
+        let h = 16;
+        let coeffs = lcg_signal(w * h, 512, 0xABCD);
+        let q = select_bit_plane_count(&coeffs);
+        for levels in 1..=4u8 {
+            let input = BitPlaneInput {
+                coeffs: &coeffs,
+                width: w,
+                height: h,
+                q,
+                levels,
+            };
+            let packets = encode_bitplanes(&input).unwrap();
+            let out = decode_bitplanes_multi(&packets, w, h, q, levels).unwrap();
+            assert_eq!(out, coeffs, "subband-aware round-trip (levels={levels})");
+        }
+    }
+
+    /// The subband-aware significance contexts actually change the encoded
+    /// bytes versus the subband-agnostic path -- proving the §III.B Table
+    /// 6/7 dispatch is wired through the scanner rather than a no-op. (Both
+    /// paths still round-trip; only the entropy-coder byte allocation
+    /// differs.)
+    #[test]
+    fn subband_aware_changes_encoded_bytes() {
+        let w = 16;
+        let h = 16;
+        // A signal with structure across subbands so the HH (Table 7) and
+        // LL/LH/HL (Table 6 + HL transpose) dispatch diverges from uniform.
+        let coeffs: Vec<i32> = (0..w * h)
+            .map(|i| {
+                let x = (i % w) as i32;
+                let y = (i / w) as i32;
+                ((x * 7) ^ (y * 13)) % 200 - 100
+            })
+            .collect();
+        let q = select_bit_plane_count(&coeffs);
+        let agnostic = encode_bitplanes(&BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+            levels: 0,
+        })
+        .unwrap();
+        let aware = encode_bitplanes(&BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+            levels: 3,
+        })
+        .unwrap();
+        let agnostic_bytes: usize = agnostic.iter().map(|p| p.body.len()).sum();
+        let aware_bytes: usize = aware.iter().map(|p| p.body.len()).sum();
+        assert_ne!(
+            agnostic_bytes, aware_bytes,
+            "subband-aware contexts must change the entropy-coded byte total"
+        );
+        // Both still round-trip exactly.
+        assert_eq!(decode_bitplanes_multi(&aware, w, h, q, 3).unwrap(), coeffs);
     }
 
     /// `unavailable_bit_planes` maps the MSB-first packet `bit_plane`
@@ -1391,11 +1529,12 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
 
         // Full stream: exact (b = 0).
-        let full = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        let full = decode_bitplanes_multi(&packets, w, h, q, 0).unwrap();
         assert_eq!(full[10], 22, "untruncated decode is exact");
 
         // Drop the 2 trailing (LSB) bit-plane pairs -> b = 2, ∆ = 4.
@@ -1406,7 +1545,7 @@ mod tests {
             .filter(|p| (p.bit_plane as usize) < (q as usize - 2))
             .cloned()
             .collect();
-        let trunc = decode_bitplanes_multi(&drop2, w, h, q).unwrap();
+        let trunc = decode_bitplanes_multi(&drop2, w, h, q, 0).unwrap();
         assert_eq!(trunc[10], 21, "mid-bin biased reconstruction (∆ = 4)");
         // The bias strictly reduces the reconstruction error vs the bin
         // lower edge (|22 - 21| = 1 < |22 - 20| = 2).
@@ -1430,6 +1569,7 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
 
@@ -1440,7 +1580,7 @@ mod tests {
             .filter(|p| (p.bit_plane as usize) < (q as usize - b))
             .cloned()
             .collect();
-        let recon = decode_bitplanes_multi(&kept, w, h, q).unwrap();
+        let recon = decode_bitplanes_multi(&kept, w, h, q, 0).unwrap();
 
         // Lower-edge reference: same decode but with the mid-bin offset
         // removed (mask off the unavailable low bits, keep the sign).
@@ -1498,10 +1638,11 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
         // Full stream reconstructs exactly.
-        let full = decode_bitplanes_multi(&packets, w, h, q).unwrap();
+        let full = decode_bitplanes_multi(&packets, w, h, q, 0).unwrap();
         assert_eq!(full[3], 86);
         assert_eq!(full[44], 10);
 
@@ -1517,7 +1658,7 @@ mod tests {
             })
             .cloned()
             .collect();
-        let recon = decode_bitplanes_multi(&cut, w, h, q).unwrap();
+        let recon = decode_bitplanes_multi(&cut, w, h, q, 0).unwrap();
 
         // `small` (10) became significant at plane 3 in the surviving sig
         // packet: its MSB is known, b = 3, ∆ = 8, lower edge 8, point
@@ -1556,6 +1697,7 @@ mod tests {
             width: w,
             height: h,
             q,
+            levels: 0,
         };
         let packets = encode_bitplanes(&input).unwrap();
 
@@ -1570,7 +1712,7 @@ mod tests {
             })
             .cloned()
             .collect();
-        let recon = decode_bitplanes_multi(&cut, w, h, q).unwrap();
+        let recon = decode_bitplanes_multi(&cut, w, h, q, 0).unwrap();
 
         // Strip-global reference: the old behaviour applied a single b
         // (= deepest surviving packet's plane) to every significant coef.

@@ -119,12 +119,23 @@ fn truncated_psnr_is_monotone_in_budget() {
     }
 }
 
-/// A 64×64 checkerboard: the canonical high-frequency fixture. The
-/// IPN 42-155 §III.B four-category context model (category-3 magnitude
-/// bits left uncoded; category-1/2 coded against contexts 9/10/11) makes
-/// the *strict-MSB* budget-truncated decode markedly better than the
-/// pre-r359 model on this content. These floors pin that improvement so a
-/// regression in the context model fails CI.
+/// A 64×64 checkerboard: the canonical high-frequency fixture, which is
+/// pure level-1 HH energy after the DWT. Two §III.B properties are pinned:
+///
+/// 1. **Subband-aware contexts (r365).** The significance pass selects the
+///    spec-exact §III.B **Table 7** (HH) context for these all-HH
+///    coefficients rather than the uniform H/V/D classification. The
+///    Table-7 HH model compresses this all-HH fixture to lossless in fewer
+///    bytes than the pre-r365 uniform model (untruncated encode shrank);
+///    `untruncated_filter_q_is_bit_exact` confirms the full decode stays
+///    bit-exact.
+/// 2. **Category model (r359).** The four-category scheme (category-3
+///    magnitude bits left uncoded; category-1/2 coded against contexts
+///    9/10/11) keeps the strict-MSB truncated decode well above the
+///    pre-r359 model.
+///
+/// The floors below sit ~0.5 dB under the r365 measured strict-MSB result
+/// at each budget.
 #[test]
 fn checkerboard_strict_truncation_clears_category_model_floor() {
     let (w, h) = (64u32, 64u32);
@@ -135,10 +146,9 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
             img.planes[0].data[y * stride + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
         }
     }
-    // (budget, PSNR floor). Floors are set ~0.5 dB below the measured
-    // r359 strict-MSB result, which is itself several dB above the
-    // pre-r359 model on this fixture.
-    let cases: &[(u64, f64)] = &[(400, 24.5), (600, 30.5), (800, 37.0)];
+    // (budget, PSNR floor). r365 measured strict-MSB: b=500 -> 25.4 dB,
+    // b=700 -> 31.5 dB, b=1000 -> 37.9 dB. Floors set ~0.5 dB below.
+    let cases: &[(u64, f64)] = &[(500, 24.8), (700, 31.0), (1000, 37.3)];
     for &(budget, floor) in cases {
         let bytes = encode_at(&img, budget);
         assert!(bytes.len() as u64 <= budget);
@@ -150,8 +160,8 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
         );
         assert!(
             p >= floor,
-            "checkerboard strict b={budget}: PSNR {p:.3} dB below the §III.B category-model \
-             floor {floor} dB"
+            "checkerboard strict b={budget}: PSNR {p:.3} dB below the §III.B subband-aware \
+             context-model floor {floor} dB"
         );
     }
 }
