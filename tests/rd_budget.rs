@@ -304,21 +304,22 @@ fn weight_map_reflects_non_unitary_subband_structure() {
 /// measurable PSNR win at a budget whose strict-MSB cut falls on a
 /// poorly-ranked packet.
 ///
-/// Round-359/365 note: the IPN 42-155 §III.B four-category context model
-/// (r359) plus the subband-aware Table 6/7 contexts + §III.C MER estimator
-/// (r365) compress the checkerboard far better than earlier models, which
+/// Round-359/365/368 note: the IPN 42-155 §III.B four-category context
+/// model (r359) plus the subband-aware Table 6/7 contexts + §III.C MER
+/// estimator (r365) plus the same-subband de-interleaved neighbour walk
+/// (r368) compress the checkerboard far better than earlier models, which
 /// shifts where the strict-MSB cut lands relative to the per-packet
-/// boundaries. The R-D packet-ranking slack now shows up at budgets whose
-/// strict cut falls just short of a high-value refinement packet that
-/// R-D's residual-fill picks up (b=400 and b=875 on the r365 model). We
-/// sweep a budget band that brackets those boundaries and require R-D to
-/// (a) never regress and (b) win by a measurable margin at at least one
-/// budget.
+/// boundaries. The R-D packet-ranking slack now shows up at the tight
+/// budgets whose strict cut falls just short of a high-value refinement
+/// packet that R-D's residual-fill picks up (b=210 and b=310 on the r368
+/// model, where the win is +3..+8 dB). We sweep a budget band that
+/// brackets those boundaries and require R-D to (a) never regress and
+/// (b) win by a measurable margin at at least one budget.
 #[test]
 fn weighted_rd_beats_strict_on_checkerboard() {
     let image = checker_64x64();
     let mut best_delta = f64::NEG_INFINITY;
-    for &budget in &[400u64, 700, 875] {
+    for &budget in &[210u64, 310, 700] {
         let strict = encode_icer(
             &image,
             &EncodeOptions::compressed().with_byte_budget(budget),

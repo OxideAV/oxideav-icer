@@ -55,7 +55,7 @@ use crate::context::{
     MagnitudeContext, CONTEXT_COUNT, UNCODED_P1,
 };
 use crate::error::{IcerError, Result};
-use crate::priority::{classify_position, SubbandType};
+use crate::priority::{classify_position, subband_stride, SubbandType};
 
 /// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
 pub const STRIPE_HEIGHT: usize = 4;
@@ -341,6 +341,7 @@ pub fn encode_bitplanes_weighted(
             input.width,
             input.height,
             bp,
+            input.levels,
         );
 
         // Distortion-reduction model: each refined coefficient halves
@@ -494,6 +495,7 @@ pub fn decode_bitplanes_multi(
                 width,
                 height,
                 bp,
+                levels,
             )?;
         } else {
             // No refinement packet at this depth (the budget cut fell
@@ -624,7 +626,7 @@ fn encode_significance_pass(
                 if significant[i] {
                     continue;
                 }
-                let pat = neighbour_significance_pattern(significant, width, height, x, y);
+                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
                 let ctx = significance_ctx_for(pat, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
 
@@ -643,7 +645,7 @@ fn encode_significance_pass(
                     // Sign bit with sign-flip convention (IPN 42-155 §III.B),
                     // subband-aware (HL axis transpose for Table 8).
                     let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y);
+                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
                     let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
                     debug_assert!(sctx < CONTEXT_COUNT);
                     // Encode the (possibly flipped) sign bit.
@@ -690,7 +692,7 @@ fn decode_significance_pass(
                 if significant[i] {
                     continue;
                 }
-                let pat = neighbour_significance_pattern(significant, width, height, x, y);
+                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
                 let ctx = significance_ctx_for(pat, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.decode_bit(num, den)?;
@@ -702,7 +704,7 @@ fn decode_significance_pass(
                     mag[i] |= 1u32 << bp;
                     last_bit[i] = bp as u8;
                     let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y);
+                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
                     let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.decode_bit(sn, sd)?;
@@ -740,6 +742,7 @@ fn encode_refinement_pass(
     width: usize,
     height: usize,
     bp: usize,
+    levels: u8,
 ) {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -762,6 +765,7 @@ fn encode_refinement_pass(
                     height,
                     x,
                     y,
+                    levels,
                 ));
                 let bit = ((m >> bp) & 1) as u8;
                 match magnitude_context(cat[i], has_hv) {
@@ -835,6 +839,7 @@ fn decode_refinement_pass(
     width: usize,
     height: usize,
     bp: usize,
+    levels: u8,
 ) -> Result<()> {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -854,6 +859,7 @@ fn decode_refinement_pass(
                     height,
                     x,
                     y,
+                    levels,
                 ));
                 let bit = match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
@@ -917,12 +923,15 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
                     if significant[i] {
                         continue;
                     }
+                    // Legacy single-packet path is subband-agnostic: pass
+                    // levels = 0 to keep the unit-stride spatial-raster walk.
                     let pat = neighbour_significance_pattern(
                         &significant,
                         input.width,
                         input.height,
                         x,
                         y,
+                        0,
                     );
                     let ctx = significance_context(pat);
                     debug_assert!(ctx < CONTEXT_COUNT);
@@ -942,6 +951,7 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
                             input.height,
                             x,
                             y,
+                            0,
                         );
                         let sctx = sign_context(h_pat, v_pat);
                         debug_assert!(sctx < CONTEXT_COUNT);
@@ -977,6 +987,7 @@ pub fn encode_bitplanes_single(input: &BitPlaneInput<'_>) -> Result<Vec<u8>> {
                         input.height,
                         x,
                         y,
+                        0,
                     ));
                     let bit = ((mag >> bp) & 1) as u8;
                     match magnitude_context(cat[i], has_hv) {
@@ -1033,7 +1044,8 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                     if significant[i] {
                         continue;
                     }
-                    let pat = neighbour_significance_pattern(&significant, width, height, x, y);
+                    // Legacy single-packet path is subband-agnostic: levels = 0.
+                    let pat = neighbour_significance_pattern(&significant, width, height, x, y, 0);
                     let ctx = significance_context(pat);
                     let (num, den) = model.probability(ctx);
                     let bit = dec.decode_bit(num, den)?;
@@ -1043,7 +1055,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                         cat[i] = 1;
                         mag[i] |= 1u32 << bp;
                         let (h_pat, v_pat) =
-                            neighbour_sign_pattern(&significant, &sign, width, height, x, y);
+                            neighbour_sign_pattern(&significant, &sign, width, height, x, y, 0);
                         let sctx = sign_context(h_pat, v_pat);
                         let flip = sign_prediction_flip(h_pat, v_pat);
                         let (sn, sd) = model.probability(sctx);
@@ -1076,6 +1088,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
                         height,
                         x,
                         y,
+                        0,
                     ));
                     let bit = match magnitude_context(cat[i], has_hv) {
                         MagnitudeContext::Coded(rctx) => {
@@ -1121,13 +1134,25 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
 /// Pack the 8-neighbour significance pattern for `(x, y)` into a `u8`
 /// using the layout documented in [`crate::context::significance_context`]
 /// (NW=bit0, N=bit1, NE=bit2, W=bit3, E=bit4, SW=bit5, S=bit6, SE=bit7).
+///
+/// The eight neighbours are the eight nearest pixels **of the same
+/// subband** (IPN 42-155 §III.B: "its eight nearest neighbors from the
+/// same segment of the subband"). In the Mallat-interleaved transform
+/// buffer those sit `subband_stride(x, y, levels)` apart along each axis,
+/// not one buffer cell apart, so the walk steps by the subband stride
+/// rather than the spatial-raster unit step. A neighbour stepped off the
+/// strip edge is "at the edge of its subband segment" and is treated as
+/// not yet significant (§III.B). `levels == 0` keeps the legacy unit-stride
+/// spatial walk used by the subband-agnostic unit tests.
 fn neighbour_significance_pattern(
     significant: &[bool],
     width: usize,
     height: usize,
     x: usize,
     y: usize,
+    levels: u8,
 ) -> u8 {
+    let stride = subband_stride(x, y, levels) as isize;
     let mut pat = 0u8;
     let neighbours = [
         // (dx, dy, bit)
@@ -1141,8 +1166,8 @@ fn neighbour_significance_pattern(
         (1, 1, 7),
     ];
     for (dx, dy, bit) in neighbours {
-        let nx = x as isize + dx;
-        let ny = y as isize + dy;
+        let nx = x as isize + dx * stride;
+        let ny = y as isize + dy * stride;
         if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
             let idx = (ny as usize) * width + (nx as usize);
             if significant[idx] {
@@ -1161,6 +1186,11 @@ fn neighbour_significance_pattern(
 ///   bits 2,3 = (neighbour-B significant, neighbour-B negative)
 ///
 /// Horizontal: A=W, B=E. Vertical: A=N, B=S.
+///
+/// The four sign neighbours are the same-subband nearest pixels (IPN
+/// 42-155 §III.B), i.e. `subband_stride(x, y, levels)` apart in the
+/// interleaved buffer rather than one cell apart. `levels == 0` keeps the
+/// legacy unit-stride spatial walk.
 fn neighbour_sign_pattern(
     significant: &[bool],
     sign: &[bool],
@@ -1168,15 +1198,17 @@ fn neighbour_sign_pattern(
     height: usize,
     x: usize,
     y: usize,
+    levels: u8,
 ) -> (u8, u8) {
+    let stride = subband_stride(x, y, levels) as isize;
     let h = pair_pattern(
         significant,
         sign,
         width,
         height,
-        x as isize - 1,
+        x as isize - stride,
         y as isize,
-        x as isize + 1,
+        x as isize + stride,
         y as isize,
     );
     let v = pair_pattern(
@@ -1185,9 +1217,9 @@ fn neighbour_sign_pattern(
         width,
         height,
         x as isize,
-        y as isize - 1,
+        y as isize - stride,
         x as isize,
-        y as isize + 1,
+        y as isize + stride,
     );
     (h, v)
 }
@@ -1261,7 +1293,7 @@ mod tests {
     fn empty_neighbours_are_zero() {
         let sig = vec![false; 4];
         assert_eq!(
-            neighbour_significance_pattern(&sig, 2, 2, 0, 0),
+            neighbour_significance_pattern(&sig, 2, 2, 0, 0, 0),
             0,
             "all-insignificant neighbourhood"
         );
@@ -1465,6 +1497,42 @@ mod tests {
         );
         // Both still round-trip exactly.
         assert_eq!(decode_bitplanes_multi(&aware, w, h, q, 3).unwrap(), coeffs);
+    }
+
+    /// §III.B same-subband neighbour walk: when `levels >= 1` the
+    /// significance pattern is gathered from same-subband neighbours
+    /// `2^level` apart, not the spatially-adjacent cells. A coefficient
+    /// whose only significant *spatial* neighbour belongs to a different
+    /// subband must see an empty same-subband neighbourhood; a coefficient
+    /// with a significant *same-subband* neighbour at stride distance must
+    /// see it.
+    #[test]
+    fn neighbour_walk_is_same_subband() {
+        // 8x8 buffer, 3 decomposition levels. The level-1 HL coefficient at
+        // (3,2): same-subband E neighbour is (3+2, 2) = (5,2) (also HL
+        // level 1); its spatial E neighbour (4,2) is a *different* subband.
+        let w = 8;
+        let h = 8;
+        let levels = 3u8;
+        // Mark only (5,2) significant -- the strided same-subband E neighbour.
+        let mut sig = vec![false; w * h];
+        sig[2 * w + 5] = true;
+        let strided = neighbour_significance_pattern(&sig, w, h, 3, 2, levels);
+        // Bit 4 is E in the NW..SE packing.
+        assert_ne!(strided & (1 << 4), 0, "same-subband E neighbour is seen");
+
+        // Now mark only the spatial E neighbour (4,2) -- a different subband.
+        let mut sig2 = vec![false; w * h];
+        sig2[2 * w + 4] = true;
+        let strided2 = neighbour_significance_pattern(&sig2, w, h, 3, 2, levels);
+        assert_eq!(
+            strided2, 0,
+            "a different-subband spatial neighbour must not pollute the context"
+        );
+        // The legacy unit-stride (levels = 0) walk *would* see the spatial
+        // neighbour -- confirming the two behaviours genuinely differ.
+        let unit = neighbour_significance_pattern(&sig2, w, h, 3, 2, 0);
+        assert_ne!(unit & (1 << 4), 0, "legacy unit walk sees the spatial cell");
     }
 
     /// `unavailable_bit_planes` maps the MSB-first packet `bit_plane`

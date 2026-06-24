@@ -1397,7 +1397,18 @@ fn pick_lower_distortion_mask(
         wavelet_float::inverse_2d(&mut coeffs, width, height, levels, filter).ok()?;
         let mut acc = 0.0f64;
         for (&o, &r) in orig.iter().zip(coeffs.iter()) {
-            let d = (o - r) as f64;
+            // Apply the decoder's inverse level-shift + [0,255] clamp so the
+            // MSE measured here is *exactly* the reconstructed-image MSE the
+            // receiver sees. `orig` is the level-shifted strip (`px - 128`),
+            // always in `[-128, 127]`, so its clamped form equals itself; the
+            // candidate `r` can exceed that range and is clamped just as
+            // `decode.rs` does before comparison. Without the clamp the guard
+            // ranks two plans by an *unclamped* MSE that can disagree with the
+            // decoded PSNR on large-coefficient (e.g. sparse-impulse) content,
+            // letting R-D pick a plan that actually decodes worse than strict.
+            let r_pixel = (r + 128).clamp(0, 255);
+            let o_pixel = (o + 128).clamp(0, 255);
+            let d = (o_pixel - r_pixel) as f64;
             acc += d * d;
         }
         Some(acc)

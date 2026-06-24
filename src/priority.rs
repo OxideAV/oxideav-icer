@@ -270,6 +270,46 @@ pub fn classify_position(mut x: usize, mut y: usize, levels: u8) -> (SubbandType
     }
 }
 
+/// Spacing, in the Mallat-interleaved coefficient buffer, between two
+/// coefficients of the **same subband** that are nearest neighbours
+/// within that subband.
+///
+/// # §III.B same-subband neighbourhood
+///
+/// IPN 42-155 §III.B specifies that a bit's coding context is "determined
+/// by the bits already encoded in the pixel and in its eight nearest
+/// neighbors **from the same segment of the subband**". The paper is
+/// emphatic that the context is built only from pixels in the immediate
+/// nine-pixel neighbourhood *within the given subband* -- not from the
+/// spatially-adjacent pixels, which in the interleaved transform buffer
+/// belong to *different* subbands.
+///
+/// In this crate's interleaved sub-rectangle dyadic layout (see
+/// [`classify_position`]) one decomposition stage interleaves low/high
+/// outputs at stride 2 per axis, two stages at stride 4, and so on, so two
+/// coefficients of a subband at decomposition level `j` that are adjacent
+/// *within that subband* sit `2^j` apart in the buffer along each axis.
+/// The deepest LL (level `D`) shares the same `2^D` spacing.
+///
+/// So the same-subband neighbour of `(x, y)` in subband direction
+/// `(dx, dy)` is the buffer position `(x + dx*stride, y + dy*stride)` with
+/// `stride = subband_stride(x, y, levels)`. That neighbour classifies to
+/// the *same* subband by construction; a neighbour that falls outside the
+/// strip is "at the edge of its subband segment" and is treated as not yet
+/// significant (§III.B).
+///
+/// `levels` is clamped to `1..=6` to match the rest of the crate; a
+/// `levels == 0` request returns a unit stride (the legacy
+/// subband-agnostic spatial-raster walk).
+#[inline]
+pub fn subband_stride(x: usize, y: usize, levels: u8) -> usize {
+    if levels == 0 {
+        return 1;
+    }
+    let (_, level) = classify_position(x, y, levels);
+    1usize << level
+}
+
 /// Per-coefficient image-domain distortion weight for a `levels`-stage
 /// decomposition of a `width * height` strip under `filter`.
 ///
@@ -564,6 +604,41 @@ mod tests {
         assert_eq!(classify_position(0, 0, d), (SubbandType::Ll, d));
         // (8,8) all-even through 3 levels -> LL.
         assert_eq!(classify_position(8, 8, d), (SubbandType::Ll, d));
+    }
+
+    /// §III.B same-subband neighbour spacing: a coefficient at
+    /// decomposition level `j` has its nearest same-subband neighbours
+    /// `2^j` apart in the interleaved buffer, and that strided neighbour
+    /// classifies into the *same* subband.
+    #[test]
+    fn subband_stride_matches_level_and_keeps_class() {
+        let levels = 3u8;
+        // A few representative coefficients across subbands/levels.
+        for &(x, y) in &[
+            (1usize, 0usize),
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (4, 0),
+            (0, 0),
+            (4, 4),
+        ] {
+            let (kind, level) = classify_position(x, y, levels);
+            let stride = subband_stride(x, y, levels);
+            assert_eq!(stride, 1usize << level, "stride is 2^level at ({x},{y})");
+            // Stepping by the stride along either axis stays in-class.
+            let (kx, _) = classify_position(x + stride, y, levels);
+            let (ky, _) = classify_position(x, y + stride, levels);
+            assert_eq!(kx, kind, "+x stride keeps subband at ({x},{y})");
+            assert_eq!(ky, kind, "+y stride keeps subband at ({x},{y})");
+        }
+    }
+
+    /// `levels == 0` requests the legacy unit-stride spatial walk.
+    #[test]
+    fn subband_stride_levels0_is_unit() {
+        assert_eq!(subband_stride(3, 7, 0), 1);
+        assert_eq!(subband_stride(0, 0, 0), 1);
     }
 
     /// The §III.A weight map is well-formed (one positive weight per

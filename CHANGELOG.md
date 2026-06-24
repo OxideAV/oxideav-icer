@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Spec-exact §III.B same-subband neighbour walk.** The bit-plane
+  scanner's significance + sign context now gathers each coefficient's
+  eight nearest neighbours **from the same subband** (IPN 42-155 §III.B:
+  "its eight nearest neighbors from the same segment of the subband"),
+  retiring the earlier spatial-raster approximation that sampled
+  cross-subband neighbours in the Mallat-interleaved buffer. A subband at
+  decomposition level `j` is interleaved at stride `2^j` per axis, so the
+  same-subband neighbour of `(x, y)` in direction `(dx, dy)` is the buffer
+  position `(x + dx·2^j, y + dy·2^j)` (new `priority::subband_stride`);
+  off-strip neighbours are "at the edge of the subband segment" and treated
+  as not-significant per §III.B. The stride is a pure function of
+  `(x, y, levels)` shared by encoder and decoder, so filter-Q full-quality
+  and colour round-trips stay bit-exact. Gathering genuinely correlated
+  neighbours improves filter-Q lossless compression materially on
+  structured 64×64 content: diagonal ramp 2076→1429 bytes (−31%),
+  checkerboard 1839→1627 (−11.5%), textured 3570→3226 (−9.6%). The legacy
+  single-packet path (`encode_bitplanes_single` / `decode_bitplanes`) stays
+  subband-agnostic (`levels = 0` → unit stride). New `priority` +
+  `bitplane` unit tests pin the stride formula, the same-subband-only
+  pattern gathering, and the divergence from the legacy unit walk.
+- **R-D candidate selector compares *clamped* reconstructed-image MSE.**
+  `encoder::pick_lower_distortion_mask` now applies the decoder's inverse
+  level-shift + `[0,255]` clamp before measuring the candidate MSE, so the
+  guard ranks the greedy and strict-MSB plans by exactly the MSE the
+  receiver decodes. The previous unclamped comparison could rank a plan as
+  no-worse on raw coefficient MSE while it actually decoded with lower PSNR
+  on large-coefficient (sparse-impulse) content, letting R-D regress below
+  strict; the clamp makes "R-D is never worse than strict-MSB" provably
+  hold. `rd_budget` checkerboard win band re-pinned to the budgets where
+  the better context model now exposes R-D's residual-fill advantage
+  (b=210/310, +3..+8 dB).
 - **Spec-exact §III.C probability estimator (MER initial counts +
   rescale-at-500).** The adaptive context-conditional estimator
   (`context::ContextModel`) now matches the IPN 42-155 §III.C "Probability

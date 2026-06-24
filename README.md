@@ -187,11 +187,28 @@ wire-format change: filter-Q full-quality and colour decodes stay
 bit-exact, and on the all-HH 64×64 checkerboard the spec-exact Table-7 HH
 model now reaches lossless in fewer bytes than the uniform model.
 
-One §III.B simplification remains: "neighbours from the same subband
-segment" is approximated by spatial-raster neighbours in the
-Mallat-interleaved coefficient buffer (encoder and decoder share the
-identical neighbour function, so the self-roundtrip is exact). A fully
-de-interleaved per-subband neighbour walk is the next refinement.
+The §III.B "neighbours from the *same segment of the subband*" rule is now
+followed exactly: the bit-plane scanner walks each coefficient's eight
+nearest **same-subband** neighbours (significance + sign), not the
+spatially-adjacent cells. In the Mallat-interleaved coefficient buffer a
+subband at decomposition level `j` is interleaved at stride `2^j` per axis,
+so the same-subband neighbour of `(x, y)` in direction `(dx, dy)` is the
+buffer position `(x + dx·2^j, y + dy·2^j)` (`priority::subband_stride`); a
+neighbour stepped off the strip edge is "at the edge of its subband
+segment" and treated as not-yet-significant (§III.B). The previous
+spatial-raster walk sampled *cross-subband* neighbours, polluting the
+context model; gathering genuinely correlated same-subband neighbours
+shrinks the filter-Q lossless output materially:
+
+| fixture (64×64) | spatial-raster | same-subband | reduction |
+|-----------------|---------------:|-------------:|----------:|
+| diagonal ramp   |          2076  |        1429  |  **−31%** |
+| checkerboard    |          1839  |        1627  |    −11.5% |
+| textured        |          3570  |        3226  |    −9.6%  |
+
+The walk runs identically on encode and decode (the stride is a pure
+function of `(x, y, levels)`), so the filter-Q full-quality + colour
+round-trips stay bit-exact through the change.
 
 ## Stripe-ordered scan
 
@@ -339,14 +356,14 @@ follow-on.
   with the HL transpose, the Table 8 sign prediction, the four-category
   magnitude scheme, and the §III.C MER probability estimator (2/4 init,
   rescale at 500). Two clean-room interpretations remain that can affect
-  bit-equivalence with real Mars-rover ICER files: (a) §III.B's "neighbours
-  from the same subband segment" is approximated by spatial-raster neighbours
-  in the Mallat-interleaved buffer (the encoder and decoder share the same
-  neighbour function, so the self-roundtrip stays exact); and (b) §IV's
+  bit-equivalence with real Mars-rover ICER files: §IV's
   **interleaved entropy coder** is realised here with a standard
   Witten-Neal-Cleary binary arithmetic coder rather than the bin-interleaved
   variable-to-variable-length coder §IV describes. The self-roundtrip is
   correct but is not guaranteed bit-equivalent to JPL ICER output.
+  (The earlier §III.B same-subband-neighbour approximation is **resolved** --
+  see "Per-subband context tables" above; the scanner now walks the
+  spec-exact same-subband neighbourhood.)
 * **Per-filter lifting coefficients** -- *resolved by the staged spec.* The
   IPN 42-155 §II.A Table 1 parameters for all seven filters (A-F + Q) are now
   transcribed in `wavelet_int`; the legacy float path's CDF 9/7 + Daubechies +
@@ -385,12 +402,12 @@ to "the implementation":
   The sign pass applies the matching HL axis-swap to the Table 8
   prediction. The sign contexts already followed §III.B **Table 8
   exactly**, and the four-category magnitude scheme (contexts 9/10/11 +
-  category-3 uncoded) was implemented in r359. The one remaining
-  simplification is that the §III.B "neighbours from the *same subband
-  segment*" rule is approximated by spatial-raster neighbours in the
-  Mallat-interleaved buffer (encoder and decoder use the identical
-  neighbour function, so the self-roundtrip stays exact; a fully
-  de-interleaved per-subband neighbour walk is the next refinement).
+  category-3 uncoded) was implemented in r359. The §III.B "neighbours
+  from the *same segment of the subband*" rule is now followed exactly
+  (r368): the scanner walks each coefficient's eight nearest same-subband
+  neighbours at the subband stride `2^level`, with off-strip neighbours
+  treated as not-significant per §III.B; the spatial-raster approximation
+  is retired.
 * **Per-filter lifting coefficients** for `A` through `G` (see above).
 
 ## Automatic filter selection
