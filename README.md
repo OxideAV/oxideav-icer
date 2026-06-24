@@ -26,7 +26,7 @@ cross-checked.
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
 | Probability estimator    | full (IPN 42-155 §III.C MER implementation: initial counts 2/4, rescale when total reaches 500, round-toward-1/2 on the halving) |
 | Context model            | full (IPN 42-155 §III.B; 9 significance + 5 sign + 3 refinement contexts) |
-| Per-subband context tables | full (IPN 42-155 §III.B **Table 6** LL/LH/HL + **Table 7** HH, keyed on the full `(h, v, d)` neighbour counts, with the **HL context-template transpose** + matching Table 8 sign transpose; the bit-plane scanner is subband-aware via `priority::classify_position`, dispatching the correct table per coefficient -- see "Per-subband context tables" below) |
+| Per-subband context tables | full (IPN 42-155 §III.B **Table 6** LL/LH/HL + **Table 7** HH, keyed on the full `(h, v, d)` neighbour counts, with the **HL context-template transpose** + matching Table 8 sign transpose; the bit-plane scanner is subband-aware via `priority::classify_position`, dispatching the correct table per coefficient, and gathers the **same-subband** neighbourhood at stride `2^level` (`priority::subband_stride`) per §III.B rather than the cross-subband spatial-raster cells -- see "Per-subband context tables" below) |
 | Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
 | Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
 | Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
