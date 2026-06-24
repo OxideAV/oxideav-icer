@@ -55,16 +55,29 @@ pub const CONTEXT_COUNT: usize = 17;
 /// the categories of adjacent pixels").
 pub const CATEGORY2_CONTEXT: usize = 11;
 
-/// Window length for the Laplace-rule probability estimator. A
-/// power-of-two keeps the renormalisation step a shift; 64 is the
-/// shortest window the paper's "fast adaptation" descriptor
-/// (IPN 42-155 §III.C) is consistent with.
-pub const ESTIMATOR_WINDOW: u32 = 64;
+/// Initial `ones` (= initial `total - zeros`) count per context. IPN
+/// 42-155 §III.C MER implementation: "the initial counts of zeros are set
+/// to 2, the initial total counts are set to 4" — a probability-of-zero
+/// of 1/2, equivalently `ones = 2` out of `4`.
+pub const INITIAL_ONES: u32 = 2;
 
-/// Adaptive context-conditional probability estimator. One counter
-/// pair per context; the running probability of `1` is
-/// `ones[ctx] / total[ctx]` clamped to `[1/W, (W-1)/W]` where
-/// `W = ESTIMATOR_WINDOW + 2` (Laplace add-one smoothing).
+/// Initial `total` count per context (IPN 42-155 §III.C MER
+/// implementation: total = 4).
+pub const INITIAL_TOTAL: u32 = 4;
+
+/// Rescale threshold for the windowed-counting estimator. IPN 42-155
+/// §III.C MER implementation: "rescaling is triggered when the total
+/// count reaches 500." When the total reaches this value both counts are
+/// halved (so recent bits get more weight), with the rounding chosen to
+/// keep the probability estimate nearer 1/2.
+pub const RESCALE_THRESHOLD: u32 = 500;
+
+/// Adaptive context-conditional probability estimator (IPN 42-155 §III.C
+/// "Probability Estimation"). One counter pair per context; the running
+/// probability of `1` is `ones[ctx] / total[ctx]`. Counts start at the
+/// §III.C MER values (2 ones out of 4 -> P = 1/2) and are halved each
+/// time `total` reaches [`RESCALE_THRESHOLD`] (= 500), with the rounding
+/// chosen so the post-rescale estimate is nearer 1/2.
 pub struct ContextModel {
     /// Number of `1` bits seen in the current window for each context.
     ones: [u32; CONTEXT_COUNT],
@@ -79,12 +92,12 @@ impl Default for ContextModel {
 }
 
 impl ContextModel {
-    /// Build a fresh model with all counters at the Laplace prior
-    /// (1 one out of 2 total -> P(1) = 1/2).
+    /// Build a fresh model with all counters at the §III.C MER prior
+    /// (2 ones out of 4 total -> P(1) = 1/2).
     pub fn new() -> Self {
         Self {
-            ones: [1; CONTEXT_COUNT],
-            total: [2; CONTEXT_COUNT],
+            ones: [INITIAL_ONES; CONTEXT_COUNT],
+            total: [INITIAL_TOTAL; CONTEXT_COUNT],
         }
     }
 
@@ -97,19 +110,61 @@ impl ContextModel {
     }
 
     /// Update the windowed counters with the observed `bit` for
-    /// context `ctx`. Must be called *after* the corresponding
-    /// arithmetic-coder symbol has been encoded / decoded so encoder
-    /// and decoder stay synchronised.
+    /// context `ctx` (IPN 42-155 §III.C). Must be called *after* the
+    /// corresponding arithmetic-coder symbol has been encoded / decoded so
+    /// encoder and decoder stay synchronised.
+    ///
+    /// §III.C: "Each bit encountered in a context increments the total
+    /// count, and increments the count of zeros if the bit is a 0. ...
+    /// When the total count reaches a specified value, both counts are
+    /// rescaled by dividing by 2 (when necessary, the count of zeros is
+    /// rounded in the direction that makes the probability-of-zero
+    /// estimate closer to 1/2)." Tracked here in terms of `ones` (=
+    /// `total - zeros`), which is the symmetric statement for the
+    /// probability-of-one the arithmetic coder consumes.
     pub fn observe(&mut self, ctx: usize, bit: u8) {
         debug_assert!(ctx < CONTEXT_COUNT);
         debug_assert!(bit <= 1);
-        if self.total[ctx] >= ESTIMATOR_WINDOW {
-            // Halve both counts, with rounding up so neither hits 0.
-            self.ones[ctx] = (self.ones[ctx] + 1) >> 1;
-            self.total[ctx] = (self.total[ctx] + 1) >> 1;
-        }
         self.total[ctx] += 1;
         self.ones[ctx] += u32::from(bit);
+        if self.total[ctx] >= RESCALE_THRESHOLD {
+            self.rescale(ctx);
+        }
+    }
+
+    /// Halve both counts for context `ctx`, rounding so the post-rescale
+    /// probability estimate is nearer 1/2 (IPN 42-155 §III.C). The total
+    /// rounds to nearest; the `ones` count is then rounded toward
+    /// `total / 2` (the 1/2 point). Both are floored at 1 / 2 so the
+    /// estimate stays strictly inside `(0, 1)` for the arithmetic coder.
+    fn rescale(&mut self, ctx: usize) {
+        let zeros = self.total[ctx] - self.ones[ctx];
+        // Round each half to nearest.
+        let mut total_h = (self.total[ctx] + 1) >> 1;
+        let ones_h = (self.ones[ctx] + 1) >> 1;
+        let zeros_h = (zeros + 1) >> 1;
+        // The two independently-rounded halves may not sum to total_h;
+        // reconcile by choosing the `ones` value (`total_h - zeros_h` vs
+        // `ones_h`) whose probability-of-one is nearer 1/2, i.e. nearer
+        // `total_h / 2`. This realises §III.C's "round in the direction
+        // that makes the estimate closer to 1/2".
+        let cand_a = ones_h.min(total_h);
+        let cand_b = total_h.saturating_sub(zeros_h);
+        let half2 = total_h; // compare 2*ones vs total to avoid fractions
+        let dist = |o: u32| (2 * o).abs_diff(half2);
+        let mut ones_new = if dist(cand_a) <= dist(cand_b) {
+            cand_a
+        } else {
+            cand_b
+        };
+        // Clamp so 1 <= ones_new <= total_h - 1 (estimate strictly inside
+        // (0, 1)); guarantee total_h >= 2 first.
+        if total_h < 2 {
+            total_h = 2;
+        }
+        ones_new = ones_new.clamp(1, total_h - 1);
+        self.total[ctx] = total_h;
+        self.ones[ctx] = ones_new;
     }
 }
 
@@ -441,6 +496,68 @@ pub const UNCODED_P1: (u32, u32) = (1, 2);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §III.C MER initial counts: 2 ones out of 4 total (P = 1/2).
+    #[test]
+    fn estimator_initial_counts() {
+        let m = ContextModel::new();
+        for ctx in 0..CONTEXT_COUNT {
+            assert_eq!(m.probability(ctx), (INITIAL_ONES, INITIAL_TOTAL));
+            assert_eq!(m.probability(ctx), (2, 4));
+        }
+    }
+
+    /// `observe` increments total always and ones only on a `1` bit
+    /// (IPN 42-155 §III.C), until the rescale threshold.
+    #[test]
+    fn estimator_increments() {
+        let mut m = ContextModel::new();
+        m.observe(0, 1);
+        assert_eq!(m.probability(0), (3, 5));
+        m.observe(0, 0);
+        assert_eq!(m.probability(0), (3, 6));
+    }
+
+    /// At `total == RESCALE_THRESHOLD` the counts halve; the estimate
+    /// stays strictly inside `(0, 1)` and nearer 1/2 than before is not
+    /// required, but `1 <= ones < total` must hold.
+    #[test]
+    fn estimator_rescales_at_threshold() {
+        let mut m = ContextModel::new();
+        // Feed all-ones until the rescale fires. Track that total never
+        // exceeds the threshold post-rescale and the estimate is valid.
+        let mut rescaled = false;
+        for _ in 0..(RESCALE_THRESHOLD as usize + 50) {
+            m.observe(0, 1);
+            let (ones, total) = m.probability(0);
+            assert!(total >= 2, "total must stay >= 2");
+            assert!(ones >= 1 && ones < total, "estimate must stay in (0,1)");
+            if total < RESCALE_THRESHOLD {
+                // After at least one observe the total dipped below the
+                // threshold again -> a rescale happened.
+                if rescaled || total < INITIAL_TOTAL + 5 {
+                    // (no-op; just exercising the path)
+                }
+            }
+            if total <= RESCALE_THRESHOLD / 2 + 5 && ones > 1 {
+                rescaled = true;
+            }
+        }
+        assert!(rescaled, "rescale must have fired within the run");
+    }
+
+    /// A pure-zeros stream pushes P(1) toward the floor but never to 0 —
+    /// the rescale clamps `ones >= 1`.
+    #[test]
+    fn estimator_floor_on_all_zeros() {
+        let mut m = ContextModel::new();
+        for _ in 0..2000 {
+            m.observe(5, 0);
+            let (ones, total) = m.probability(5);
+            assert!(ones >= 1, "ones floored at 1");
+            assert!(ones < total, "P(1) strictly below 1");
+        }
+    }
 
     #[test]
     fn significance_context_all_zero() {

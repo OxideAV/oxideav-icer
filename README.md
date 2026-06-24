@@ -24,6 +24,7 @@ cross-checked.
 | Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
+| Probability estimator    | full (IPN 42-155 §III.C MER implementation: initial counts 2/4, rescale when total reaches 500, round-toward-1/2 on the halving) |
 | Context model            | full (IPN 42-155 §III.B; 9 significance + 5 sign + 3 refinement contexts) |
 | Per-subband context tables | full (IPN 42-155 §III.B **Table 6** LL/LH/HL + **Table 7** HH, keyed on the full `(h, v, d)` neighbour counts, with the **HL context-template transpose** + matching Table 8 sign transpose; the bit-plane scanner is subband-aware via `priority::classify_position`, dispatching the correct table per coefficient -- see "Per-subband context tables" below) |
 | Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
@@ -358,9 +359,14 @@ to "the implementation":
 * The **literal sync-prefix value** (§IV mentions "self-synchronising prefix"
   but doesn't pin a 16-bit value). This crate accepts any non-zero 16-bit
   prefix and surfaces it via `SegmentHeader::sync_prefix`.
-* The **probability estimator window size** for the adaptive arithmetic coder
-  (§III.C says "windowed counting"; window size unspecified). This crate uses
-  64.
+* The **probability estimator window size** for the adaptive arithmetic coder.
+  *Resolved (r365).* §III.C's MER implementation in fact pins the values:
+  "the initial counts of zeros are set to 2, the initial total counts are set
+  to 4, and rescaling is triggered when the total count reaches 500." The
+  estimator now uses exactly these (`INITIAL_ONES = 2`, `INITIAL_TOTAL = 4`,
+  `RESCALE_THRESHOLD = 500`), with the rescale rounding chosen "in the
+  direction that makes the probability estimate closer to 1/2" per §III.C.
+  (The round-1 placeholder used a 64-symbol window.)
 * The **per-subband significance context tables** (§III.B Table 6 for
   LL/LH/HL and Table 7 for HH, plus the HL context-template transpose).
   **Resolved (r365).** The bit-plane scanner is now subband-aware: each

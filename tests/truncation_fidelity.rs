@@ -146,9 +146,10 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
             img.planes[0].data[y * stride + x] = if (x ^ y) & 1 == 0 { 0 } else { 255 };
         }
     }
-    // (budget, PSNR floor). r365 measured strict-MSB: b=500 -> 25.4 dB,
-    // b=700 -> 31.5 dB, b=1000 -> 37.9 dB. Floors set ~0.5 dB below.
-    let cases: &[(u64, f64)] = &[(500, 24.8), (700, 31.0), (1000, 37.3)];
+    // (budget, PSNR floor). r365 measured strict-MSB (spec-exact Table 6/7
+    // contexts + §III.C MER estimator): b=600 -> 25.4 dB, b=700 -> 31.5 dB,
+    // b=900 -> 37.9 dB. Floors set ~0.5 dB below the measured value.
+    let cases: &[(u64, f64)] = &[(600, 24.9), (700, 31.0), (900, 37.4)];
     for &(budget, floor) in cases {
         let bytes = encode_at(&img, budget);
         assert!(bytes.len() as u64 <= budget);

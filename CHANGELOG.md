@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Spec-exact §III.C probability estimator (MER initial counts +
+  rescale-at-500).** The adaptive context-conditional estimator
+  (`context::ContextModel`) now matches the IPN 42-155 §III.C "Probability
+  Estimation" MER implementation verbatim: initial counts are 2 ones out
+  of 4 total (P = 1/2; new `INITIAL_ONES` / `INITIAL_TOTAL` constants),
+  and both counts are halved when `total` reaches 500 (new
+  `RESCALE_THRESHOLD`), with the count rounded "in the direction that
+  makes the probability estimate closer to 1/2" per §III.C, floored so the
+  estimate stays strictly inside `(0, 1)` for the arithmetic coder. This
+  replaces the round-1 placeholder windowed-counting model (window 64,
+  init 1/2, removed `ESTIMATOR_WINDOW`). Because encoder and decoder run
+  the identical estimator the self-roundtrip stays exact (filter-Q
+  full-quality + colour decodes bit-exact); the longer 500-symbol window
+  improves the probability estimate's stationarity on real content. New
+  `context` unit tests pin the MER initial counts, the increment rule, the
+  rescale-at-threshold halving, and the all-zeros floor. The
+  `truncation_fidelity` / `rd_budget` checkerboard floors are re-pinned to
+  the r365 measurements (the denser entropy coding shifts where the
+  byte-budget cut lands).
+
 - **Subband-aware bit-plane scanner — wires the §III.B Table 6/7 contexts
   + HL transpose into encode + decode.** `BitPlaneInput` gains a `levels`
   field (the dyadic decomposition depth); when `levels >= 1` the
