@@ -334,12 +334,19 @@ follow-on.
 
 ## What is *not* implemented
 
-* **Real-world bitstream interop**. The context model now uses the IPN 42-155
-  §III.B classification scheme, but the exact pattern-to-context index
-  mapping and the exact probability estimator window size are not published
-  in the paper. This crate implements a clean-room interpretation; the
-  self-roundtrip is correct but may not be bit-equivalent to real Mars-rover
-  ICER files.
+* **Real-world bitstream interop**. The context model now follows IPN 42-155
+  §III.B / §III.C exactly — the Table 6/7 per-subband significance contexts
+  with the HL transpose, the Table 8 sign prediction, the four-category
+  magnitude scheme, and the §III.C MER probability estimator (2/4 init,
+  rescale at 500). Two clean-room interpretations remain that can affect
+  bit-equivalence with real Mars-rover ICER files: (a) §III.B's "neighbours
+  from the same subband segment" is approximated by spatial-raster neighbours
+  in the Mallat-interleaved buffer (the encoder and decoder share the same
+  neighbour function, so the self-roundtrip stays exact); and (b) §IV's
+  **interleaved entropy coder** is realised here with a standard
+  Witten-Neal-Cleary binary arithmetic coder rather than the bin-interleaved
+  variable-to-variable-length coder §IV describes. The self-roundtrip is
+  correct but is not guaranteed bit-equivalent to JPL ICER output.
 * **Per-filter lifting coefficients** -- *resolved by the staged spec.* The
   IPN 42-155 §II.A Table 1 parameters for all seven filters (A-F + Q) are now
   transcribed in `wavelet_int`; the legacy float path's CDF 9/7 + Daubechies +
