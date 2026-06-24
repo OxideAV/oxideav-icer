@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Spec-exact IPN 42-155 §III.B per-subband significance context tables
+  (Table 6 + Table 7) with the HL context-template transpose.** New pure
+  functions in `context` (re-exported at the crate root):
+  `neighbour_counts(pattern) -> (h, v, d)` decodes the packed 8-neighbour
+  significance pattern into the full horizontal / vertical / diagonal
+  counts (`h, v in 0..=2`, `d in 0..=4`) the spec tables index by;
+  `significance_context_table6(h, v, d)` is the §III.B **Table 6** grid
+  (LL / LH / HL subbands); `significance_context_table7(h, v, d)` is the
+  §III.B **Table 7** grid (HH subbands, indexed by `h + v` and `d`);
+  `significance_context_subband(h, v, d, is_hh, is_hl)` dispatches between
+  the two tables and applies the §III.B **HL transpose** (swap the roles
+  of `h` and `v` before the Table 6 lookup). `sign_context_subband` /
+  `sign_prediction_flip_subband` apply the matching HL axis-swap to the
+  §III.B Table 8 sign prediction. Every published Table 6 / Table 7 cell
+  is pinned by a unit test, plus the transpose, the range invariant, and
+  the neighbour-count decode. These close the long-documented gap that the
+  scanner shipped the collapsed H/V/D classification uniformly rather than
+  the subband-specific Table 6/7 indices + the HL transpose; the next
+  commit wires them into a subband-aware bit-plane scanner.
+
 ### Changed
 
 - **Spec-exact IPN 42-155 §III.B four-category context model with

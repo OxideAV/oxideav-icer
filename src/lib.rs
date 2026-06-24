@@ -113,6 +113,10 @@ pub use analyze::{
     DistortionReport, ImageStats, DEFAULT_RD_CANDIDATES,
 };
 pub use bitplane::EncodedPacket;
+pub use context::{
+    neighbour_counts, sign_context_subband, sign_prediction_flip_subband,
+    significance_context_subband, significance_context_table6, significance_context_table7,
+};
 pub use decoder::{
     decode_uncompressed_icer, parse_icer, parse_icer_lenient, parse_icer_lenient_with_limits,
     parse_icer_metadata, parse_icer_metadata_with_limits, parse_icer_with_limits, DecodeLimits,

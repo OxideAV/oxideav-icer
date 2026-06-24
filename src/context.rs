@@ -177,6 +177,128 @@ pub fn significance_context(pattern: u8) -> usize {
     }
 }
 
+/// Count the horizontally / vertically / diagonally significant
+/// neighbours from the packed 8-neighbour pattern documented in
+/// [`significance_context`] (NW=bit0, N=bit1, NE=bit2, W=bit3, E=bit4,
+/// SW=bit5, S=bit6, SE=bit7).
+///
+/// Returns `(h, v, d)` where:
+///   * `h` = number of horizontally adjacent significant pixels (W, E),
+///     in `0..=2`;
+///   * `v` = number of vertically adjacent significant pixels (N, S),
+///     in `0..=2`;
+///   * `d` = number of diagonally adjacent significant pixels
+///     (NW, NE, SW, SE), in `0..=4`.
+///
+/// This is the `(h, v, d)` triple IPN 42-155 §III.B Tables 6 and 7 are
+/// indexed by. Unlike [`significance_context`] (which collapses V and D
+/// to a binary "0 / 1+"), the spec tables key on the full counts, so the
+/// scanner must pass the exact counts here.
+#[inline]
+pub fn neighbour_counts(pattern: u8) -> (u8, u8, u8) {
+    let h = (pattern & 0b0001_1000).count_ones() as u8; // W(bit3) + E(bit4)
+    let v = (pattern & 0b0100_0010).count_ones() as u8; // N(bit1) + S(bit6)
+    let d = (pattern & 0b1010_0101).count_ones() as u8; // NW/NE/SW/SE
+    (h, v, d)
+}
+
+/// IPN 42-155 §III.B **Table 6** — significance context (category 0) for
+/// **LL, LH, and HL** subbands as a function of `(h, v, d)`, with `h` =
+/// horizontally-significant count (0, 1, 2), `v` = vertically-significant
+/// count (0, 1, 2), `d` = diagonally-significant count (0..4).
+///
+/// The published Table 6 grid (rows `d = 0`, `d = 1`, `d >= 2`; columns
+/// `h = 0 {v=0,v=1,v=2}`, `h = 1 {v=0,v>0}`, `h = 2`):
+///
+/// |       | h=0,v=0 | h=0,v=1 | h=0,v=2 | h=1,v=0 | h=1,v>0 | h=2 |
+/// |-------|--------:|--------:|--------:|--------:|--------:|----:|
+/// | d=0   |    0    |    3    |    4    |    5    |    7    |  8  |
+/// | d=1   |    1    |    3    |    4    |    6    |    7    |  8  |
+/// | d>=2  |    2    |    3    |    4    |    7    |    7    |  8  |
+///
+/// For an **HL** subband the §III.B context template is transposed: the
+/// roles of `h` and `v` are reversed before indexing this table. The
+/// caller performs that swap (see [`significance_context_subband`]); this
+/// function always indexes with the post-transpose `(h, v, d)`.
+pub fn significance_context_table6(h: u8, v: u8, d: u8) -> usize {
+    // Column selection from (h, v), then row selection from d.
+    // The three d-rows differ only in the (h=0,v=0) and (h=1,v=0) cells;
+    // every other cell is constant across d.
+    match (h, v) {
+        (0, 0) => match d {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        },
+        (0, 1) => 3,
+        (0, _) => 4, // v >= 2
+        (1, 0) => match d {
+            0 => 5,
+            1 => 6,
+            _ => 7,
+        },
+        (1, _) => 7, // h = 1, v > 0
+        _ => 8,      // h >= 2
+    }
+}
+
+/// IPN 42-155 §III.B **Table 7** — significance context (category 0) for
+/// **HH** subbands as a function of `h + v` and `d`. HH subbands have no
+/// preferred orientation, so the horizontal and vertical counts are summed
+/// before indexing:
+///
+/// | d    | h+v=0 | h+v=1 | h+v>=2 |
+/// |------|------:|------:|-------:|
+/// | d=0  |   0   |   1   |   2    |
+/// | d=1  |   3   |   4   |   5    |
+/// | d=2  |   6   |   7   |   7    |
+/// | d>=3 |   8   |   8   |   8    |
+pub fn significance_context_table7(h: u8, v: u8, d: u8) -> usize {
+    let hv = h + v;
+    match d {
+        0 => match hv {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        },
+        1 => match hv {
+            0 => 3,
+            1 => 4,
+            _ => 5,
+        },
+        2 => match hv {
+            0 => 6,
+            _ => 7,
+        },
+        _ => 8, // d >= 3
+    }
+}
+
+/// Spec-exact §III.B category-0 significance context, dispatching on the
+/// subband type and applying the **HL context-template transpose**.
+///
+/// IPN 42-155 §III.B: "If the subband being encoded is not an HL subband,
+/// then let `h` be the number of horizontally adjacent significant pixels
+/// ... For an HL subband, the roles of `h` and `v` are reversed,
+/// effectively transposing the context template. Given `h`, `v`, and `d`,
+/// the context is assigned according to Table 6 if the subband is not an
+/// HH subband; otherwise ... Table 7."
+///
+/// `(h, v, d)` are the raw neighbour counts from [`neighbour_counts`]
+/// (un-transposed). `is_hh` selects Table 7 over Table 6; `is_hl` requests
+/// the `h`/`v` swap before the Table 6 lookup. (HH subbands sum `h + v`,
+/// so the transpose is a no-op there and `is_hl` is ignored when `is_hh`.)
+pub fn significance_context_subband(h: u8, v: u8, d: u8, is_hh: bool, is_hl: bool) -> usize {
+    if is_hh {
+        significance_context_table7(h, v, d)
+    } else if is_hl {
+        // Transpose the context template: swap horizontal / vertical roles.
+        significance_context_table6(v, h, d)
+    } else {
+        significance_context_table6(h, v, d)
+    }
+}
+
 /// Sign-context lookup per IPN 42-155 §III.B **Table 8**.
 ///
 /// ICER uses the two horizontally adjacent (W, E) and the two vertically
@@ -211,6 +333,37 @@ pub fn sign_prediction_flip(h_pattern: u8, v_pattern: u8) -> bool {
     let h = axis_sign_sum(h_pattern);
     let v = axis_sign_sum(v_pattern);
     sign_table8(h, v).0
+}
+
+/// HL-transpose-aware sign context (IPN 42-155 §III.B Table 8).
+///
+/// §III.B: "ICER uses the two horizontally adjacent and the two
+/// vertically adjacent pixels to determine both the sign estimate and the
+/// context. If the subband is not an HL subband, let `h1` and `h2`
+/// represent the signs ... of the two horizontally adjacent pixels ...
+/// For the HL subband, the roles of the `h`'s and `v`'s are again
+/// reversed."
+///
+/// `(h_pattern, v_pattern)` are the raw axis neighbour patterns (see
+/// [`sign_context`]); `is_hl` swaps the two axes before indexing Table 8.
+pub fn sign_context_subband(h_pattern: u8, v_pattern: u8, is_hl: bool) -> usize {
+    let (hp, vp) = if is_hl {
+        (v_pattern, h_pattern)
+    } else {
+        (h_pattern, v_pattern)
+    };
+    sign_context(hp, vp)
+}
+
+/// HL-transpose-aware sign-prediction flip (IPN 42-155 §III.B Table 8).
+/// See [`sign_context_subband`] for the axis-swap rule.
+pub fn sign_prediction_flip_subband(h_pattern: u8, v_pattern: u8, is_hl: bool) -> bool {
+    let (hp, vp) = if is_hl {
+        (v_pattern, h_pattern)
+    } else {
+        (h_pattern, v_pattern)
+    };
+    sign_prediction_flip(hp, vp)
 }
 
 /// IPN 42-155 §III.B Table 8 — `(predicted_sign_is_negative, context)`
@@ -373,6 +526,151 @@ mod tests {
         assert!(!sign_prediction_flip(pos, neg));
         assert_eq!(sign_context(neg, pos), 14);
         assert!(sign_prediction_flip(neg, pos));
+    }
+
+    /// IPN 42-155 §III.B **Table 6** — every published cell, indexed by
+    /// `(h, v, d)`. The grid only varies with `d` in the `(h=0,v=0)` and
+    /// `(h=1,v=0)` columns; the others are flat across `d`.
+    #[test]
+    fn table6_all_cells() {
+        // (h, v, d_class) -> expected context. d_class: 0 -> d=0,
+        // 1 -> d=1, 2 -> d>=2 (probe d=2 and d=4).
+        let cells: &[(u8, u8, u8, usize)] = &[
+            // h=0, v=0: 0 / 1 / 2 down the d rows.
+            (0, 0, 0, 0),
+            (0, 0, 1, 1),
+            (0, 0, 2, 2),
+            (0, 0, 4, 2),
+            // h=0, v=1: always 3.
+            (0, 1, 0, 3),
+            (0, 1, 1, 3),
+            (0, 1, 4, 3),
+            // h=0, v=2: always 4.
+            (0, 2, 0, 4),
+            (0, 2, 3, 4),
+            // h=1, v=0: 5 / 6 / 7 down the d rows.
+            (1, 0, 0, 5),
+            (1, 0, 1, 6),
+            (1, 0, 2, 7),
+            (1, 0, 4, 7),
+            // h=1, v>0: always 7.
+            (1, 1, 0, 7),
+            (1, 2, 2, 7),
+            // h=2: always 8.
+            (2, 0, 0, 8),
+            (2, 1, 1, 8),
+            (2, 2, 4, 8),
+        ];
+        for &(h, v, d, expect) in cells {
+            assert_eq!(
+                significance_context_table6(h, v, d),
+                expect,
+                "Table 6 cell (h={h}, v={v}, d={d})"
+            );
+        }
+    }
+
+    /// IPN 42-155 §III.B **Table 7** — every published cell, indexed by
+    /// `(h + v)` and `d`.
+    #[test]
+    fn table7_all_cells() {
+        // (h, v, d, expected). h+v drives the column.
+        let cells: &[(u8, u8, u8, usize)] = &[
+            // d=0: 0 / 1 / 2.
+            (0, 0, 0, 0),
+            (1, 0, 0, 1),
+            (0, 1, 0, 1),
+            (2, 0, 0, 2),
+            (1, 1, 0, 2),
+            // d=1: 3 / 4 / 5.
+            (0, 0, 1, 3),
+            (1, 0, 1, 4),
+            (2, 0, 1, 5),
+            // d=2: 6 / 7 / 7.
+            (0, 0, 2, 6),
+            (1, 0, 2, 7),
+            (2, 0, 2, 7),
+            // d>=3: always 8.
+            (0, 0, 3, 8),
+            (1, 0, 4, 8),
+            (2, 0, 4, 8),
+        ];
+        for &(h, v, d, expect) in cells {
+            assert_eq!(
+                significance_context_table7(h, v, d),
+                expect,
+                "Table 7 cell (h={h}, v={v}, d={d})"
+            );
+        }
+    }
+
+    /// The HL context-template transpose swaps `h` and `v` before the
+    /// Table 6 lookup, while LL / LH use the counts as-is.
+    #[test]
+    fn hl_transpose_swaps_h_and_v() {
+        // (h=1, v=0, d=0) -> Table 6 cell 5; transposed (h<->v) it becomes
+        // (h=0, v=1, d=0) -> cell 3.
+        let (h, v, d) = (1u8, 0u8, 0u8);
+        assert_eq!(
+            significance_context_subband(h, v, d, false, false),
+            5,
+            "LH/LL"
+        );
+        assert_eq!(significance_context_subband(h, v, d, false, true), 3, "HL");
+        // HH ignores the transpose flag and sums h+v.
+        assert_eq!(
+            significance_context_subband(h, v, d, true, true),
+            significance_context_table7(h, v, d)
+        );
+        assert_eq!(
+            significance_context_subband(h, v, d, true, false),
+            significance_context_table7(h, v, d)
+        );
+    }
+
+    /// Every `(h, v, d)` in the valid ranges produces a context in
+    /// `0..=8` for both tables and both transpose settings.
+    #[test]
+    fn subband_contexts_in_range() {
+        for h in 0..=2u8 {
+            for v in 0..=2u8 {
+                for d in 0..=4u8 {
+                    for is_hh in [false, true] {
+                        for is_hl in [false, true] {
+                            let c = significance_context_subband(h, v, d, is_hh, is_hl);
+                            assert!(c <= 8, "ctx {c} out of range for ({h},{v},{d})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `neighbour_counts` decodes the packed 8-neighbour pattern into
+    /// the `(h, v, d)` triple the spec tables index by.
+    #[test]
+    fn neighbour_counts_decode() {
+        // W(bit3) + E(bit4) -> h=2; N(bit1) -> v=1; NW(bit0)+SE(bit7) -> d=2.
+        let pat = 0b1001_1011u8;
+        let (h, v, d) = neighbour_counts(pat);
+        assert_eq!((h, v, d), (2, 1, 2));
+        // All neighbours set: h=2, v=2, d=4.
+        assert_eq!(neighbour_counts(0xFF), (2, 2, 4));
+        // None set.
+        assert_eq!(neighbour_counts(0), (0, 0, 0));
+    }
+
+    /// The HL sign transpose swaps the two sign-axis patterns before the
+    /// Table 8 lookup; non-HL subbands leave them in place.
+    #[test]
+    fn hl_sign_transpose() {
+        // h>0, v=0 -> +,15 (no flip); transposed it is h=0,v>0 -> -,13.
+        let pos = 0b0001u8; // axis significant, positive
+        let zero = 0u8;
+        assert_eq!(sign_context_subband(pos, zero, false), 15);
+        assert!(!sign_prediction_flip_subband(pos, zero, false));
+        assert_eq!(sign_context_subband(pos, zero, true), 13);
+        assert!(sign_prediction_flip_subband(pos, zero, true));
     }
 
     #[test]
