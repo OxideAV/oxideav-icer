@@ -16,11 +16,15 @@
 //!   in [`wavelet_float::forward_2d`] / [`wavelet_float::inverse_2d`].
 //!   Filter G (Le Gall 5/3 float variant) completes the full A-G set.
 //! * **Binary arithmetic coder + context model** -- registers, range
-//!   renormalisation, follow-bit handling, adaptive Laplace-windowed
-//!   probability estimator. (See [`arith`] + [`context`].)
-//! * **Real JPL significance context table** -- the IPN 42-155 §III.B
-//!   H/V/D neighbour-count classification (9 contexts) replaces the
-//!   round-2 popcount placeholder. Sign-flip convention per §III.B.
+//!   renormalisation, follow-bit handling, and the IPN 42-155 §III.C MER
+//!   probability estimator (initial counts 2/4, rescale when the total
+//!   reaches 500). (See [`arith`] + [`context`].)
+//! * **Spec-exact §III.B significance contexts** -- the subband-aware
+//!   IPN 42-155 §III.B Table 6 (LL/LH/HL) / Table 7 (HH) context
+//!   assignment, with the HL context-template transpose; the bit-plane
+//!   scanner resolves each coefficient's subband via
+//!   [`priority::classify_position`]. Sign contexts follow §III.B Table 8
+//!   (with the HL sign transpose).
 //! * **Stripe-ordered scan** -- bit-plane scanner processes coefficients
 //!   in horizontal stripes of height `STRIPE_HEIGHT` (4 rows, IPN
 //!   42-155 §III.B) to maximise context-pattern locality.
