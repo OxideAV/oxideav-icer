@@ -130,6 +130,13 @@ pub struct SegmentHeader {
     /// including the LSB. Capped at 32 (the encoder's accumulator
     /// width).
     pub bit_plane_count: u8,
+    /// Which entropy backend coded this segment's packet bodies
+    /// (IPN 42-155 §IV). `false` = the binary arithmetic coder (the
+    /// crate's original wire form); `true` = the spec-exact §IV
+    /// interleaved entropy coder. Carried in the high bit of byte 7's
+    /// previously-reserved 2-bit field, so every pre-existing stream
+    /// (reserved = 0) parses as `false` unchanged.
+    pub interleaved_entropy: bool,
     /// Total compressed body size of this segment in bytes — does not
     /// include the segment header itself. Used by the demuxer / packet
     /// walker to skip past a segment whose interior it can't (yet)
@@ -180,12 +187,14 @@ impl SegmentHeader {
             return Err(IcerError::invalid("segment dimensions cannot be zero"));
         }
 
-        // Byte 7: 6 bits bit-plane Q (top), 2 bits reserved (bottom).
+        // Byte 7: 6 bits bit-plane Q (top), 1 bit entropy backend, 1 bit
+        // reserved (bottom).
         let bit_plane_count = bytes[7] >> 2;
-        let reserved = bytes[7] & 0b0000_0011;
+        let interleaved_entropy = (bytes[7] & 0b0000_0010) != 0;
+        let reserved = bytes[7] & 0b0000_0001;
         if reserved != 0 {
             return Err(IcerError::invalid(format!(
-                "reserved bits in byte 7 must be zero, got {reserved:#04b}"
+                "reserved bit in byte 7 must be zero, got {reserved:#04b}"
             )));
         }
         if bit_plane_count == 0 || bit_plane_count > 32 {
@@ -209,6 +218,7 @@ impl SegmentHeader {
                 width,
                 height,
                 bit_plane_count,
+                interleaved_entropy,
                 segment_length,
                 segment_index,
             },
@@ -228,7 +238,9 @@ impl SegmentHeader {
         out[2] = (filter_bits << 4) | (levels_bits << 1) | uncompressed_bit;
         out[3..5].copy_from_slice(&self.width.to_be_bytes());
         out[5..7].copy_from_slice(&self.height.to_be_bytes());
-        out[7] = self.bit_plane_count << 2; // reserved bits stay zero
+        // Byte 7: Q in the top 6 bits, entropy-backend flag in bit 1,
+        // reserved bit 0 stays zero.
+        out[7] = (self.bit_plane_count << 2) | (u8::from(self.interleaved_entropy) << 1);
         out[8..10].copy_from_slice(&self.segment_length.to_be_bytes());
         out[10..12].copy_from_slice(&self.segment_index.to_be_bytes());
         out

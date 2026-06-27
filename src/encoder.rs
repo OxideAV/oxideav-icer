@@ -20,7 +20,7 @@
 //!   * **Filter G** -- Le Gall 5/3 float variant; wired through both
 //!     encode and decode dispatch paths.
 
-use crate::bitplane::{encode_bitplanes, select_bit_plane_count, BitPlaneInput, EncodedPacket};
+use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
@@ -242,6 +242,14 @@ pub struct EncodeOptions {
     /// `None` (the default) preserves the pre-round-233 behaviour: no
     /// quality search, the caller's `byte_budget` (if any) governs.
     pub quality_target_psnr: Option<f32>,
+
+    /// Code each compressed segment's packet bodies with ICER's §IV
+    /// interleaved entropy coder instead of the binary arithmetic coder.
+    /// `false` (default) keeps the established arithmetic-coded wire form;
+    /// `true` emits the spec-exact §IV coder and sets the segment header's
+    /// entropy-backend flag so the decoder dispatches the matching
+    /// backend. No effect on the uncompressed §III.D path.
+    pub interleaved_entropy: bool,
 }
 
 impl Default for EncodeOptions {
@@ -266,6 +274,7 @@ impl Default for EncodeOptions {
             rd_pruning: false,
             auto_uncompressed_fallback: false,
             quality_target_psnr: None,
+            interleaved_entropy: false,
         }
     }
 }
@@ -446,6 +455,24 @@ impl EncodeOptions {
     pub fn with_quality_target(mut self, target_db: f32) -> Self {
         self.quality_target_psnr = Some(target_db);
         self
+    }
+
+    /// Code the compressed segments with ICER's §IV interleaved entropy
+    /// coder instead of the binary arithmetic coder. See
+    /// [`EncodeOptions::interleaved_entropy`].
+    #[must_use]
+    pub fn with_interleaved_entropy(mut self) -> Self {
+        self.interleaved_entropy = true;
+        self
+    }
+
+    /// The entropy backend this option set selects.
+    pub(crate) fn entropy_kind(&self) -> crate::entropy::EntropyKind {
+        if self.interleaved_entropy {
+            crate::entropy::EntropyKind::Interleaved
+        } else {
+            crate::entropy::EntropyKind::Arithmetic
+        }
     }
 }
 
@@ -792,6 +819,7 @@ fn emit_skipped_placeholders(
             width: w as u16,
             height: this_h as u16,
             bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+            interleaved_entropy: opts.interleaved_entropy && !opts.uncompressed,
             segment_length: 0,
             segment_index: seg_idx as u16,
         };
@@ -951,9 +979,12 @@ fn encode_one_segment_compressed(
         None
     };
     let packets = if let Some(weights) = &rd_weights {
+        // R-D weighting is only computed for the arithmetic backend's
+        // packet-selection path; the interleaved backend (a distinct wire
+        // form) is not combined with R-D pruning here.
         crate::bitplane::encode_bitplanes_weighted(&bp_input, Some(weights))?
     } else {
-        encode_bitplanes(&bp_input)?
+        crate::bitplane::encode_bitplanes_with(&bp_input, opts.entropy_kind())?
     };
 
     // Round 91: rate-distortion-driven packet selection (IPN 42-155
@@ -1158,6 +1189,7 @@ fn emit_segment_header_and_body(
         width: width as u16,
         height: height as u16,
         bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+        interleaved_entropy: opts.interleaved_entropy && !uncompressed,
         segment_length: segment_length as u16,
         segment_index,
     };
@@ -1446,6 +1478,7 @@ fn finish_segment(
         width: width as u16,
         height: height as u16,
         bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+        interleaved_entropy: opts.interleaved_entropy && !uncompressed,
         segment_length: segment_length as u16,
         segment_index,
     };

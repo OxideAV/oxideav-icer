@@ -133,6 +133,7 @@ fuzz_target!(|data: &[u8]| {
     let use_byte_budget = (opt_d & 0x10) != 0;
     let use_target_bytes = (opt_d & 0x20) != 0;
     let use_priorities = (opt_d & 0x40) != 0;
+    let interleaved_entropy = (opt_d & 0x80) != 0;
 
     // Budgets are derived from opt_e + opt_f so a fuzzer can drive the
     // encoder over the full "tiny-budget early-stop" through
@@ -172,6 +173,7 @@ fuzz_target!(|data: &[u8]| {
         rd_pruning,
         auto_uncompressed_fallback,
         quality_target_psnr: None,
+        interleaved_entropy,
     };
 
     // ---- Encode ------------------------------------------------------

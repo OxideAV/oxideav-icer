@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IPN 42-155 §IV interleaved entropy coder — spec-exact, selectable
+  encode/decode backend.** ICER's actual entropy stage is not arithmetic
+  coding; §IV specifies a bit-wise adaptable *interleaved entropy coder*.
+  The new `ixec` module implements it spec-exactly: the §IV.B Golomb codes
+  `G_m` (verified bit-for-bit against the Table 9 G5 listing), the §IV.D
+  shorthand-tree component codes for bins 2–8, the full Table 10 17-bin
+  design (probability cutoffs over the 65536 denominator + Golomb
+  assignments G5/G6/G7/G11/G17/G31/G70/G200/G512), and the §IV.C
+  interleaving machinery (MER 2048-word circular buffer, FIFO
+  front-of-list emission in word-creation order, the §IV.C flush of
+  partial words on buffer-full and end-of-stream, and the per-bin suffix
+  decode bookkeeping). A context-driven `IxecEncoder`/`IxecDecoder` wrap
+  it with the same `(symbol, p1_num, p1_den)` signature as the arithmetic
+  coder, applying the §IV.C `p0 >= 1/2` reduction (inverting the bit when
+  needed) to select the bin. The bit-plane significance/refinement/sign
+  passes are abstracted over a new `entropy::{BitSink, BitSource}` trait
+  surface so the identical §III.B pass logic drives either backend, and
+  `EncodeOptions::with_interleaved_entropy()` selects the §IV coder for a
+  full `encode_icer` → `parse_icer` round-trip. The choice is recorded in
+  a previously-reserved segment-header bit (byte 7 bit 1), so every
+  pre-existing arithmetic-coded stream parses unchanged and decodes
+  exactly as before. Filter-Q full-quality round-trips (Gray8 + colour +
+  multi-segment) are bit-exact through the interleaved coder; budget
+  truncation frames the full geometry identically. This resolves the
+  headline interop gap the README flagged (the §IV coder was previously a
+  Witten-Neal-Cleary stand-in). New unit + integration tests cover the
+  component-code bijections, a 2000-iteration randomised interleaver
+  round-trip, the bit-plane end-to-end path on both backends, and the
+  full pipeline.
+
 - **End-to-end fidelity regression coverage for the §III.B same-subband
   walk.** `truncation_fidelity` gains `same_subband_walk_shrinks_lossless_output`
   (filter-Q lossless byte ceilings on the diagonal-ramp and checkerboard

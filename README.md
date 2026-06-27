@@ -24,6 +24,7 @@ cross-checked.
 | Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
+| §IV interleaved entropy coder | full (IPN 42-155 §IV.B Golomb codes G_m + §IV.D shorthand-tree component codes + **Table 10** 17-bin design + §IV.C 2048-word circular-buffer interleaving with flush bits; a selectable encode/decode backend via `EncodeOptions::with_interleaved_entropy()`, recorded in a previously-reserved segment-header bit so old streams parse unchanged -- see "Interleaved entropy coder" below) |
 | Probability estimator    | full (IPN 42-155 §III.C MER implementation: initial counts 2/4, rescale when total reaches 500, round-toward-1/2 on the halving) |
 | Context model            | full (IPN 42-155 §III.B; 9 significance + 5 sign + 3 refinement contexts) |
 | Per-subband context tables | full (IPN 42-155 §III.B **Table 6** LL/LH/HL + **Table 7** HH, keyed on the full `(h, v, d)` neighbour counts, with the **HL context-template transpose** + matching Table 8 sign transpose; the bit-plane scanner is subband-aware via `priority::classify_position`, dispatching the correct table per coefficient, and gathers the **same-subband** neighbourhood at stride `2^level` (`priority::subband_stride`) per §III.B rather than the cross-subband spatial-raster cells -- see "Per-subband context tables" below) |
@@ -294,6 +295,66 @@ The win grows with the number of dropped bit planes (larger `∆`) and is purely
 a decode-side change -- the wire format is unchanged, so every previously-
 encoded stream decodes better with no re-encode.
 
+## Interleaved entropy coder (IPN 42-155 §IV)
+
+ICER's entropy stage is **not** arithmetic coding. §IV specifies a
+bit-wise adaptable *interleaved entropy coder*: a set of component
+variable-to-variable-length binary source codes, one per probability
+"bin", whose output codewords are interleaved into a single stream so the
+decoder reconstructs them in the order the encoder produced them. The
+`ixec` module implements it spec-exactly, built bottom-up:
+
+* **Component codes** (`ComponentCode`, §IV.B) — a bijection between a
+  prefix-free + exhaustive set of *input* codewords (source bits) and an
+  equally prefix-free + exhaustive set of *output* codewords (channel
+  bits). Encode parses one input codeword and emits its paired output;
+  decode reverses the roles.
+* **Golomb codes `G_m`** (§IV.B) — `m + 1` input codewords
+  `1, 01, …, 0^(m-1) 1, 0^m`, with the published output mapping
+  (`ℓ = ⌈log2 m⌉`, `i = 2^ℓ − m`; input `0^k 1` → the `ℓ`-bit binary of
+  `k` when `k < i`, else the `(ℓ+1)`-bit binary of `k + i`; `0^m` → a
+  single `1`). Verified bit-for-bit against the §IV.B **Table 9** G5
+  listing.
+* **Shorthand-tree codes** (§IV.D) — bins 2–8 are given as a decoding-tree
+  shorthand (each leaf an input codeword, the root-to-leaf branch path its
+  output codeword); the parser materialises the `(input, output)` pairs.
+* **Table 10's 17-bin design** (`bins()`) — bin 1 uncoded, bins 2–8 the
+  shorthand-tree codes, bins 9–17 `G5/G6/G7/G11/G17/G31/G70/G200/G512`,
+  each with its probability cutoff `z_j` over the fixed denominator
+  `2^16 = 65536`. `bin_for_probability` locates the bin for a
+  probability-of-zero estimate `p ≥ 1/2` by integer cross-multiplication.
+* **Interleaving machinery** (`InterleavedEncoder` / `InterleavedDecoder`,
+  §IV.C) — the MER **2048-word** circular buffer, FIFO front-of-list
+  emission that keeps the channel in word-creation order (the order the
+  decoder reconstructs in), the §IV.C flush of partial words when the
+  buffer fills or the input is exhausted, and the per-bin suffix
+  bookkeeping the decoder uses to reverse it.
+
+A context-driven `IxecEncoder` / `IxecDecoder` wraps the interleaver with
+the same `encode_bit(symbol, p1_num, p1_den)` / `decode_bit(...)`
+signature as the arithmetic coder, applying the §IV.C `p0 ≥ 1/2` reduction
+(inverting the bit when `p0 < 1/2`) before bin selection. The bit-plane
+significance / refinement / sign passes are written once against a
+`entropy::{BitSink, BitSource}` trait surface, so the identical §III.B
+pass logic — stripe order, contexts, the four-category scheme — drives
+either backend; only the per-packet entropy coding differs.
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_interleaved_entropy();         // code with the §IV coder
+let bytes = encode_icer(&image, &opts)?;
+let decoded = parse_icer(&bytes)?;       // decoder dispatches on the wire flag
+```
+
+The backend choice is recorded in a previously-reserved segment-header bit
+(byte 7, bit 1), so **every existing arithmetic-coded stream parses
+unchanged** (reserved = 0 ⇒ arithmetic) and decodes exactly as before; the
+default remains the arithmetic coder. Filter-Q full-quality round-trips
+(Gray8, colour 4:4:4, and multi-segment) are bit-exact through the
+interleaved coder, and a budget-truncated interleaved stream frames the
+full image geometry identically to the arithmetic path (progressive
+truncation is a property of the packet ordering, not the entropy stage).
+
 ## Subband priority model (IPN 42-155 §III.A)
 
 ICER does not finish one subband before starting the next: it
@@ -351,16 +412,22 @@ follow-on.
 
 ## What is *not* implemented
 
-* **Real-world bitstream interop**. The context model now follows IPN 42-155
+* **Real-world bitstream interop**. The context model follows IPN 42-155
   §III.B / §III.C exactly — the Table 6/7 per-subband significance contexts
   with the HL transpose, the Table 8 sign prediction, the four-category
   magnitude scheme, and the §III.C MER probability estimator (2/4 init,
-  rescale at 500). Two clean-room interpretations remain that can affect
-  bit-equivalence with real Mars-rover ICER files: §IV's
-  **interleaved entropy coder** is realised here with a standard
-  Witten-Neal-Cleary binary arithmetic coder rather than the bin-interleaved
-  variable-to-variable-length coder §IV describes. The self-roundtrip is
-  correct but is not guaranteed bit-equivalent to JPL ICER output.
+  rescale at 500). The §IV **interleaved entropy coder** is now implemented
+  spec-exactly (Table 10's 17-bin design, the §IV.B Golomb codes, the §IV.D
+  shorthand-tree component codes, and the §IV.C 2048-word circular-buffer
+  interleaving with flush bits) and is a selectable encode/decode backend
+  (`EncodeOptions::with_interleaved_entropy()`) — see "Interleaved entropy
+  coder" below. The crate still defaults to the Witten-Neal-Cleary binary
+  arithmetic coder for backward-compatible wire output; the remaining
+  interop unknown is the **bit ordering / packetisation conventions** of a
+  specific Mars-rover ICER build (the §IV component codes are pinned, but
+  the paper leaves the sync-prefix value and the exact packet framing to
+  "the implementation"), so neither backend is yet guaranteed
+  bit-equivalent to a particular JPL ICER file.
   (The earlier §III.B same-subband-neighbour approximation is **resolved** --
   see "Per-subband context tables" above; the scanner now walks the
   spec-exact same-subband neighbourhood.)

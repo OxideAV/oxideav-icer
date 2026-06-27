@@ -31,7 +31,7 @@
 //! to override the policy use [`parse_icer_with_limits`] /
 //! [`parse_icer_metadata_with_limits`].
 
-use crate::bitplane::{decode_bitplanes_multi, EncodedPacket};
+use crate::bitplane::EncodedPacket;
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
@@ -445,7 +445,19 @@ fn decode_compressed_segment_into(
                 delta_distortion: 0.0,
             })
             .collect();
-        decode_bitplanes_multi(&encoded_packets, width, height, q, levels)?
+        let kind = if walked.header.interleaved_entropy {
+            crate::entropy::EntropyKind::Interleaved
+        } else {
+            crate::entropy::EntropyKind::Arithmetic
+        };
+        crate::bitplane::decode_bitplanes_multi_with(
+            &encoded_packets,
+            width,
+            height,
+            q,
+            levels,
+            kind,
+        )?
     };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
     // Inverse level-shift + clamp to 0..=255.

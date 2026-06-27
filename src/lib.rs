@@ -136,6 +136,10 @@ pub use header::{
     WaveletFilter,
 };
 pub use image::{IcerImage, IcerPixelFormat, IcerPlane};
+pub use ixec::{
+    bin_for_probability, bins, Bin, ComponentCode, InterleavedDecoder, InterleavedEncoder,
+    IxecDecoder, IxecEncoder, BUFFER_WORDS,
+};
 pub use plane_container::{is_container, parse_container, ParsedContainer};
 pub use priority::{
     classify_position, encode_order, subband_weight_map, subbands, Subband, SubbandBitPlane,

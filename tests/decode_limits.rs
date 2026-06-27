@@ -28,6 +28,7 @@ fn synth_header(width: u16, height: u16, uncompressed: bool) -> Vec<u8> {
         width,
         height,
         bit_plane_count: 8,
+        interleaved_entropy: false,
         segment_length: 0,
         segment_index: 0,
     };

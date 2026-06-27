@@ -91,6 +91,7 @@ fn drive(data: &[u8]) -> bool {
     let auto_filter_rd = (opt_d & 0x02) != 0;
     let rd_pruning = (opt_d & 0x04) != 0;
     let auto_uncompressed_fallback = (opt_d & 0x08) != 0;
+    let interleaved_entropy = (opt_d & 0x80) != 0;
     let use_byte_budget = (opt_d & 0x10) != 0;
     let use_target_bytes = (opt_d & 0x20) != 0;
     let use_priorities = (opt_d & 0x40) != 0;
@@ -128,6 +129,7 @@ fn drive(data: &[u8]) -> bool {
         rd_pruning,
         auto_uncompressed_fallback,
         quality_target_psnr: None,
+        interleaved_entropy,
     };
 
     let encoded = match encode_icer(&img, &opts) {

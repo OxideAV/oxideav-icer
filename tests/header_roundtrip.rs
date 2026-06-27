@@ -16,21 +16,24 @@ fn segment_header_roundtrip_all_filters() {
     ] {
         for levels in 1..=6 {
             for uncompressed in [false, true] {
-                let h = SegmentHeader {
-                    sync_prefix: 0xACED,
-                    filter,
-                    decomp_levels: levels,
-                    uncompressed,
-                    width: 256,
-                    height: 192,
-                    bit_plane_count: 8,
-                    segment_length: 1234,
-                    segment_index: 0,
-                };
-                let enc = h.encode();
-                let (parsed, n) = SegmentHeader::parse(&enc).unwrap();
-                assert_eq!(n, SegmentHeader::ENCODED_BYTES);
-                assert_eq!(parsed, h);
+                for interleaved_entropy in [false, true] {
+                    let h = SegmentHeader {
+                        sync_prefix: 0xACED,
+                        filter,
+                        decomp_levels: levels,
+                        uncompressed,
+                        width: 256,
+                        height: 192,
+                        bit_plane_count: 8,
+                        interleaved_entropy,
+                        segment_length: 1234,
+                        segment_index: 0,
+                    };
+                    let enc = h.encode();
+                    let (parsed, n) = SegmentHeader::parse(&enc).unwrap();
+                    assert_eq!(n, SegmentHeader::ENCODED_BYTES);
+                    assert_eq!(parsed, h);
+                }
             }
         }
     }
@@ -113,6 +116,7 @@ fn walk_segment_with_two_packets() {
         width: 32,
         height: 16,
         bit_plane_count: 8,
+        interleaved_entropy: false,
         segment_length: packets_concat.len() as u16,
         segment_index: 0,
     };
