@@ -97,6 +97,7 @@ pub mod encoder;
 pub mod error;
 pub mod header;
 pub mod image;
+pub mod ixec;
 pub mod plane_container;
 pub mod priority;
 #[cfg(feature = "registry")]
