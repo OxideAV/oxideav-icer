@@ -835,6 +835,96 @@ impl<'a> InterleavedDecoder<'a> {
     }
 }
 
+/// Map a probability-of-*one* estimate `(p1_num, p1_den)` — the form the
+/// §III.C context model produces and the arithmetic coder consumes — to
+/// the §IV bin index plus a "bit was inverted" flag.
+///
+/// §IV.C requires the coded bit's probability-of-zero `p0 = 1 - p1` to be
+/// `>= 1/2`. When `p0 < 1/2` (i.e. `p1 > 1/2`) the source bit is inverted
+/// before coding so the bin always sees `p0 >= 1/2`; the same inversion
+/// is reproducible in the decoder. Returns `(bin_index, invert)` where
+/// `invert` is whether the coded bit is the *complement* of the source
+/// bit.
+fn bin_and_invert(p1_num: u32, p1_den: u32) -> (u8, bool) {
+    // Guard a degenerate denominator.
+    let den = p1_den.max(1);
+    let p1 = p1_num.min(den);
+    let p0 = den - p1; // probability-of-zero numerator over `den`.
+    if 2 * p0 >= den {
+        // p0 >= 1/2: code the bit as-is, p = p0.
+        (bin_for_probability(p0, den), false)
+    } else {
+        // p0 < 1/2: invert so the coded bit has probability-of-zero p1.
+        (bin_for_probability(p1, den), true)
+    }
+}
+
+/// Context-driven interleaved entropy *encoder* — a drop-in for
+/// [`crate::arith::ArithEncoder`] that codes via ICER's §IV interleaved
+/// coder instead of binary arithmetic coding.
+///
+/// `encode_bit(symbol, p1_num, p1_den)` takes the same probability-of-one
+/// estimate the arithmetic coder does. Internally it applies the §IV.C
+/// `p0 >= 1/2` reduction, selects the Table 10 bin, and feeds the
+/// (possibly inverted) bit to the [`InterleavedEncoder`].
+pub struct IxecEncoder {
+    inner: InterleavedEncoder,
+}
+
+impl IxecEncoder {
+    pub fn new() -> Self {
+        IxecEncoder {
+            inner: InterleavedEncoder::new(),
+        }
+    }
+
+    /// Encode one binary `symbol` (0 or 1) whose probability of being a
+    /// `1` is `p1_num / p1_den`.
+    pub fn encode_bit(&mut self, symbol: u8, p1_num: u32, p1_den: u32) {
+        let (bin, invert) = bin_and_invert(p1_num, p1_den);
+        let coded = if invert { symbol == 0 } else { symbol == 1 };
+        // The interleaver codes a bool where the bin's probability-of-zero
+        // applies to the `false` value, so the "zero" of the coded bit is
+        // `false`. We pass the coded source bit directly: `true` is a one.
+        self.inner.encode_bit(coded, bin);
+    }
+
+    /// Flush + return the channel byte stream.
+    pub fn finish(self) -> Vec<u8> {
+        self.inner.finish()
+    }
+}
+
+impl Default for IxecEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Context-driven interleaved entropy *decoder* — the inverse of
+/// [`IxecEncoder`], a drop-in for [`crate::arith::ArithDecoder`].
+pub struct IxecDecoder<'a> {
+    inner: InterleavedDecoder<'a>,
+}
+
+impl<'a> IxecDecoder<'a> {
+    pub fn new(channel: &'a [u8]) -> Self {
+        IxecDecoder {
+            inner: InterleavedDecoder::new(channel),
+        }
+    }
+
+    /// Decode one binary symbol given the same probability-of-one
+    /// estimate the encoder used.
+    pub fn decode_bit(&mut self, p1_num: u32, p1_den: u32) -> u8 {
+        let (bin, invert) = bin_and_invert(p1_num, p1_den);
+        let coded = self.inner.decode_bit(bin);
+        // Reverse the §IV.C inversion to recover the source bit.
+        let symbol = if invert { !coded } else { coded };
+        symbol as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,5 +1207,93 @@ mod tests {
         // or pure padding.
         assert!(channel.len() <= 1);
         let _dec = InterleavedDecoder::new(&channel);
+    }
+
+    #[test]
+    fn bin_and_invert_reduction() {
+        // p1 = 1/2 -> p0 = 1/2 >= 1/2, no inversion, bin 1.
+        assert_eq!(bin_and_invert(1, 2), (1, false));
+        // p1 small -> p0 large -> high bin, no inversion.
+        let (bin, inv) = bin_and_invert(1, 100);
+        assert!(bin > 8 && !inv, "p0 = 99/100 -> high bin no inversion");
+        // p1 large -> p0 small (<1/2) -> invert, code with p = p1.
+        let (bin2, inv2) = bin_and_invert(99, 100);
+        assert!(inv2, "p1 = 99/100 -> invert");
+        assert_eq!(bin, bin2, "symmetric: same bin after inversion");
+    }
+
+    /// Round-trip the context-driven wrapper with a *fixed* per-bit
+    /// probability estimate (encoder + decoder must agree on the estimate
+    /// — in the codec both reproduce it from the §III.C model).
+    #[test]
+    fn ixec_fixed_probability_roundtrip() {
+        // A skewed source: mostly zeros, estimate p1 = 1/16.
+        let symbols: Vec<u8> = (0..500).map(|i| ((i * 37 + 5) % 16 == 0) as u8).collect();
+        let (p1n, p1d) = (1u32, 16u32);
+        let mut enc = IxecEncoder::new();
+        for &s in &symbols {
+            enc.encode_bit(s, p1n, p1d);
+        }
+        let channel = enc.finish();
+        let mut dec = IxecDecoder::new(&channel);
+        for (i, &s) in symbols.iter().enumerate() {
+            assert_eq!(dec.decode_bit(p1n, p1d), s, "symbol {i}");
+        }
+    }
+
+    /// Round-trip the wrapper driven by an *adaptive* estimate that both
+    /// sides reproduce from the decoded-so-far bits — the way the
+    /// bit-plane path uses the §III.C model. The estimate depends only on
+    /// previously coded symbols, so encoder and decoder stay in lockstep.
+    #[test]
+    fn ixec_adaptive_estimate_roundtrip() {
+        // A simple per-bit estimator: p1 = (ones_seen + 1) / (total + 2).
+        let symbols: Vec<u8> = (0..800)
+            .map(|i| (((i * 101 + 13) % 23) < 4) as u8)
+            .collect();
+
+        // Encode.
+        let mut enc = IxecEncoder::new();
+        let (mut ones, mut total) = (0u32, 0u32);
+        for &s in &symbols {
+            let p1n = ones + 1;
+            let p1d = total + 2;
+            enc.encode_bit(s, p1n, p1d);
+            ones += u32::from(s);
+            total += 1;
+        }
+        let channel = enc.finish();
+
+        // Decode, reproducing the same estimator from decoded bits.
+        let mut dec = IxecDecoder::new(&channel);
+        let (mut ones_d, mut total_d) = (0u32, 0u32);
+        for (i, &s) in symbols.iter().enumerate() {
+            let p1n = ones_d + 1;
+            let p1d = total_d + 2;
+            let got = dec.decode_bit(p1n, p1d);
+            assert_eq!(got, s, "symbol {i}");
+            ones_d += u32::from(got);
+            total_d += 1;
+        }
+    }
+
+    /// The interleaved coder should compress a skewed source below the
+    /// raw bit count (a sanity check that the entropy stage does work,
+    /// not just round-trip). A 1000-bit mostly-zeros source must pack to
+    /// well under 1000 bits.
+    #[test]
+    fn ixec_compresses_skewed_source() {
+        let symbols: Vec<u8> = (0..1000).map(|i| (i % 50 == 0) as u8).collect();
+        let mut enc = IxecEncoder::new();
+        for &s in &symbols {
+            enc.encode_bit(s, 1, 50); // p1 = 1/50 -> p0 = 49/50, high bin
+        }
+        let channel = enc.finish();
+        assert!(
+            channel.len() * 8 < symbols.len(),
+            "skewed source compressed: {} bytes for {} bits",
+            channel.len(),
+            symbols.len()
+        );
     }
 }
