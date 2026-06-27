@@ -143,6 +143,50 @@ fn interleaved_colour_bit_exact() {
     }
 }
 
+/// Feeding the interleaved decode path a stream whose packet bodies are
+/// garbage (header declares the interleaved backend, bodies are random)
+/// must never panic — it decodes *something* (a bounded reconstruction)
+/// or returns an error, but stays memory-safe. Guards the fuzz surface
+/// the new backend opens via `parse_icer`.
+#[test]
+fn interleaved_garbage_body_does_not_panic() {
+    // Build a legitimate interleaved stream, then corrupt every body byte.
+    let original = ramp_image(32, 32);
+    let opts = EncodeOptions::compressed().with_interleaved_entropy();
+    let mut bytes = encode_icer(&original, &opts).unwrap();
+    // Corrupt the payload after the 12-byte segment header.
+    let mut s = 0x1357u64;
+    for b in bytes.iter_mut().skip(SegmentHeader::ENCODED_BYTES) {
+        s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        *b = (s >> 40) as u8;
+    }
+    // Must not panic; either decodes a (garbage) image or errors cleanly.
+    let _ = parse_icer(&bytes);
+}
+
+/// On structured content the §IV interleaved coder compresses the
+/// significance/refinement bit stream — the lossless filter-Q output for
+/// a smooth ramp is well under the raw pixel count, just like the
+/// arithmetic backend.
+#[test]
+fn interleaved_compresses_structured_content() {
+    let original = ramp_image(64, 64);
+    let raw_pixels = 64 * 64;
+    let bytes = encode_icer(
+        &original,
+        &EncodeOptions::compressed().with_interleaved_entropy(),
+    )
+    .unwrap();
+    assert!(
+        bytes.len() < raw_pixels,
+        "interleaved filter-Q lossless ({} bytes) should beat the {raw_pixels}-byte raw image",
+        bytes.len()
+    );
+    // And it round-trips losslessly.
+    let decoded = parse_icer(&bytes).unwrap();
+    assert_eq!(decoded.planes[0].data, original.planes[0].data);
+}
+
 /// A budget-truncated interleaved-coded stream still decodes (lower
 /// quality) and frames the full geometry, exactly like the arithmetic
 /// path — progressive truncation is a property of the packet ordering,
