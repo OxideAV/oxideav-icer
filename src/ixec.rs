@@ -28,9 +28,18 @@
 //!   code. Bin 1 is the "uncoded" bin (each source bit is its own
 //!   complete input *and* output codeword).
 //!
-//! The interleaving machinery (the 2048-word circular buffer, flush
-//! bits, decode bookkeeping) lives in a later milestone; this module
-//! provides the verified component-code layer it builds on.
+//! * The **interleaving machinery** ([`InterleavedEncoder`] /
+//!   [`InterleavedDecoder`], §IV.C) — the MER 2048-word circular buffer
+//!   ([`BUFFER_WORDS`]), the FIFO front-of-list emission that keeps the
+//!   channel in creation order, the §IV.C flush of partial words when the
+//!   buffer fills or the input is exhausted, and the per-bin suffix
+//!   bookkeeping the decoder uses to reverse it. Encoder and decoder both
+//!   take the bin index per bit from the caller (in ICER that index comes
+//!   from the §III.C probability estimate, reproduced identically on both
+//!   sides).
+//!
+//! Wiring this coder in behind the context model — as an alternative to
+//! the existing binary arithmetic coder — is the next milestone.
 
 /// A variable-to-variable-length binary source code (IPN 42-155 §IV.B).
 ///
@@ -246,6 +255,60 @@ impl ComponentCode {
     /// of source bits a single `encode_one` can consume.
     pub fn max_input_len(&self) -> usize {
         self.pairs.iter().map(|(i, _)| i.len()).max().unwrap_or(0)
+    }
+
+    /// Look up the output codeword paired with a *complete* input
+    /// codeword `input`, or `None` if `input` is not a codeword.
+    fn output_for_input(&self, input: &[bool]) -> Option<&[bool]> {
+        self.pairs
+            .iter()
+            .find(|(i, _)| i.as_slice() == input)
+            .map(|(_, o)| o.as_slice())
+    }
+
+    /// Look up the input codeword paired with a *complete* output
+    /// codeword `output`, or `None`.
+    fn input_for_output(&self, output: &[bool]) -> Option<&[bool]> {
+        self.pairs
+            .iter()
+            .find(|(_, o)| o.as_slice() == output)
+            .map(|(i, _)| i.as_slice())
+    }
+
+    /// Classify a run of source bits against the *input* codeword set:
+    /// is `bits` exactly a codeword, a strict prefix of one or more, or
+    /// neither?
+    fn classify_input(&self, bits: &[bool]) -> InputStatus {
+        // Exact match?
+        if self.pairs.iter().any(|(i, _)| i.as_slice() == bits) {
+            return InputStatus::Complete;
+        }
+        // Strict prefix of some codeword?
+        if self
+            .pairs
+            .iter()
+            .any(|(i, _)| i.len() > bits.len() && i[..bits.len()] == *bits)
+        {
+            InputStatus::Partial
+        } else {
+            InputStatus::None
+        }
+    }
+
+    /// The §IV.C flush of a *partial* input prefix: the shortest input
+    /// codeword that has `prefix` as a prefix (ties broken by the order
+    /// the codewords appear). Returns that completed input codeword and
+    /// its paired output codeword. §IV.C: "the shortest output codeword
+    /// consistent with the bits already in the partial codeword".
+    ///
+    /// An empty `prefix` (no bits accumulated) has no codeword to flush;
+    /// callers only flush non-empty partials.
+    fn flush_partial(&self, prefix: &[bool]) -> Option<(Vec<bool>, Vec<bool>)> {
+        self.pairs
+            .iter()
+            .filter(|(i, _)| i.len() >= prefix.len() && i[..prefix.len()] == *prefix)
+            .min_by_key(|(_, o)| o.len())
+            .map(|(i, o)| (i.clone(), o.clone()))
     }
 
     /// The set of `(input, output)` pairs (for tests / inspection).
@@ -485,6 +548,293 @@ pub fn bin_for_probability(p_num: u32, p_den: u32) -> u8 {
     17
 }
 
+/// Classification of a run of source bits against a component code's
+/// input-codeword set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputStatus {
+    /// `bits` is exactly an input codeword.
+    Complete,
+    /// `bits` is a strict prefix of one or more input codewords.
+    Partial,
+    /// `bits` is neither a codeword nor a prefix (cannot happen for an
+    /// exhaustive prefix-free set fed valid bits).
+    None,
+}
+
+/// The MER circular-buffer capacity, in words (§IV.C.1: "the circular
+/// buffer has a capacity of 2048 words").
+pub const BUFFER_WORDS: usize = 2048;
+
+/// One in-flight word in the encoder's list: the bin it belongs to plus
+/// the input-codeword bits accumulated so far.
+#[derive(Debug, Clone)]
+struct Word {
+    bin: usize,
+    bits: Vec<bool>,
+    /// Set once `bits` is a complete input codeword for `bin`'s code.
+    complete: bool,
+}
+
+/// The interleaved entropy encoder (IPN 42-155 §IV.C.1 + §IV.D).
+///
+/// Source bits arrive one at a time, each with the index (1-based, as in
+/// Table 10) of the bin its probability estimate selected. The encoder
+/// groups bits of the same bin into input codewords, holds the
+/// partially- and fully-formed words in an ordered list (the MER
+/// circular buffer of [`BUFFER_WORDS`] words), and emits each word's
+/// output codeword when that word reaches the *front* of the list
+/// complete — preserving the order the decoder needs.
+pub struct InterleavedEncoder {
+    bins: Vec<Bin>,
+    /// Ordered word list (front = index 0). At most one *partial* word
+    /// per bin is open at a time (the most recent).
+    words: std::collections::VecDeque<Word>,
+    /// The emitted channel bits.
+    out: BitSink,
+}
+
+/// A growable MSB-first bit buffer that packs into bytes on `finish`.
+#[derive(Debug, Default)]
+struct BitSink {
+    bits: Vec<bool>,
+}
+
+impl BitSink {
+    fn push_bits(&mut self, bits: &[bool]) {
+        self.bits.extend_from_slice(bits);
+    }
+
+    /// Pack the accumulated bits MSB-first into bytes (zero-padding the
+    /// final partial byte). The interleaved decoder reads bits back in
+    /// the same MSB-first order and stops once every source bit is
+    /// recovered, so trailing pad bits are harmless.
+    fn into_bytes(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bits.len().div_ceil(8));
+        let mut cur = 0u8;
+        let mut n = 0u8;
+        for b in self.bits {
+            cur = (cur << 1) | (b as u8);
+            n += 1;
+            if n == 8 {
+                out.push(cur);
+                cur = 0;
+                n = 0;
+            }
+        }
+        if n != 0 {
+            out.push(cur << (8 - n));
+        }
+        out
+    }
+}
+
+impl InterleavedEncoder {
+    /// Build a fresh encoder over the Table 10 bin design.
+    pub fn new() -> Self {
+        InterleavedEncoder {
+            bins: bins(),
+            words: std::collections::VecDeque::new(),
+            out: BitSink::default(),
+        }
+    }
+
+    /// Encode one source bit assigned to bin `bin_index` (1-based).
+    ///
+    /// The bit is appended to the bin's open partial word (or starts a
+    /// new word at the tail of the list). If that word becomes a complete
+    /// input codeword it is flagged; then any complete words at the
+    /// *front* of the list are drained, emitting their output codewords.
+    /// A full buffer triggers a §IV.C flush of the front word.
+    pub fn encode_bit(&mut self, bit: bool, bin_index: u8) {
+        let bin = bin_index as usize - 1;
+        debug_assert!(bin < self.bins.len());
+
+        // Find this bin's open partial word (scanning from the back: the
+        // most-recent open word for the bin). A word stays "open" until
+        // it is complete.
+        let open = self
+            .words
+            .iter_mut()
+            .rev()
+            .find(|w| w.bin == bin && !w.complete);
+
+        match open {
+            Some(w) => {
+                w.bits.push(bit);
+                let status = self.bins[bin].code.classify_input(&w.bits);
+                if status == InputStatus::Complete {
+                    w.complete = true;
+                }
+            }
+            None => {
+                let mut bits = Vec::with_capacity(4);
+                bits.push(bit);
+                let complete = self.bins[bin].code.classify_input(&bits) == InputStatus::Complete;
+                self.words.push_back(Word {
+                    bin,
+                    bits,
+                    complete,
+                });
+            }
+        }
+
+        self.drain_front();
+
+        // §IV.C.1: if the buffer is full, flush the front (partial) word.
+        while self.words.len() >= BUFFER_WORDS {
+            self.flush_front();
+            self.drain_front();
+        }
+    }
+
+    /// Emit + remove every complete word at the front of the list.
+    fn drain_front(&mut self) {
+        while let Some(front) = self.words.front() {
+            if !front.complete {
+                break;
+            }
+            let front = self.words.pop_front().unwrap();
+            let out = self.bins[front.bin]
+                .code
+                .output_for_input(&front.bits)
+                .expect("complete word has an output codeword");
+            self.out.push_bits(out);
+        }
+    }
+
+    /// §IV.C.1 flush of the front word: complete its partial input
+    /// codeword with the shortest consistent output codeword, then drain.
+    fn flush_front(&mut self) {
+        let Some(front) = self.words.front().cloned() else {
+            return;
+        };
+        // The front is necessarily partial here (drain_front already
+        // removed any complete front). Flush it to a full codeword.
+        if let Some((full_input, _)) = self.bins[front.bin].code.flush_partial(&front.bits) {
+            if let Some(w) = self.words.front_mut() {
+                w.bits = full_input;
+                w.complete = true;
+            }
+        } else {
+            // No codeword extends the prefix (cannot happen for a valid
+            // exhaustive code); drop the word to guarantee progress.
+            self.words.pop_front();
+        }
+    }
+
+    /// Finish encoding: flush all remaining partial words (§IV.C.1
+    /// "flush bits also are used to complete all partial codewords
+    /// remaining in the list once the input bit sequence is exhausted"),
+    /// then pack to bytes. Returns the channel byte stream.
+    pub fn finish(mut self) -> Vec<u8> {
+        // Complete every word still in the list, front to back. A word
+        // that is already complete emits directly; a partial one is
+        // flushed to its shortest consistent codeword first. Mirrors the
+        // mid-stream FIFO drain so the channel emission order stays
+        // creation order (the order the decoder reconstructs in).
+        while !self.words.is_empty() {
+            let len_before = self.words.len();
+            if !self.words.front().unwrap().complete {
+                self.flush_front();
+            }
+            self.drain_front();
+            // Guard against a stuck front (only possible on a malformed
+            // code where `flush_partial` found no completion): if no word
+            // was removed this iteration, drop the front to guarantee
+            // termination.
+            if self.words.len() == len_before {
+                self.words.pop_front();
+            }
+        }
+        self.out.into_bytes()
+    }
+}
+
+impl Default for InterleavedEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The interleaved entropy decoder (IPN 42-155 §IV.C.2 + §IV.D).
+///
+/// The decoder keeps, per bin, a *suffix* of the next input codeword for
+/// that bin. To decode a source bit assigned to bin `j` it either pops
+/// the first bit of that bin's stored suffix, or — if the suffix is
+/// empty — parses one output codeword from the channel stream, maps it
+/// back to its input codeword, returns the input codeword's first bit,
+/// and stores the remainder as the new suffix.
+pub struct InterleavedDecoder<'a> {
+    bins: Vec<Bin>,
+    /// Channel bits (MSB-first) with a read cursor.
+    chan: &'a [u8],
+    bit_pos: usize,
+    /// Per-bin stored suffix of the in-progress input codeword.
+    suffix: Vec<std::collections::VecDeque<bool>>,
+}
+
+impl<'a> InterleavedDecoder<'a> {
+    /// Build a decoder over the channel byte stream produced by
+    /// [`InterleavedEncoder::finish`].
+    pub fn new(channel: &'a [u8]) -> Self {
+        let bins = bins();
+        let n = bins.len();
+        InterleavedDecoder {
+            bins,
+            chan: channel,
+            bit_pos: 0,
+            suffix: (0..n).map(|_| std::collections::VecDeque::new()).collect(),
+        }
+    }
+
+    /// Read the next channel bit (MSB-first), or `false` past the end
+    /// (trailing reads after the packed stream are pad bits — the caller
+    /// only decodes as many source bits as were encoded).
+    fn read_chan_bit(&mut self) -> bool {
+        let byte = self.bit_pos / 8;
+        if byte >= self.chan.len() {
+            return false;
+        }
+        let bit = (self.chan[byte] >> (7 - (self.bit_pos % 8))) & 1 == 1;
+        self.bit_pos += 1;
+        bit
+    }
+
+    /// Decode one source bit assigned to bin `bin_index` (1-based).
+    pub fn decode_bit(&mut self, bin_index: u8) -> bool {
+        let bin = bin_index as usize - 1;
+        if self.suffix[bin].is_empty() {
+            // Reconstruct one input codeword by parsing an output
+            // codeword from the channel (§IV.C.2).
+            let input = self.parse_input_codeword(bin);
+            for b in input {
+                self.suffix[bin].push_back(b);
+            }
+        }
+        // The first remaining bit of the suffix is the decoded bit.
+        self.suffix[bin].pop_front().unwrap_or(false)
+    }
+
+    /// Parse one output codeword from the channel and return its paired
+    /// input codeword (§IV.C.2). Reads channel bits until the output
+    /// trie recognises a complete output codeword.
+    fn parse_input_codeword(&mut self, bin: usize) -> Vec<bool> {
+        let mut acc: Vec<bool> = Vec::with_capacity(4);
+        loop {
+            acc.push(self.read_chan_bit());
+            if let Some(input) = self.bins[bin].code.input_for_output(&acc) {
+                return input.to_vec();
+            }
+            // Safety bound: no output codeword in Table 10 exceeds a
+            // small length; a runaway means the channel is exhausted /
+            // corrupt, so stop.
+            if acc.len() > 64 {
+                return vec![false];
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +1001,121 @@ mod tests {
         assert_eq!(o1, bits("1"));
         let (i0, _) = c.decode_one(&bits("0")).unwrap();
         assert_eq!(i0, bits("0"));
+    }
+
+    /// Round-trip the interleaved coder over a fixed (bit, bin) stream:
+    /// encode, then decode with the identical per-bit bin assignment, and
+    /// recover every source bit exactly (§IV.C end-to-end).
+    fn roundtrip(stream: &[(bool, u8)]) {
+        let mut enc = InterleavedEncoder::new();
+        for &(b, j) in stream {
+            enc.encode_bit(b, j);
+        }
+        let channel = enc.finish();
+        let mut dec = InterleavedDecoder::new(&channel);
+        for (idx, &(b, j)) in stream.iter().enumerate() {
+            let got = dec.decode_bit(j);
+            assert_eq!(got, b, "bit {idx} bin {j}: decoded {got} != source {b}");
+        }
+    }
+
+    #[test]
+    fn interleave_uncoded_bin_roundtrip() {
+        // Bin 1 (uncoded): identity, so the channel mirrors the source.
+        let stream: Vec<(bool, u8)> = (0..40).map(|i| ((i * 7 + 3) % 5 < 2, 1u8)).collect();
+        roundtrip(&stream);
+    }
+
+    #[test]
+    fn interleave_single_golomb_bin_roundtrip() {
+        // Drive a long run of mostly-zeros through bin 17 (G512), the
+        // most aggressive run-length code, then a few ones.
+        let mut stream: Vec<(bool, u8)> = Vec::new();
+        for _ in 0..1000 {
+            stream.push((false, 17));
+        }
+        for _ in 0..5 {
+            stream.push((true, 17));
+        }
+        for i in 0..50 {
+            stream.push((i % 3 == 0, 17));
+        }
+        roundtrip(&stream);
+    }
+
+    #[test]
+    fn interleave_shorthand_bin_roundtrip() {
+        // Bins 2..=8 each exercise a shorthand-tree code.
+        for bin in 2u8..=8 {
+            let stream: Vec<(bool, u8)> = (0..200).map(|i| (((i * 13 + 1) % 7) < 5, bin)).collect();
+            roundtrip(&stream);
+        }
+    }
+
+    #[test]
+    fn interleave_mixed_bins_roundtrip() {
+        // Interleave several bins so the front-of-list ordering and the
+        // per-bin partial-word tracking are both exercised.
+        let bins_cycle = [1u8, 5, 9, 17, 3, 12, 1, 8];
+        let stream: Vec<(bool, u8)> = (0..600)
+            .map(|i| {
+                let j = bins_cycle[i % bins_cycle.len()];
+                let b = ((i * 31 + 7) % 11) < 6;
+                (b, j)
+            })
+            .collect();
+        roundtrip(&stream);
+    }
+
+    #[test]
+    fn interleave_buffer_flush_roundtrip() {
+        // Force many open words (alternating bins so each opens a new
+        // partial word) to exceed the 2048-word buffer and trigger the
+        // §IV.C flush path, then keep decoding correctly.
+        let mut stream: Vec<(bool, u8)> = Vec::new();
+        for i in 0..(BUFFER_WORDS * 3) {
+            // Alternate between two run-length bins; a lone `0` in a
+            // Golomb bin starts a partial word that stays open, so the
+            // list grows until the flush fires.
+            let j = if i % 2 == 0 { 16u8 } else { 17u8 };
+            stream.push((false, j));
+        }
+        roundtrip(&stream);
+    }
+
+    /// A deterministic LCG drives many short random (bit, bin) streams
+    /// across all 17 bins; every one must round-trip exactly. This
+    /// exercises the front-of-list FIFO drain, the per-bin partial-word
+    /// tracking, and the end-of-stream flush across a wide variety of
+    /// word-completion orderings (the case that surfaced the finish-loop
+    /// bug).
+    #[test]
+    fn interleave_randomized_roundtrip() {
+        let mut state = 0x1234_5678u32;
+        let mut next = |m: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) % m
+        };
+        for _ in 0..2000 {
+            let n = 1 + next(40) as usize;
+            let stream: Vec<(bool, u8)> = (0..n)
+                .map(|_| {
+                    let b = next(2) == 1;
+                    let j = (1 + next(17)) as u8;
+                    (b, j)
+                })
+                .collect();
+            roundtrip(&stream);
+        }
+    }
+
+    #[test]
+    fn interleave_empty_stream() {
+        let enc = InterleavedEncoder::new();
+        let channel = enc.finish();
+        // No source bits encoded -> nothing to decode; channel is empty
+        // or pure padding.
+        assert!(channel.len() <= 1);
+        let _dec = InterleavedDecoder::new(&channel);
     }
 }
