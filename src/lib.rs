@@ -94,6 +94,7 @@ pub mod bitplane;
 pub mod context;
 pub mod decoder;
 pub mod encoder;
+pub mod entropy;
 pub mod error;
 pub mod header;
 pub mod image;
@@ -128,6 +129,7 @@ pub use decoder::{
     IcerMetadata, LenientDecode, SegmentMetadata,
 };
 pub use encoder::{encode_icer, EncodeOptions};
+pub use entropy::EntropyKind;
 pub use error::{IcerError, Result};
 pub use header::{
     walk_segment, BitPlanePass, PacketHeader, SegmentHeader, WalkedPacket, WalkedSegment,

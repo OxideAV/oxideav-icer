@@ -1,5 +1,9 @@
 //! Bit-plane scanner -- significance, refinement, and sign passes that
-//! drive the binary arithmetic coder.
+//! drive a binary entropy coder. The passes are written once against the
+//! [`crate::entropy::BitSink`] / [`crate::entropy::BitSource`] trait
+//! surface, so they run unchanged on either entropy backend (the binary
+//! arithmetic coder or ICER's §IV interleaved coder) -- the entropy
+//! backend is selected per call via [`crate::entropy::EntropyKind`].
 //!
 //! ICER's compressed segment body is built MSB-down by walking each
 //! bit-plane of the wavelet coefficient buffer through three passes
@@ -54,6 +58,7 @@ use crate::context::{
     sign_prediction_flip_subband, significance_context, significance_context_subband, ContextModel,
     MagnitudeContext, CONTEXT_COUNT, UNCODED_P1,
 };
+use crate::entropy::{BitSink, BitSource};
 use crate::error::{IcerError, Result};
 use crate::priority::{classify_position, subband_stride, SubbandType};
 
@@ -221,6 +226,17 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
     encode_bitplanes_weighted(input, None)
 }
 
+/// Like [`encode_bitplanes`] but with the entropy backend chosen by
+/// `kind` (IPN 42-155 §IV interleaved coder vs the binary arithmetic
+/// coder). The pass logic — stripe order, contexts, category scheme — is
+/// identical across backends; only the per-packet entropy coding differs.
+pub fn encode_bitplanes_with(
+    input: &BitPlaneInput<'_>,
+    kind: crate::entropy::EntropyKind,
+) -> Result<Vec<EncodedPacket>> {
+    encode_bitplanes_inner(input, None, kind)
+}
+
 /// Like [`encode_bitplanes`], but accepts an optional per-coefficient
 /// image-domain distortion weight map (IPN 42-155 §III.A).
 ///
@@ -244,6 +260,18 @@ pub fn encode_bitplanes(input: &BitPlaneInput<'_>) -> Result<Vec<EncodedPacket>>
 pub fn encode_bitplanes_weighted(
     input: &BitPlaneInput<'_>,
     weights: Option<&[f64]>,
+) -> Result<Vec<EncodedPacket>> {
+    encode_bitplanes_inner(input, weights, crate::entropy::EntropyKind::Arithmetic)
+}
+
+/// The shared bit-plane encode driver. `kind` selects the entropy
+/// backend; `weights` the optional §III.A distortion weighting. Both the
+/// public weighted and backend-selecting entrypoints funnel here so the
+/// pass logic exists once.
+fn encode_bitplanes_inner(
+    input: &BitPlaneInput<'_>,
+    weights: Option<&[f64]>,
+    kind: crate::entropy::EntropyKind,
 ) -> Result<Vec<EncodedPacket>> {
     input.validate()?;
     let n = input.coeffs.len();
@@ -273,11 +301,11 @@ pub fn encode_bitplanes_weighted(
 
         // --- Significance + sign pass (fresh coder, stripe order) ---
         let mut sig_model = ContextModel::new();
-        let mut sig_enc = ArithEncoder::new();
+        let mut sig_enc = kind.make_sink();
         let sig_before: Vec<bool> = significant.clone();
 
         encode_significance_pass(
-            &mut sig_enc,
+            sig_enc.as_mut(),
             &mut sig_model,
             input.coeffs,
             &mut significant,
@@ -316,13 +344,13 @@ pub fn encode_bitplanes_weighted(
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
             is_significance: true,
-            body: sig_enc.finish(),
+            body: sig_enc.finish_bits(),
             delta_distortion: sig_dist,
         });
 
         // --- Refinement pass (fresh coder, stripe order) ---
         let mut ref_model = ContextModel::new();
-        let mut ref_enc = ArithEncoder::new();
+        let mut ref_enc = kind.make_sink();
         let ref_weight_sum = refinement_weight_sum(
             input.coeffs,
             &significant,
@@ -333,7 +361,7 @@ pub fn encode_bitplanes_weighted(
         );
 
         encode_refinement_pass(
-            &mut ref_enc,
+            ref_enc.as_mut(),
             &mut ref_model,
             input.coeffs,
             &significant,
@@ -352,7 +380,7 @@ pub fn encode_bitplanes_weighted(
         packets.push(EncodedPacket {
             bit_plane: bp_idx as u8,
             is_significance: false,
-            body: ref_enc.finish(),
+            body: ref_enc.finish_bits(),
             delta_distortion: ref_dist,
         });
     }
@@ -411,6 +439,26 @@ pub fn decode_bitplanes_multi(
     q: u8,
     levels: u8,
 ) -> Result<Vec<i32>> {
+    decode_bitplanes_multi_with(
+        packets,
+        width,
+        height,
+        q,
+        levels,
+        crate::entropy::EntropyKind::Arithmetic,
+    )
+}
+
+/// Like [`decode_bitplanes_multi`] but with the entropy backend selected
+/// by `kind` (must match the one the encoder used).
+pub fn decode_bitplanes_multi_with(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+    levels: u8,
+    kind: crate::entropy::EntropyKind,
+) -> Result<Vec<i32>> {
     let n = width * height;
     if q == 0 || q > 31 {
         return Err(IcerError::invalid(format!(
@@ -455,10 +503,10 @@ pub fn decode_bitplanes_multi(
         };
 
         let mut sig_model = ContextModel::new();
-        let mut sig_dec = ArithDecoder::new(sig_body)?;
+        let mut sig_dec = kind.make_source(sig_body)?;
 
         decode_significance_pass(
-            &mut sig_dec,
+            sig_dec.as_mut(),
             &mut sig_model,
             &mut significant,
             &mut sign,
@@ -483,10 +531,10 @@ pub fn decode_bitplanes_multi(
             .map(|p| p.body.as_slice())
         {
             let mut ref_model = ContextModel::new();
-            let mut ref_dec = ArithDecoder::new(ref_body)?;
+            let mut ref_dec = kind.make_source(ref_body)?;
 
             decode_refinement_pass(
-                &mut ref_dec,
+                ref_dec.as_mut(),
                 &mut ref_model,
                 &significant,
                 &mut mag,
@@ -606,7 +654,7 @@ fn unavailable_bit_planes(packets: &[EncodedPacket], q: usize) -> u32 {
 /// pixel's category becomes 1").
 #[allow(clippy::too_many_arguments)]
 fn encode_significance_pass(
-    enc: &mut ArithEncoder,
+    enc: &mut dyn BitSink,
     model: &mut ContextModel,
     coeffs: &[i32],
     significant: &mut [bool],
@@ -634,7 +682,7 @@ fn encode_significance_pass(
                 let bit = ((mag >> bp) & 1) as u8;
 
                 let (num, den) = model.probability(ctx);
-                enc.encode_bit(bit, num, den);
+                enc.put_bit(bit, num, den);
                 model.observe(ctx, bit);
 
                 if bit == 1 {
@@ -652,7 +700,7 @@ fn encode_significance_pass(
                     let raw_sign = u8::from(sign[i]);
                     let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
                     let (sn, sd) = model.probability(sctx);
-                    enc.encode_bit(coded_sign, sn, sd);
+                    enc.put_bit(coded_sign, sn, sd);
                     model.observe(sctx, coded_sign);
                 }
             }
@@ -671,7 +719,7 @@ fn encode_significance_pass(
 /// deadzone reconstruction point (see [`decode_bitplanes_multi`]).
 #[allow(clippy::too_many_arguments)]
 fn decode_significance_pass(
-    dec: &mut ArithDecoder<'_>,
+    dec: &mut dyn BitSource,
     model: &mut ContextModel,
     significant: &mut [bool],
     sign: &mut [bool],
@@ -695,7 +743,7 @@ fn decode_significance_pass(
                 let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
                 let ctx = significance_ctx_for(pat, x, y, levels);
                 let (num, den) = model.probability(ctx);
-                let bit = dec.decode_bit(num, den)?;
+                let bit = dec.get_bit(num, den)?;
                 model.observe(ctx, bit);
 
                 if bit == 1 {
@@ -707,7 +755,7 @@ fn decode_significance_pass(
                         neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
                     let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
                     let (sn, sd) = model.probability(sctx);
-                    let coded_sign = dec.decode_bit(sn, sd)?;
+                    let coded_sign = dec.get_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
                     // Undo the sign flip.
                     let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
@@ -734,7 +782,7 @@ fn decode_significance_pass(
 /// runs the identical category transitions, keeping the two in lockstep.
 #[allow(clippy::too_many_arguments)]
 fn encode_refinement_pass(
-    enc: &mut ArithEncoder,
+    enc: &mut dyn BitSink,
     model: &mut ContextModel,
     coeffs: &[i32],
     significant: &[bool],
@@ -772,12 +820,12 @@ fn encode_refinement_pass(
                     MagnitudeContext::Coded(rctx) => {
                         debug_assert!(rctx < CONTEXT_COUNT);
                         let (num, den) = model.probability(rctx);
-                        enc.encode_bit(bit, num, den);
+                        enc.put_bit(bit, num, den);
                         model.observe(rctx, bit);
                     }
                     MagnitudeContext::Uncoded => {
                         let (num, den) = UNCODED_P1;
-                        enc.encode_bit(bit, num, den);
+                        enc.put_bit(bit, num, den);
                     }
                 }
                 cat[i] = cat[i].saturating_add(1).min(3);
@@ -830,7 +878,7 @@ fn advance_refinement_categories(
 /// `last_bit` and therefore a wider reconstruction bin than one that was.
 #[allow(clippy::too_many_arguments)]
 fn decode_refinement_pass(
-    dec: &mut ArithDecoder<'_>,
+    dec: &mut dyn BitSource,
     model: &mut ContextModel,
     significant: &[bool],
     mag: &mut [u32],
@@ -864,13 +912,13 @@ fn decode_refinement_pass(
                 let bit = match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
                         let (num, den) = model.probability(rctx);
-                        let bit = dec.decode_bit(num, den)?;
+                        let bit = dec.get_bit(num, den)?;
                         model.observe(rctx, bit);
                         bit
                     }
                     MagnitudeContext::Uncoded => {
                         let (num, den) = UNCODED_P1;
-                        dec.decode_bit(num, den)?
+                        dec.get_bit(num, den)?
                     }
                 };
                 if bit == 1 {
@@ -1497,6 +1545,72 @@ mod tests {
         );
         // Both still round-trip exactly.
         assert_eq!(decode_bitplanes_multi(&aware, w, h, q, 3).unwrap(), coeffs);
+    }
+
+    /// End-to-end §IV path: encode a coefficient buffer's bit planes with
+    /// the interleaved entropy backend and decode them back losslessly.
+    /// The interleaved coder drives the identical §III.B passes the
+    /// arithmetic coder does, so a full-quality decode reconstructs every
+    /// coefficient exactly.
+    #[test]
+    fn interleaved_backend_bitplane_roundtrip() {
+        use crate::entropy::EntropyKind;
+        let w = 16;
+        let h = 16;
+        let coeffs = lcg_signal(w * h, 512, 0x51C3);
+        let q = select_bit_plane_count(&coeffs);
+        for levels in 0..=4u8 {
+            let input = BitPlaneInput {
+                coeffs: &coeffs,
+                width: w,
+                height: h,
+                q,
+                levels,
+            };
+            let packets = encode_bitplanes_with(&input, EntropyKind::Interleaved).unwrap();
+            let out =
+                decode_bitplanes_multi_with(&packets, w, h, q, levels, EntropyKind::Interleaved)
+                    .unwrap();
+            assert_eq!(out, coeffs, "interleaved §IV round-trip (levels={levels})");
+        }
+    }
+
+    /// The interleaved backend produces a *different* byte stream than the
+    /// arithmetic backend on the same coefficients (the two entropy coders
+    /// pack the identical context/probability stream differently), yet both
+    /// round-trip losslessly. Proves the backend switch is real, not a
+    /// no-op alias.
+    #[test]
+    fn interleaved_differs_from_arithmetic() {
+        use crate::entropy::EntropyKind;
+        let w = 16;
+        let h = 16;
+        let coeffs = lcg_signal(w * h, 300, 0x9E37);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+            levels: 2,
+        };
+        let arith = encode_bitplanes_with(&input, EntropyKind::Arithmetic).unwrap();
+        let inter = encode_bitplanes_with(&input, EntropyKind::Interleaved).unwrap();
+        let arith_bytes: usize = arith.iter().map(|p| p.body.len()).sum();
+        let inter_bytes: usize = inter.iter().map(|p| p.body.len()).sum();
+        assert_ne!(
+            arith_bytes, inter_bytes,
+            "the two entropy backends should not produce identical byte totals"
+        );
+        // Both decode losslessly under their own backend.
+        assert_eq!(
+            decode_bitplanes_multi_with(&arith, w, h, q, 2, EntropyKind::Arithmetic).unwrap(),
+            coeffs
+        );
+        assert_eq!(
+            decode_bitplanes_multi_with(&inter, w, h, q, 2, EntropyKind::Interleaved).unwrap(),
+            coeffs
+        );
     }
 
     /// §III.B same-subband neighbour walk: when `levels >= 1` the
