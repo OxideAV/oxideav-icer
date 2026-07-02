@@ -92,6 +92,7 @@ pub mod analyze;
 pub mod arith;
 pub mod bitplane;
 pub mod context;
+pub mod context3d;
 pub mod decoder;
 pub mod encoder;
 pub mod entropy;

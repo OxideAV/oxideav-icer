@@ -81,9 +81,9 @@ pub const RESCALE_THRESHOLD: u32 = 500;
 /// chosen so the post-rescale estimate is nearer 1/2.
 pub struct ContextModel {
     /// Number of `1` bits seen in the current window for each context.
-    ones: [u32; CONTEXT_COUNT],
+    ones: Vec<u32>,
     /// Total bits seen in the current window for each context.
-    total: [u32; CONTEXT_COUNT],
+    total: Vec<u32>,
 }
 
 impl Default for ContextModel {
@@ -96,9 +96,21 @@ impl ContextModel {
     /// Build a fresh model with all counters at the §III.C MER prior
     /// (2 ones out of 4 total -> P(1) = 1/2).
     pub fn new() -> Self {
+        Self::with_contexts(CONTEXT_COUNT)
+    }
+
+    /// Build a fresh model with `count` contexts, all counters at the
+    /// §III.C MER prior (2 ones out of 4 total -> P(1) = 1/2). The
+    /// 2-D bit-plane coder uses the default 17-context layout
+    /// ([`CONTEXT_COUNT`]); the ICER-3D coder uses the 19-context
+    /// spectral layout of IPN 42-164 §IV.C (see [`crate::context3d`]) —
+    /// the §IV.C estimation procedure itself is shared ("a simple
+    /// adaptive procedure, also used by ICER ... is used to estimate
+    /// probabilities").
+    pub fn with_contexts(count: usize) -> Self {
         Self {
-            ones: [INITIAL_ONES; CONTEXT_COUNT],
-            total: [INITIAL_TOTAL; CONTEXT_COUNT],
+            ones: vec![INITIAL_ONES; count],
+            total: vec![INITIAL_TOTAL; count],
         }
     }
 
@@ -106,7 +118,7 @@ impl ContextModel {
     /// `ctx` to feed into [`crate::arith::ArithEncoder::encode_bit`] /
     /// [`crate::arith::ArithDecoder::decode_bit`].
     pub fn probability(&self, ctx: usize) -> (u32, u32) {
-        debug_assert!(ctx < CONTEXT_COUNT);
+        debug_assert!(ctx < self.ones.len());
         (self.ones[ctx], self.total[ctx])
     }
 
@@ -124,7 +136,7 @@ impl ContextModel {
     /// `total - zeros`), which is the symmetric statement for the
     /// probability-of-one the arithmetic coder consumes.
     pub fn observe(&mut self, ctx: usize, bit: u8) {
-        debug_assert!(ctx < CONTEXT_COUNT);
+        debug_assert!(ctx < self.ones.len());
         debug_assert!(bit <= 1);
         self.total[ctx] += 1;
         self.ones[ctx] += u32::from(bit);
