@@ -103,6 +103,7 @@ pub mod plane_container;
 pub mod priority;
 #[cfg(feature = "registry")]
 pub mod registry;
+pub mod subband3d;
 pub mod wavelet;
 pub mod wavelet3d;
 pub mod wavelet_float;
