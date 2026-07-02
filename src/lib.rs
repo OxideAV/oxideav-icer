@@ -104,6 +104,7 @@ pub mod priority;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod wavelet;
+pub mod wavelet3d;
 pub mod wavelet_float;
 pub mod wavelet_int;
 
