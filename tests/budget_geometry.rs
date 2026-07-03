@@ -119,3 +119,49 @@ fn unbudgeted_multi_segment_unchanged() {
     assert_eq!(decoded.width, w);
     assert_eq!(decoded.height, h);
 }
+
+/// Scheduled-fuzz crash regression (round 383): a forced-uncompressed
+/// SINGLE-segment encode with a byte budget used to bypass the budget
+/// check entirely (the `segment_count == 1` fast path returned the raw
+/// §III.D emission — 16016 bytes against a 1537-byte budget on the
+/// fuzz artifact). The §III.D path is all-or-nothing, so when the lone
+/// segment cannot fit, the encoder must fall back to the zero-body
+/// placeholder header: budget honoured, full geometry framed, flat-128
+/// decode.
+#[test]
+fn single_segment_uncompressed_respects_budget() {
+    let (w, h) = (125u32, 128u32);
+    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);
+    for (i, p) in img.planes[0].data.iter_mut().enumerate() {
+        *p = (i % 251) as u8;
+    }
+    let opts = EncodeOptions {
+        segment_count: 1,
+        byte_budget: Some(1537),
+        ..EncodeOptions::default() // default = uncompressed forced
+    };
+    let bytes = encode_icer(&img, &opts).expect("encode");
+    assert!(
+        bytes.len() as u64 <= 1537,
+        "budget blown: {} bytes",
+        bytes.len()
+    );
+    let decoded = parse_icer(&bytes).expect("decode placeholder stream");
+    assert_eq!(decoded.width, w);
+    assert_eq!(decoded.height, h);
+    assert!(
+        decoded.planes[0].data.iter().all(|&p| p == 128),
+        "placeholder strip must decode flat-128"
+    );
+
+    // A budget that does fit keeps the exact uncompressed emission.
+    let roomy = EncodeOptions {
+        segment_count: 1,
+        byte_budget: Some(20_000),
+        ..EncodeOptions::default()
+    };
+    let full = encode_icer(&img, &roomy).expect("encode roomy");
+    assert!(full.len() > 16_000);
+    let decoded = parse_icer(&full).expect("decode full");
+    assert_eq!(decoded.planes[0].data, img.planes[0].data);
+}

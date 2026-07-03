@@ -247,6 +247,17 @@ fn seeds() -> Vec<Vec<u8>> {
         v
     });
 
+    // 11. Scheduled-fuzz crash regression: forced-uncompressed
+    //     SINGLE-segment encode with a byte budget (125x128 image,
+    //     budget 1537). The single-segment path used to return the raw
+    //     §III.D emission (16016 bytes) without any budget check; it
+    //     must emit the zero-body placeholder instead. Byte-exact fuzz
+    //     artifact, also seeded at fuzz/corpus/encode_roundtrip/
+    //     seed_single_segment_uncompressed_budget.bin.
+    out.push(vec![
+        0xfc, 0xff, 0xff, 0xf1, 0x01, 0xff, 0x06, 0x00, 0x04, 0x0a,
+    ]);
+
     out
 }
 

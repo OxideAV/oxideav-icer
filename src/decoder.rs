@@ -626,6 +626,21 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
     // Sort by segment_index so out-of-order delivery still composes.
     walked_all.sort_by_key(|w| w.header.segment_index);
 
+    // Duplicate segment indices are a geometry contradiction, not a
+    // loss-tolerance scenario: the lenient height inference assumes one
+    // strip per index, and two same-index segments with different
+    // heights would make the placement loop write past the inferred
+    // plane (found by the scheduled decode_segment fuzz run; the strict
+    // decoder already rejects duplicates via its contiguity check).
+    for pair in walked_all.windows(2) {
+        if pair[0].header.segment_index == pair[1].header.segment_index {
+            return Err(IcerError::Unsupported(format!(
+                "duplicate segment index {} in lenient stream",
+                pair[0].header.segment_index
+            )));
+        }
+    }
+
     // Segment 0 must be present so we can pin the canonical width +
     // strip height.
     let first = &walked_all[0];

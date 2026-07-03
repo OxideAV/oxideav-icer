@@ -610,7 +610,25 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     let levels = opts.wavelet_levels.clamp(1, 6);
 
     if segment_count == 1 {
-        return encode_one_segment(plane, w, 0, h, 0, opts, levels);
+        let bytes = encode_one_segment(plane, w, 0, h, 0, opts, levels)?;
+        if let Some(budget) = opts.byte_budget {
+            if bytes.len() as u64 > budget {
+                // The lone segment cannot fit the byte budget even after
+                // its own internal truncation — the §III.D uncompressed
+                // path is all-or-nothing (a partial raw body would not
+                // decode). Mirror the multi-segment skip semantics: emit
+                // the zero-body placeholder header so the stream still
+                // frames the full image geometry (flat-128 strip on
+                // decode) instead of blowing through the advertised hard
+                // cap (found by the scheduled encode_roundtrip fuzz run:
+                // a forced-uncompressed single-segment encode previously
+                // ignored `byte_budget` entirely).
+                let mut out = Vec::new();
+                emit_skipped_placeholders(&mut out, &[false], &[(0, h)], w, levels, opts);
+                return Ok(out);
+            }
+        }
+        return Ok(bytes);
     }
 
     // Multi-segment: split into `segment_count` row strips. Each strip

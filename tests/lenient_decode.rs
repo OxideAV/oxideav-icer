@@ -328,3 +328,30 @@ fn lenient_empty_bytes_returns_truncated() {
     let err = parse_icer_lenient(&[]).expect_err("empty must fail");
     assert!(matches!(err, IcerError::Truncated));
 }
+
+#[test]
+fn lenient_rejects_duplicate_segment_indices() {
+    // Scheduled-fuzz crash regression (also seeded at
+    // fuzz/corpus/decode_segment/seed_lenient_duplicate_segment_index.bin):
+    // two segments sharing an index are a geometry contradiction, not
+    // packet loss. Pre-fix, concatenating two single-segment streams of
+    // *different* heights made the lenient height inference take the
+    // canonical strip height from the taller first segment (40 rows)
+    // and the total height from the shorter duplicate (8 rows), then
+    // write the 40-row strip past the 8-row plane. Both orderings and
+    // the equal-height duplicate must now be refused, never panic.
+    let tall = encode_icer(&ramp_image(32, 40), &EncodeOptions::compressed()).expect("encode 40");
+    let short = encode_icer(&ramp_image(32, 8), &EncodeOptions::compressed()).expect("encode 8");
+
+    for (a, b) in [(&tall, &short), (&short, &tall), (&tall, &tall)] {
+        let mut concat = a.clone();
+        concat.extend_from_slice(b);
+        let err = parse_icer_lenient(&concat).expect_err("duplicate index must be refused");
+        assert!(
+            matches!(err, IcerError::Unsupported(_)),
+            "unexpected error kind: {err:?}"
+        );
+        // The strict decoder already refuses via its contiguity check.
+        assert!(parse_icer(&concat).is_err());
+    }
+}
