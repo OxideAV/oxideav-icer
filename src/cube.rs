@@ -284,6 +284,9 @@ fn subtract_plane_means(coeffs: &mut [i32], geom: &CubeGeometry) -> Vec<i32> {
 }
 
 /// Add the §III.A means back (the decompression counterpart).
+/// Saturating: a corrupt stream can carry arbitrary means against
+/// arbitrary decoded coefficients, and the decoder clamps to the sample
+/// range afterwards anyway.
 fn add_plane_means(coeffs: &mut [i32], geom: &CubeGeometry, means: &[i32]) {
     let stride = 1usize << geom.ts;
     let plane = geom.width * geom.height;
@@ -293,7 +296,8 @@ fn add_plane_means(coeffs: &mut [i32], geom: &CubeGeometry, means: &[i32]) {
         while y < geom.height {
             let mut x = 0usize;
             while x < geom.width {
-                coeffs[base + y * geom.width + x] += mean;
+                let c = &mut coeffs[base + y * geom.width + x];
+                *c = c.saturating_add(mean);
                 x += stride;
             }
             y += stride;
@@ -572,7 +576,9 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
             let dst_plane = b * width * height;
             for y in 0..sh {
                 for x in 0..width {
-                    let v = (coeffs[src_plane + y * width + x] + shift).clamp(0, ceil);
+                    let v = coeffs[src_plane + y * width + x]
+                        .saturating_add(shift)
+                        .clamp(0, ceil);
                     cube.samples[dst_plane + (y0 + y) * width + x] = v as u16;
                 }
             }
