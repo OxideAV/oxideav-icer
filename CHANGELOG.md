@@ -9,6 +9,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ICER-3D (IPN Progress Report 42-164) — the full hyperspectral cube
+  pipeline.** Round 383 implements the staged 42-164 paper end-to-end
+  across four new modules plus public API:
+  * `wavelet3d` — the §III.A three-dimensional wavelet decomposition.
+    Not a plain 3-D Mallat pyramid: after the first stage the
+    spatially-low-pass / spectrally-high-pass subbands keep decomposing
+    spatially, so a level-k spatial subband carries exactly k spectral
+    levels. Implemented as, per stage, one 2-D spatial stage on every
+    spectral plane's low-pass lattice then one spectral stage over the
+    low-pass block, with the inverse replaying the exact reverse order
+    (normative under integer rounding per the §III.A footnote). All
+    seven IPN 42-155 §II.A reversible integer filters supported,
+    bit-exact reversible across odd/thin/single-band/degenerate
+    geometries via pure-function per-dimension stage gating.
+  * `subband3d` — §IV.A bit-plane priorities `p = 2b + L - H + 3` and
+    the Appendix subband index assignment (paper pins verified: 31
+    subbands at D = 3; subband 21 H = 2 / L = 6 with p = 2b + 7; only
+    subband 0 reaches priority 0 and none reach 1; priority parity),
+    plus the decreasing-priority / decreasing-index schedule. An
+    Appendix tie that can arise for D > 3 is broken by a documented
+    implementation rule (5).
+  * `context3d` — the §IV.C spectral context modeler: 19 contexts
+    (Table 2) from the two spectral-neighbour coefficients' categories
+    (Tables 3/4/5) and signs (Table 6 prediction + XOR agreement-bit
+    sign coding); category-3 bits uncoded; every table cell pinned by a
+    unit test. `ContextModel` gains `with_contexts(n)` (counters are now
+    length-configurable; the 17-context 2-D default is unchanged) since
+    §IV.C shares the 42-155 §III.C MER estimation procedure.
+  * `bitplane3d` — the §IV coding engine: one spatial plane at a time in
+    raster order, sign coded immediately after a coefficient's first '1'
+    bit, four-category tracking in encoder/decoder lockstep, one packet
+    per §IV.A priority value, per-subband deadzone mid-bin
+    reconstruction of truncated planes, both entropy backends
+    (arithmetic + the §IV interleaved coder) through the existing
+    `BitSink`/`BitSource` surface.
+  * `cube` — `IcerCube` (band-major, 1–16-bit samples),
+    `CubeEncodeOptions`, `encode_icer3d` / `parse_icer3d` /
+    `parse_icer3d_with_limits` / `is_cube`. Pipeline per row-strip
+    error-containment segment (strips extend through all bands, §II.B):
+    level shift → 3-D DWT → §III.A per-spatial-plane mean subtraction
+    over the spatially-low-pass lattice (one mean per band per segment
+    on the wire, added back at the matching decompression step) →
+    priority-granular packets. §IV.B rate control verbatim: byte quota
+    (framing floor enforced, per-segment packet-prefix truncation,
+    geometry always framed) + integer minimum-loss parameter (stop at
+    its priority boundary; 0 = lossless when the quota allows),
+    composing "whichever comes first". Implementation-defined framing
+    behind a `0x0000 0xC3` magic that can never collide with a 2-D
+    stream or the colour container; strict validation + the same
+    `DecodeLimits` caps as the 2-D path before any allocation;
+    saturating decode arithmetic so hostile means/coefficients cannot
+    overflow.
+  Measured on a 32x32x16 correlated-band scene (lossless, filter Q,
+  3 levels): 4.12 bits/sample vs 7.00 bits/sample for per-band 2-D ICER
+  (−41% bytes) — the §V.A Table 7 direction. Coverage: ~50 new unit +
+  integration tests (`tests/cube3d.rs` + module tests) spanning
+  lossless round-trips for all filters/backends/depths/segmentations,
+  quota + min-loss sweeps with monotone quality, mean-subtraction
+  effectiveness, single-byte-corruption and prefix-truncation sweeps;
+  the `decode_segment` fuzz target gains `parse_icer3d` as a fourth
+  layer with three encoder-produced cube corpus seeds, and the new
+  `tests/corpus_smoke.rs` drives the whole corpus per push.
+
+### Fixed
+
+- **`parse_icer_lenient` out-of-bounds panic on duplicate segment
+  indices** (scheduled decode_segment fuzz crash). Two segments sharing
+  a `segment_index` but with different heights made the lenient height
+  inference take the canonical strip height from the first duplicate
+  and the total height from the last, then write the taller strip past
+  the inferred plane. Duplicate indices are a geometry contradiction,
+  not §III.E packet loss, and are now refused with
+  `IcerError::Unsupported` (the strict decoder already refuses them via
+  its contiguity check). Byte-exact corpus seed
+  (`seed_lenient_duplicate_segment_index.bin`) + a three-ordering
+  regression test in `tests/lenient_decode.rs`.
+- **Single-segment encode bypassed `byte_budget`** (scheduled
+  encode_roundtrip fuzz crash). The `segment_count == 1` fast path
+  returned the raw §III.D uncompressed emission without any budget
+  check — 16016 bytes against a 1537-byte cap on the fuzz artifact.
+  The §III.D path is all-or-nothing, so a lone segment that cannot fit
+  now falls back to the zero-body placeholder header (budget honoured,
+  full geometry framed, flat-128 decode), mirroring the multi-segment
+  skip semantics. Byte-exact corpus seed + seed-bank entry 11 in
+  `tests/encode_fuzz_seed.rs` +
+  `single_segment_uncompressed_respects_budget`.
+
+### Added
+
 - **IPN 42-155 §IV interleaved entropy coder — spec-exact, selectable
   encode/decode backend.** ICER's actual entropy stage is not arithmetic
   coding; §IV specifies a bit-wise adaptable *interleaved entropy coder*.

@@ -5,12 +5,15 @@ Mars surface mission since the 2003 Mars Exploration Rovers (Spirit and
 Opportunity), continued on Mars Science Laboratory (Curiosity), Mars 2020
 (Perseverance), and follow-on missions.
 
-This is a **clean-room** implementation. The only specification source
-consulted was the open Kiely & Klimesh paper "The ICER Progressive Wavelet
-Image Compressor", Jet Propulsion Laboratory, *IPN Progress Report 42-155*
-(2003) -- abbreviated `IPN 42-155` in source comments. That paper is the
-sole source; no other material was consulted, paraphrased, or
-cross-checked.
+This is a **clean-room** implementation. The specification sources
+consulted are the two open JPL papers: Kiely & Klimesh, "The ICER
+Progressive Wavelet Image Compressor", *IPN Progress Report 42-155*
+(2003) -- abbreviated `IPN 42-155` in source comments -- and, for the
+hyperspectral ICER-3D pipeline, Kiely, Klimesh, Xie & Aranki, "ICER-3D:
+A Progressive Wavelet-Based Compressor for Hyperspectral Images", *IPN
+Progress Report 42-164* (2006) -- abbreviated `IPN 42-164`. Those two
+papers are the sole sources; no other material was consulted,
+paraphrased, or cross-checked.
 
 ## Status
 
@@ -52,6 +55,10 @@ cross-checked.
 | Post-decode quality metrics | full (`DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae` + `ssim` -- mean structural-similarity index over a sliding 8x8 window; all spec-neutral) |
 | Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on both the integer 5/3 (filter Q) and float 9/7 (filter A) paths -- see Benchmarks below) |
 | Colour (YUV 4:4:4) encode + decode | full (IPN 42-155 §III independent-per-component scheme; each plane is its own single-plane ICER bitstream behind a `plane_container` header; filter-Q + uncompressed round-trips bit-exact across all three planes; Gray8 wire form byte-for-byte unchanged -- see "Colour images" below) |
+| ICER-3D 3-D wavelet decomposition | full (IPN 42-164 §III.A staged decomposition -- spatially-low-pass / spectrally-high-pass subbands keep decomposing spatially; bit-exact reversible for all seven §II.A integer filters across degenerate geometries -- see `wavelet3d`) |
+| ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
+| ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
+| ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip segments, `DecodeLimits` caps -- see "ICER-3D" below) |
 
 End-to-end round-trips:
 
@@ -789,19 +796,12 @@ Mid-packet truncation is deferred (needs the IPN 42-155 supplemental
 
 ### ICER 3D
 
-The 2009 follow-on paper Kiely *et al.*, "ICER-3D: A Progressive
-Wavelet-Based Compressor for Hyperspectral Images" (IPN Progress
-Report 42-178) extends the same coder to a 3-D wavelet transform for
-hyperspectral cubes (HiRISE-style data with N spectral bands stacked).
-The 2-D 5/3 + float A-G filters become a 3-D separable transform; the
-context model gains a band-axis dimension. The encoder + decoder
-machinery already in this crate (segment framing, packet ordering,
-arithmetic coder, context model) carry over largely unchanged — the
-delta is the 3-D DWT + extended context indexing.
-
-This is the natural follow-on once the 2-D path is at JPL-interop
-parity (i.e. once the [13] reference tables are transcribed and the
-quota-controlled encoder is in place).
+**Implemented** (round 383) from the staged IPN Progress Report 42-164
+(2006) -- see the "ICER-3D" section above. Remaining 3-D deltas are the
+same interop unknowns as the 2-D path (the papers leave the byte-level
+container to the implementation) plus the 42-155 §V.D rectangle
+partitioning algorithm, which both the 2-D and 3-D paths approximate
+with row strips.
 
 ## Standalone vs registry build
 
@@ -995,6 +995,86 @@ colour path is bit-exact too. The `DecodeLimits` DoS caps apply per plane
 RGB↔YCbCr colour-transform stage are not implemented (the deployed pipeline
 applies the colour transform before ICER -- this crate sees three
 already-decorrelated 4:4:4 planes).
+
+## ICER-3D (IPN 42-164)
+
+Hyperspectral cubes -- `width x height x bands` stacks of spectral-band
+images, 1..=16-bit samples -- compress through the ICER-3D pipeline of
+IPN Progress Report 42-164, implemented across four modules:
+
+* **`wavelet3d`** -- the §III.A decomposition. Not a plain 3-D Mallat
+  pyramid: after the first stage, spatially-low-pass / spectrally
+  high-pass subbands keep decomposing *spatially*, so a level-`k`
+  spatial subband carries exactly `k` spectral levels. Realised as, per
+  stage, one 2-D spatial stage on every spectral plane's low-pass
+  lattice followed by one spectral stage over the low-pass block; the
+  inverse replays the exact reverse order (the §III.A footnote makes
+  the operation order normative under integer rounding). All seven
+  IPN 42-155 §II.A reversible integer filters are supported and proven
+  bit-exact reversible, including degenerate geometries (per-dimension
+  stage gating is a pure function of the geometry).
+* **`subband3d`** -- §IV.A bit-plane priorities `p = 2b + L - H + 3`
+  (from the per-subband high/low filtering-operation counts) and the
+  Appendix subband index assignment; the schedule sorts by decreasing
+  priority with the decreasing-index tie-break. Paper pins verified:
+  31 subbands at three stages, subband 21 has `H = 2, L = 6` and
+  `p = 2b + 7`, only subband 0 owns a priority-0 bit plane and no
+  priority-1 plane exists, per-subband priority parity.
+* **`context3d`** -- the §IV.C spectral context modeler: 19 contexts
+  (Table 2) computed from the categories / signs of the two
+  spectral-neighbour coefficients only (Tables 3/4/5), Table 6 sign
+  prediction with XOR agreement-bit coding, category-3 bits uncoded.
+  The probability estimator is the shared 42-155 §III.C MER procedure.
+* **`bitplane3d` + `cube`** -- the §IV coding engine (one spatial plane
+  at a time, raster order, sign coded immediately after a coefficient's
+  first `1` bit) and the public pipeline: level shift, 3-D DWT, §III.A
+  per-spatial-plane **mean subtraction** over the spatially-low-pass
+  lattice (one mean per band per segment on the wire -- the negligible
+  overhead the paper promises), then priority-granular packets.
+
+```rust
+use oxideav_icer::{encode_icer3d, parse_icer3d, CubeEncodeOptions, IcerCube};
+
+let cube = IcerCube::zeros(64, 64, 224, 12);      // AVIRIS-shaped
+let opts = CubeEncodeOptions::default()           // filter Q, 3 levels
+    .with_segment_count(4)                        // §II.B row strips
+    .with_byte_quota(200_000)                     // §IV.B byte quota
+    .with_min_loss(0);                            // 0 = lossless if quota allows
+let bytes = encode_icer3d(&cube, &opts)?;
+let decoded = parse_icer3d(&bytes)?;
+```
+
+Rate control is §IV.B verbatim: compression stops when the *minimum
+loss* parameter's priority boundary or the *byte quota* is reached,
+whichever comes first. Packets are cut per priority value, so the
+min-loss stop lands exactly on its defining boundary and quota
+truncation keeps a per-segment packet prefix (later strips still frame
+-- geometry is always preserved). Truncated subbands reconstruct at the
+deadzone mid-bin point inherited from the 2-D path.
+
+**Measured** (32x32x16 correlated-band 8-bit scene, lossless filter Q,
+3 levels): the cube stream is **4.12 bits/sample** vs **7.00
+bits/sample** for lossless 2-D ICER applied to each band independently
+-- a 41% byte reduction, the direction IPN 42-164 §V.A Table 7 reports
+for AVIRIS (5.35 vs 7.19). Both entropy backends (arithmetic + the §IV
+interleaved coder) drive the cube path; a stream records its backend in
+the header flags.
+
+The wire framing (0x0000 + 0xC3 magic, never ambiguous against a 2-D
+single-plane stream or the colour container) is implementation-defined
+-- both papers leave the byte-level container open. Decode applies the
+same `DecodeLimits` caps as the 2-D path (per strip and per cube)
+before any allocation, survives every single-byte corruption and prefix
+truncation of a valid stream (test-pinned), and the `decode_segment`
+fuzz target drives `parse_icer3d` on every input alongside the 2-D
+layers.
+
+Two 42-164 ambiguities are resolved by documented implementation
+choices: the within-stage operation order (spatial rows/columns then
+spectral; the paper only requires forward/inverse symmetry), and an
+Appendix index tie that can arise for decompositions deeper than the
+paper's 3-stage illustration (broken by a documented rule (5) --
+spectral depth, then spectral lowness).
 
 ## Benchmarks
 
