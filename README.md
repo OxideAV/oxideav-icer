@@ -1109,6 +1109,8 @@ opt-level, `--quick` smoke):
 | `decode_compressed_filter_a/ramp_64x64`| ~258 µs| ~15.2 MiB/s|
 | `uncompressed_path_64x64/encode`       | ~197 ns| ~19.2 GiB/s|
 | `uncompressed_path_64x64/decode`       | ~336 ns| ~11.3 GiB/s|
+| `cube3d_filter_q_32x32x16/encode`      | ~2.43 ms| ~12.9 MiB/s|
+| `cube3d_filter_q_32x32x16/decode`      | ~2.40 ms| ~13.0 MiB/s|
 
 The filter-A groups cover the lossy float 9/7 CDF lifting path on
 the same input shapes; the Q-vs-A delta on the 64×64 ramp is ~5% on
@@ -1134,6 +1136,11 @@ single default:
   fixed per-segment cost accumulates as strip payloads shrink. Encode
   is ~flat through 4 segments then steps up at 8; decode rises
   monotonically with the per-segment framing-parse cost.
+* **ICER-3D cube baseline** (`cube3d_filter_q_32x32x16`): lossless
+  filter-Q encode + decode of a 32x32x16 correlated-band 12-bit cube
+  (the integration suite's headline-comparison shape), throughput over
+  the 32 KiB of u16 samples — a stable reference for the 3-D DWT +
+  spectral-context bit-plane coder before any vectorisation work.
 * **`bit_plane_count` over `[4, 8, 12, 16]`** (filter Q): the field is
   a floor on the per-segment packet count, so raising it past the
   natural `needed` (~7-8 on this ramp) emits extra near-empty bit-plane

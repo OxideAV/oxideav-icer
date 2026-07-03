@@ -28,7 +28,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use oxideav_icer::{
-    encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    encode_icer, encode_icer3d, parse_icer, parse_icer3d, CubeEncodeOptions, EncodeOptions,
+    IcerCube, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 /// Diagonal ramp identical to the round-trip tests' `ramp_image`. Keeps
@@ -538,6 +539,45 @@ fn bench_filter_a_wavelet_levels_sweep(c: &mut Criterion) {
     dec_group.finish();
 }
 
+/// ICER-3D cube baseline (IPN 42-164): lossless filter-Q encode +
+/// decode of a 32x32x16 correlated-band 12-bit cube (the shape of the
+/// integration suite's headline comparison). Gives the 3-D DWT +
+/// spectral-context bit-plane coder + priority-packet framing a stable
+/// perf reference before any vectorisation work.
+fn bench_cube3d_path(c: &mut Criterion) {
+    let (w, h, bands) = (32u32, 32u32, 16u32);
+    let mut cube = IcerCube::zeros(w, h, bands, 12);
+    let (wu, hu) = (w as usize, h as usize);
+    for b in 0..bands as usize {
+        let dc = 800 + ((b * 137) % 1200) as i32;
+        for y in 0..hu {
+            for x in 0..wu {
+                let t = ((x * 13 + y * 29 + b * 7) % 257) as i32 - 128;
+                cube.samples[b * wu * hu + y * wu + x] = (dc + t).clamp(0, 4095) as u16;
+            }
+        }
+    }
+    let sample_bytes = (cube.samples.len() * 2) as u64;
+    let opts = CubeEncodeOptions::default();
+
+    let mut group = c.benchmark_group("cube3d_filter_q_32x32x16");
+    group.throughput(Throughput::Bytes(sample_bytes));
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            let bytes = encode_icer3d(black_box(&cube), black_box(&opts)).unwrap();
+            black_box(bytes);
+        });
+    });
+    let bytes = encode_icer3d(&cube, &opts).unwrap();
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let out = parse_icer3d(black_box(&bytes)).unwrap();
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -548,5 +588,6 @@ criterion_group!(
     bench_segment_count_sweep,
     bench_bit_plane_count_sweep,
     bench_filter_a_wavelet_levels_sweep,
+    bench_cube3d_path,
 );
 criterion_main!(benches);

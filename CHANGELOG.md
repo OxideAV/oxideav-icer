@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   convention until an emitter rework adopts §V.B transform-domain
   segmentation.
 
+- **ICER-3D criterion baseline.** `benches/encode_decode.rs` gains a
+  `cube3d_filter_q_32x32x16` group (lossless filter-Q encode + decode of
+  a correlated-band 12-bit cube). aarch64-darwin `--quick` smoke:
+  encode ~2.43 ms / ~12.9 MiB/s, decode ~2.40 ms / ~13.0 MiB/s — the
+  perf reference for future 3-D DWT / spectral-context vectorisation.
+
 ### Fixed
 
 - **`parse_icer_lenient` out-of-bounds panic on duplicate segment
