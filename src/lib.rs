@@ -94,6 +94,7 @@ pub mod bitplane;
 pub mod bitplane3d;
 pub mod context;
 pub mod context3d;
+pub mod cube;
 pub mod decoder;
 pub mod encoder;
 pub mod entropy;
@@ -126,6 +127,9 @@ pub use bitplane::EncodedPacket;
 pub use context::{
     neighbour_counts, sign_context_subband, sign_prediction_flip_subband,
     significance_context_subband, significance_context_table6, significance_context_table7,
+};
+pub use cube::{
+    encode_icer3d, is_cube, parse_icer3d, parse_icer3d_with_limits, CubeEncodeOptions, IcerCube,
 };
 pub use decoder::{
     decode_uncompressed_icer, parse_icer, parse_icer_lenient, parse_icer_lenient_with_limits,
