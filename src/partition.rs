@@ -220,6 +220,70 @@ pub fn partition(w: usize, h: usize, s: usize) -> Result<Vec<SegmentRect>> {
     Ok(out)
 }
 
+/// LL-resolution segment-index map: entry `y * w + x` is the raster
+/// segment index (Fig. 17) of LL pixel `(x, y)` under the §V.D
+/// partition of a `w x h` LL subband into `s` segments.
+pub fn ll_segment_map(w: usize, h: usize, s: usize) -> Result<Vec<u16>> {
+    if s > u16::MAX as usize {
+        return Err(IcerError::unsupported(format!(
+            "segment count {s} exceeds the u16 map range"
+        )));
+    }
+    let rects = partition(w, h, s)?;
+    let mut map = vec![0u16; w * h];
+    for r in &rects {
+        for y in r.y..r.y + r.height {
+            for x in r.x..r.x + r.width {
+                map[y * w + x] = r.index as u16;
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Full-resolution §V.B coefficient segment map for a `W x H` image
+/// transformed with `d` decomposition stages and partitioned into `s`
+/// segments.
+///
+/// §V.B: "segmentation occurs after the wavelet decomposition. Each
+/// pixel of the transformed image is assigned to a segment. ... first
+/// the LL subband is partitioned into `s` rectangular segments, and
+/// then this partition is mapped to the other subbands. Thus, pixels
+/// in different subbands corresponding to the same spatial location
+/// will belong to the same segment."
+///
+/// In the crate's Mallat-interleaved coefficient layout (see
+/// [`crate::priority::classify_position`]) a subband coefficient at
+/// buffer position `(x, y)` covers the spatial neighbourhood of
+/// `(x, y)` itself, so the LL pixel co-located with it is simply
+/// `(x >> d, y >> d)` — one integer shift maps *every* subband onto
+/// the §V.D LL partition, realising the §V.B "same spatial location,
+/// same segment" rule exactly (Fig. 14). Entry `y * W + x` of the
+/// returned map is the segment index of coefficient `(x, y)`.
+pub fn coefficient_segment_map(
+    image_w: usize,
+    image_h: usize,
+    d: u8,
+    s: usize,
+) -> Result<Vec<u16>> {
+    if image_w == 0 || image_h == 0 {
+        return Err(IcerError::unsupported(
+            "coefficient map requires a non-empty image (§V.B)",
+        ));
+    }
+    let (w_ll, h_ll) = ll_dimensions(image_w, image_h, d);
+    let ll_map = ll_segment_map(w_ll, h_ll, s)?;
+    let mut map = vec![0u16; image_w * image_h];
+    for y in 0..image_h {
+        let ly = y >> d;
+        for x in 0..image_w {
+            let lx = x >> d;
+            map[y * image_w + x] = ll_map[ly * w_ll + lx];
+        }
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +492,112 @@ mod tests {
         assert_eq!(ll_dimensions(1024, 1024, 6), (16, 16));
         assert_eq!(ll_dimensions(17, 5, 2), (5, 2));
         assert_eq!(ll_dimensions(17, 5, 0), (17, 5));
+    }
+
+    #[test]
+    fn ll_segment_map_matches_rects() {
+        let (w, h, s) = (10usize, 14usize, 17usize);
+        let map = ll_segment_map(w, h, s).unwrap();
+        let rects = partition(w, h, s).unwrap();
+        for r in &rects {
+            for y in r.y..r.y + r.height {
+                for x in r.x..r.x + r.width {
+                    assert_eq!(map[y * w + x] as usize, r.index, "({x},{y})");
+                }
+            }
+        }
+        // Every segment index appears at least once.
+        for idx in 0..s {
+            assert!(
+                map.iter().any(|&m| m as usize == idx),
+                "segment {idx} empty"
+            );
+        }
+    }
+
+    /// §V.B: pixels in different subbands corresponding to the same
+    /// spatial location belong to the same segment. In the interleaved
+    /// layout the level-`j` detail coefficient covering spatial location
+    /// `(u * 2^j, v * 2^j)` sits at `x = (2u+1) * 2^(j-1)` (high-pass
+    /// axis) / `x = u * 2^j` (low-pass axis); all of them must map to
+    /// the segment of LL pixel `(u * 2^j >> d, ...)`.
+    #[test]
+    fn same_spatial_location_same_segment() {
+        let (iw, ih, d, s) = (48usize, 40usize, 3u8, 5usize);
+        let map = coefficient_segment_map(iw, ih, d, s).unwrap();
+        let step = 1usize << d;
+        for by in (0..ih).step_by(step) {
+            for bx in (0..iw).step_by(step) {
+                // The LL coefficient of this spatial block.
+                let seg_ll = map[by * iw + bx];
+                for j in 1..=d {
+                    let half = 1usize << (j - 1);
+                    // HL: high-pass in x, low-pass in y.
+                    let (hx, hy) = (bx + half, by);
+                    // LH: low-pass in x, high-pass in y.
+                    let (lx, ly) = (bx, by + half);
+                    // HH: high-pass in both.
+                    let (dx, dy) = (bx + half, by + half);
+                    for &(x, y) in &[(hx, hy), (lx, ly), (dx, dy)] {
+                        if x < iw && y < ih {
+                            assert_eq!(
+                                map[y * iw + x],
+                                seg_ll,
+                                "level-{j} coefficient ({x},{y}) disagrees with LL block ({bx},{by})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fig. 14 analogue: a two-segment partition of a transformed image
+    /// splits *every* subband at the scaled position of the LL boundary
+    /// (the shaded pixels of Fig. 14 all belong to the left segment).
+    #[test]
+    fn fig14_two_segment_split_shape() {
+        let (iw, ih, d, s) = (64usize, 64usize, 3u8, 2usize);
+        let (w_ll, h_ll) = ll_dimensions(iw, ih, d);
+        assert_eq!((w_ll, h_ll), (8, 8));
+        let rects = partition(w_ll, h_ll, s).unwrap();
+        // For an 8x8 LL and 2 segments the §V.D split is one row of two
+        // columns (r = 1, c = 2): left/right halves.
+        assert_eq!(rects.len(), 2);
+        let map = coefficient_segment_map(iw, ih, d, s).unwrap();
+        // Segment membership is a pure function of the LL x coordinate:
+        // every coefficient column x maps to LL column x >> 3.
+        for y in 0..ih {
+            for x in 0..iw {
+                let expect = if (x >> d) < rects[0].width { 0 } else { 1 };
+                assert_eq!(map[y * iw + x] as usize, expect, "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn coefficient_map_covers_odd_geometry() {
+        // Odd dims: LL is ceil-sized, and the trailing partial spatial
+        // block must still map in-range.
+        let (iw, ih, d, s) = (37usize, 23usize, 2u8, 6usize);
+        let map = coefficient_segment_map(iw, ih, d, s).unwrap();
+        assert_eq!(map.len(), iw * ih);
+        assert!(map.iter().all(|&m| (m as usize) < s));
+        for idx in 0..s {
+            assert!(
+                map.iter().any(|&m| m as usize == idx),
+                "segment {idx} empty"
+            );
+        }
+    }
+
+    #[test]
+    fn coefficient_map_refuses_eq9_violation() {
+        // LL of a 16x16 image at d=3 is 2x2 = 4 pixels < 5 segments.
+        assert!(matches!(
+            coefficient_segment_map(16, 16, 3, 5),
+            Err(IcerError::Unsupported(_))
+        ));
     }
 
     #[test]
