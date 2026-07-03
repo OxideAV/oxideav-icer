@@ -32,11 +32,12 @@
 //! of eq (13) is computed as `(h*c*r_t + s/2) / s` exactly as the paper
 //! notes).
 //!
-//! This crate's 2-D and 3-D pipelines currently split images into row
-//! strips *in the image domain* (their own documented convention); this
-//! module provides the spec's transform-domain rectangle partition as a
-//! standalone, fully tested geometry so a future emitter rework can
-//! adopt §V.B/§V.D segmentation without re-deriving it.
+//! The 2-D pipeline adopts this partition end-to-end via
+//! [`crate::encoder::EncodeOptions::with_transform_domain_segments`]
+//! (§V.B: one whole-image transform, the LL partition mapped to every
+//! subband by [`coefficient_segment_map`], each segment coded
+//! independently). The 3-D cube pipeline still uses its documented
+//! row-strip convention.
 
 use crate::error::{IcerError, Result};
 

@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§V.B transform-domain segmentation (IPN 42-155 §V.B + §V.D), end to
+  end.** `EncodeOptions::with_transform_domain_segments()` runs one
+  whole-image DWT, partitions the LL subband with the §V.D algorithm
+  (`partition::ll_segment_map` / `coefficient_segment_map` — the §V.B
+  same-spatial-location rule is a single integer shift in the
+  interleaved layout), and codes each segment independently (own
+  context modeler + entropy coder). New wire framing in previously-
+  reserved space: header byte 7 bit 0 flags the mode; bytes 10..12
+  carry `(total_segments, segment_index)` so the decoder recomputes the
+  partition per §V.D — boundaries are never encoded. Filter-Q decode is
+  bit-exact (both entropy backends, colour, odd geometries); a dropped
+  segment is pixel-exact-contained outside a `3·2^D` bleed margin and
+  the lenient decoder no longer needs segment 0. Lossless output is
+  2–3% smaller than row strips at equal segment count (whole-image
+  decorrelation), with no §V.B strip-boundary artifacts.
+- **§VI.A minimum-loss quality goal for the 2-D path.**
+  `EncodeOptions::with_min_loss(M)`: per-subband Fig. 18 LSB-plane
+  exclusion (`priority::min_loss_offset` / `min_loss_skip_map`,
+  offsets `HH_j = j-1`, `HL/LH_j = j`, `LL = D+1`, pinned against the
+  published D = 3 figure), `M` carried in every packet header's
+  previously-reserved byte (0 = historical form; `with_min_loss(0)` is
+  byte-identical), fully-excluded trailing planes dropped from the
+  wire. Composes with row strips, transform-domain segments, both
+  entropy backends, and the byte quota; monotone in bytes + MSE
+  (textured 128×128 curve: 12884 B at M=0 down to 442 B at M=8).
+- **`bitplane::ScanFilter`** — composable §V.B segment-mask + §VI.A
+  plane-exclusion restriction over the significance/refinement passes
+  (`encode_bitplanes_filtered` / `decode_bitplanes_filtered`);
+  `ScanFilter::ALL` proven byte-identical to the unfiltered scan.
+- **Per-push mutation smoke + new fuzz seeds** for the new wire modes
+  (`tests/mutation_smoke.rs`, four `seed_transform_*`/`seed_minloss*`
+  corpus entries, `encode_roundtrip` fuzz target drives the new
+  options); criterion group `transform_segments_64x64_s4` +
+  `min_loss_64x64` with wire-form byte-identity pins in the setup.
+
+### Fixed
+
+- Two decode-side debug-build panics reachable from corrupted streams
+  (bit-plane count near 31 decodes coefficients near `i32::MAX`),
+  found by the new mutation smoke: the 5/3 lifting inner neighbour
+  sums now wrap and the decoder's inverse level shift saturates before
+  the `[0, 255]` clamp.
+
 - **ICER-3D (IPN Progress Report 42-164) — the full hyperspectral cube
   pipeline.** Round 383 implements the staged 42-164 paper end-to-end
   across four new modules plus public API:

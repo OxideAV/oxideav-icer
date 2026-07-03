@@ -59,7 +59,9 @@ paraphrased, or cross-checked.
 | ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
 | ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
 | ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip segments, `DecodeLimits` caps -- see "ICER-3D" below) |
-| §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; standalone geometry module (`partition`) — the coding pipelines still use their documented row-strip convention pending the §V.B transform-domain emitter rework) |
+| §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; `partition` + the §V.B maps `ll_segment_map` / `coefficient_segment_map`) |
+| §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment is pixel-exact-contained outside a small wavelet-support bleed -- see "Transform-domain segmentation" below) |
+| §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
 
 End-to-end round-trips:
 
@@ -417,6 +419,109 @@ emitter can adopt this interleaving order independently in a later
 round. The current packet emitter still uses the per-segment MSB-down
 order; wiring the §III.A interleaving into the emitter is the natural
 follow-on.
+
+## Transform-domain segmentation (IPN 42-155 §V.B + §V.D)
+
+The spec's error-containment segmentation happens **after** the wavelet
+decomposition: "first the LL subband is partitioned into s rectangular
+segments, and then this partition is mapped to the other subbands.
+Thus, pixels in different subbands corresponding to the same spatial
+location will belong to the same segment" (§V.B, Fig. 14). In the
+crate's Mallat-interleaved coefficient layout that mapping is a single
+integer shift — coefficient `(x, y)` belongs to the §V.D rectangle
+containing LL pixel `(x >> D, y >> D)` (`coefficient_segment_map`).
+
+```rust
+let mut opts = oxideav_icer::EncodeOptions::compressed()
+    .with_transform_domain_segments();
+opts.segment_count = 8;                  // §V.D partition of the LL subband
+let bytes = oxideav_icer::encode_icer(&image, &opts)?;
+let decoded = oxideav_icer::parse_icer(&bytes)?;   // recomputes the partition
+```
+
+Wire form: one segment per §V.D rectangle, each header carrying the
+full image dimensions plus `(total_segments, segment_index)` in the
+previously-reserved framing space, flagged by the last reserved header
+bit so every pre-existing row-strip stream parses unchanged. Segment
+boundaries are never encoded — the decoder recomputes them "from the
+image dimensions, the number of stages of wavelet decomposition, and
+the total number of segments" (§V.D). Each segment is coded with its
+own context modeler and entropy coder (§V.B) over the coefficients the
+partition maps to it; §III.B same-segment neighbour semantics hold
+automatically because out-of-segment coefficients never enter the scan
+state.
+
+Properties (all pinned by `tests/transform_segments.rs`):
+
+* Filter-Q full-quality decode is **bit-exact** across geometries,
+  segment counts, both entropy backends, and colour 4:4:4.
+* Whole-image decorrelation beats the row-strip convention at equal
+  segment count: textured 128×128, filter Q lossless, 8 segments emits
+  **13632 B vs 13990 B** (−2.6%); and §V.B's strip-boundary artifact
+  ("Fig. 15(a)") cannot occur because there is only one transform.
+* **Error containment**: dropping any one segment from the stream
+  leaves every pixel outside a `3·2^D` dilation of that segment's
+  image-domain rectangle **bit-identical** to the full decode; the
+  lost region degrades to a smooth low-detail patch (zero coefficients
+  through the shared inverse transform), not a flat-128 strip. The
+  lenient decoder no longer needs segment 0 — *any* surviving segment
+  pins the full geometry.
+* Byte budgets compose: whole segments are scheduled in ROI-priority
+  order, each internally truncated MSB-down, dropped segments leave
+  placeholder headers, and the full image geometry is always framed.
+* §V.D eq (9) (`s <= LL pixel count`) is enforced at encode and
+  decode; the wire caps the count at 255 (the MER build allows at most
+  32 segments, §V.C).
+
+Cost: the per-segment scan currently walks the full coefficient buffer
+with a membership predicate, so encode time grows with segment count
+(~40% over row strips at s = 4 on the criterion 64×64 pin); a
+bounding-box scan window is the obvious future trim.
+
+## Minimum-loss quality goal (IPN 42-155 §VI.A)
+
+ICER's two rate-control knobs are the **byte quota** and the **quality
+goal** (§VI): "ICER stops producing compressed bytes once the quality
+goal or byte quota is met, whichever comes first." The quality goal is
+the *minimum loss* parameter `M`: a nonnegative integer such that each
+subband's `max(0, M - offset)` least-significant magnitude bit planes
+are never encoded, with the per-subband relative-importance offsets of
+Fig. 18 (derived from the Fig. 7 priority weights):
+
+```text
+    offset(HH_j)              = j - 1
+    offset(HL_j) = offset(LH_j) = j
+    offset(LL_D)              = D + 1
+```
+
+`priority::min_loss_offset` reproduces the published D = 3 figure
+exactly (LL = 4; level-3 HL/LH = 3, HH = 2; level-2 HL/LH = 2, HH = 1;
+level-1 HL/LH = 1, HH = 0). `M = 0` is lossless when the quota allows;
+if all but `k` planes of a subband are encoded, its pixels are in
+effect quantised with step `2^k` and reconstruct at the §III.A
+deadzone points; `M >= B + D` encodes almost nothing (§VI.A).
+
+```rust
+let opts = oxideav_icer::EncodeOptions::compressed()
+    .with_min_loss(3)                    // quality goal
+    .with_byte_budget(4096);             // quota — whichever binds first
+```
+
+`M` rides the previously-reserved byte of **every packet header** so a
+loss-tolerant decoder learns it from any surviving packet; 0 is the
+historical value, so every pre-existing stream decodes unchanged, and
+`with_min_loss(0)` is proven byte-identical to the plain encode.
+Measured byte curve (textured 128×128, filter Q, 3 levels):
+
+| M | 0 | 1 | 2 | 3 | 4 | 6 | 8 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| bytes | 12884 | 12352 | 10589 | 8432 | 6063 | 2054 | 442 |
+
+Composes with row strips, §V.B transform-domain segments, both entropy
+backends, and the byte quota; monotone in bytes and MSE by test.
+(`min_loss + rd_pruning` is rejected — two different rate-control
+modes.) The 3-D cube path has carried its own §IV.B (IPN 42-164)
+min-loss since r383; this is the 2-D §VI.A realisation.
 
 ## What is *not* implemented
 
@@ -801,8 +906,9 @@ Mid-packet truncation is deferred (needs the IPN 42-155 supplemental
 (2006) -- see the "ICER-3D" section above. Remaining 3-D deltas are the
 same interop unknowns as the 2-D path (the papers leave the byte-level
 container to the implementation) plus the 42-155 §V.D rectangle
-partitioning algorithm, which both the 2-D and 3-D paths approximate
-with row strips.
+partitioning algorithm, which the 2-D path now implements end-to-end
+(`with_transform_domain_segments`, r389) but the 3-D cube path still
+approximates with row strips.
 
 ## Standalone vs registry build
 
@@ -855,6 +961,18 @@ Not a fuzz crash; documented for a future header-validation pass
 
 A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
 budget; OxideAV reusable workflow).
+
+`tests/mutation_smoke.rs` additionally gives every push a bounded,
+deterministic corruption sweep (single-byte flips, exhaustive
+header-field value sweeps, every truncation point, cross-seed splices)
+over the §V.B transform-domain and §VI.A minimum-loss wire forms. On
+its first run it caught two decode-side panics reachable from corrupted
+streams (bit-plane counts near 31 decode coefficients near `i32::MAX`):
+the 5/3 lifting inner neighbour sums and the inverse level shift both
+overflowed in debug — the lifting sums now wrap and the level shift
+saturates. Corpus seeds for the new wire modes (`seed_transform_*`,
+`seed_minloss*`) feed both the scheduled fuzz run and the per-push
+corpus smoke.
 
 ## Decode-side resource limits
 

@@ -578,6 +578,63 @@ fn bench_cube3d_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// §V.B transform-domain segmentation vs the row-strip convention at
+/// the same segment count, plus the §VI.A minimum-loss sweep — the
+/// round-389 additions. Byte-identity of the M = 0 / row-strip wire
+/// form is asserted inside the benchmark setup so a perf tweak that
+/// silently changes the output fails the bench run.
+fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
+    let img = ramp_image(64, 64);
+    let plane_bytes = (64 * 64) as u64;
+
+    let mut strip = compressed_filter_q_opts();
+    strip.segment_count = 4;
+    let mut tf = compressed_filter_q_opts().with_transform_domain_segments();
+    tf.segment_count = 4;
+
+    // Wire-form pins: M = 0 is byte-identical to the plain compressed
+    // encode; the transform-domain stream decodes bit-exactly.
+    let strip_bytes = encode_icer(&img, &strip).unwrap();
+    let strip_m0 = encode_icer(&img, &strip.clone().with_min_loss(0)).unwrap();
+    assert_eq!(strip_bytes, strip_m0, "M = 0 must not change the wire form");
+    let tf_bytes = encode_icer(&img, &tf).unwrap();
+    assert_eq!(
+        parse_icer(&tf_bytes).unwrap().planes[0].data,
+        img.planes[0].data,
+        "transform-domain filter-Q decode must stay bit-exact"
+    );
+
+    let mut group = c.benchmark_group("transform_segments_64x64_s4");
+    group.throughput(Throughput::Bytes(plane_bytes));
+    group.bench_function("encode_row_strip", |b| {
+        b.iter(|| black_box(encode_icer(black_box(&img), &strip).unwrap()));
+    });
+    group.bench_function("encode_transform", |b| {
+        b.iter(|| black_box(encode_icer(black_box(&img), &tf).unwrap()));
+    });
+    group.bench_function("decode_row_strip", |b| {
+        b.iter(|| black_box(parse_icer(black_box(&strip_bytes)).unwrap()));
+    });
+    group.bench_function("decode_transform", |b| {
+        b.iter(|| black_box(parse_icer(black_box(&tf_bytes)).unwrap()));
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("min_loss_64x64");
+    group.throughput(Throughput::Bytes(plane_bytes));
+    for m in [0u8, 2, 4, 8] {
+        let opts = compressed_filter_q_opts().with_min_loss(m);
+        let encoded = encode_icer(&img, &opts).unwrap();
+        group.bench_function(format!("encode_m{m}"), |b| {
+            b.iter(|| black_box(encode_icer(black_box(&img), &opts).unwrap()));
+        });
+        group.bench_function(format!("decode_m{m}"), |b| {
+            b.iter(|| black_box(parse_icer(black_box(&encoded)).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -589,5 +646,6 @@ criterion_group!(
     bench_bit_plane_count_sweep,
     bench_filter_a_wavelet_levels_sweep,
     bench_cube3d_path,
+    bench_transform_segments_and_min_loss,
 );
 criterion_main!(benches);
