@@ -59,6 +59,7 @@ paraphrased, or cross-checked.
 | ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
 | ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
 | ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip segments, `DecodeLimits` caps -- see "ICER-3D" below) |
+| §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; standalone geometry module (`partition`) — the coding pipelines still use their documented row-strip convention pending the §V.B transform-domain emitter rework) |
 
 End-to-end round-trips:
 

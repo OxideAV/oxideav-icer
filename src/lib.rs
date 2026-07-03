@@ -102,6 +102,7 @@ pub mod error;
 pub mod header;
 pub mod image;
 pub mod ixec;
+pub mod partition;
 pub mod plane_container;
 pub mod priority;
 #[cfg(feature = "registry")]
@@ -148,6 +149,7 @@ pub use ixec::{
     bin_for_probability, bins, Bin, ComponentCode, InterleavedDecoder, InterleavedEncoder,
     IxecDecoder, IxecEncoder, BUFFER_WORDS,
 };
+pub use partition::{ll_dimensions, partition, partition_params, PartitionParams, SegmentRect};
 pub use plane_container::{is_container, parse_container, ParsedContainer};
 pub use priority::{
     classify_position, encode_order, subband_weight_map, subbands, Subband, SubbandBitPlane,

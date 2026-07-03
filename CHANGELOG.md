@@ -72,6 +72,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layer with three encoder-produced cube corpus seeds, and the new
   `tests/corpus_smoke.rs` drives the whole corpus per push.
 
+- **IPN 42-155 §V.D partitioning algorithm.** New `partition` module
+  (re-exported at the crate root: `partition`, `partition_params`,
+  `ll_dimensions`, `PartitionParams`, `SegmentRect`) transcribing the
+  §V.D LL-subband rectangle partition exactly: eq (10)'s row-count
+  search (including the published integer loop), assignments (11)-(21)
+  with the integer form of eq (13)'s rounding, raster-scan segment
+  indices, and the eq (9) `s <= w*h` validity precondition. The Fig. 17
+  worked example (w=10, h=14, s=17) pins every output parameter and
+  five segment rectangles; property tests sweep validity (§V.D Property
+  (4): exact tiling, no zero-dimension segments) across geometries and
+  every legal segment count, nearly-equal areas (Property (3)), the
+  tall-narrow `r = s` branch of eq (10), and the MER-style 1024x1024 /
+  6-stage / 8-segment configuration. Standalone geometry for now: the
+  2-D and 3-D pipelines keep their documented image-domain row-strip
+  convention until an emitter rework adopts §V.B transform-domain
+  segmentation.
+
 ### Fixed
 
 - **`parse_icer_lenient` out-of-bounds panic on duplicate segment
