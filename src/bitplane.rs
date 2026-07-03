@@ -120,6 +120,79 @@ fn sign_ctx_for(h_pat: u8, v_pat: u8, x: usize, y: usize, levels: u8) -> (usize,
     )
 }
 
+/// Restricts which coefficients (and which of their magnitude bit
+/// planes) the scan passes visit. Two orthogonal restrictions compose:
+///
+/// * **§V.B transform-domain segmentation** — `segment = Some((map,
+///   seg))` visits only the coefficients whose
+///   [`crate::partition::coefficient_segment_map`] entry equals `seg`.
+///   Coefficients of other segments are never visited and never become
+///   significant in this scan's state, so the §III.B "eight nearest
+///   neighbors from the same segment of the subband" rule holds
+///   automatically: an out-of-segment neighbour reads as
+///   not-yet-significant, exactly the §III.B treatment of a pixel at
+///   the edge of its subband segment.
+/// * **§VI.A minimum loss** — `skip = Some(map)` never codes the bit of
+///   coefficient `i` at a magnitude bit position below `map[i]` (the
+///   per-coefficient LSB-plane exclusion from
+///   [`crate::priority::min_loss_skip_map`]).
+///
+/// [`ScanFilter::ALL`] (both `None`) visits everything; the passes are
+/// then bit-for-bit identical to the unfiltered scan, so every
+/// pre-existing wire form is unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanFilter<'a> {
+    /// §V.B coefficient segment map + the segment index being coded.
+    pub segment: Option<(&'a [u16], u16)>,
+    /// §VI.A per-coefficient skipped-LSB-plane counts.
+    pub skip: Option<&'a [u8]>,
+}
+
+impl ScanFilter<'_> {
+    /// The visit-everything filter (legacy whole-strip scan).
+    pub const ALL: ScanFilter<'static> = ScanFilter {
+        segment: None,
+        skip: None,
+    };
+
+    /// `true` iff coefficient `i`'s bit at magnitude bit position `bp`
+    /// is part of this scan.
+    #[inline]
+    fn visits(&self, i: usize, bp: usize) -> bool {
+        if let Some((map, seg)) = self.segment {
+            if map[i] != seg {
+                return false;
+            }
+        }
+        if let Some(skip) = self.skip {
+            if (bp as u32) < skip[i] as u32 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn validate(&self, n: usize) -> Result<()> {
+        if let Some((map, _)) = self.segment {
+            if map.len() != n {
+                return Err(IcerError::invalid(format!(
+                    "segment map length {} != coeff count {n}",
+                    map.len()
+                )));
+            }
+        }
+        if let Some(skip) = self.skip {
+            if skip.len() != n {
+                return Err(IcerError::invalid(format!(
+                    "skip map length {} != coeff count {n}",
+                    skip.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Describes one wavelet coefficient sub-band's bit-plane scan input.
 /// `coeffs` holds the signed wavelet coefficients in raster scan
 /// order (`width * height` samples). `q` is the bit-plane count from
@@ -234,7 +307,19 @@ pub fn encode_bitplanes_with(
     input: &BitPlaneInput<'_>,
     kind: crate::entropy::EntropyKind,
 ) -> Result<Vec<EncodedPacket>> {
-    encode_bitplanes_inner(input, None, kind)
+    encode_bitplanes_inner(input, None, kind, &ScanFilter::ALL)
+}
+
+/// Like [`encode_bitplanes_with`], restricted by a [`ScanFilter`]
+/// (IPN 42-155 §V.B transform-domain segmentation and/or the §VI.A
+/// minimum-loss plane exclusion). With [`ScanFilter::ALL`] the output
+/// is byte-identical to [`encode_bitplanes_with`].
+pub fn encode_bitplanes_filtered(
+    input: &BitPlaneInput<'_>,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+) -> Result<Vec<EncodedPacket>> {
+    encode_bitplanes_inner(input, None, kind, filter)
 }
 
 /// Like [`encode_bitplanes`], but accepts an optional per-coefficient
@@ -261,21 +346,28 @@ pub fn encode_bitplanes_weighted(
     input: &BitPlaneInput<'_>,
     weights: Option<&[f64]>,
 ) -> Result<Vec<EncodedPacket>> {
-    encode_bitplanes_inner(input, weights, crate::entropy::EntropyKind::Arithmetic)
+    encode_bitplanes_inner(
+        input,
+        weights,
+        crate::entropy::EntropyKind::Arithmetic,
+        &ScanFilter::ALL,
+    )
 }
 
 /// The shared bit-plane encode driver. `kind` selects the entropy
-/// backend; `weights` the optional §III.A distortion weighting. Both the
-/// public weighted and backend-selecting entrypoints funnel here so the
-/// pass logic exists once.
+/// backend; `weights` the optional §III.A distortion weighting; `filter`
+/// the §V.B / §VI.A visit restriction. All public entrypoints funnel
+/// here so the pass logic exists once.
 fn encode_bitplanes_inner(
     input: &BitPlaneInput<'_>,
     weights: Option<&[f64]>,
     kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
 ) -> Result<Vec<EncodedPacket>> {
     input.validate()?;
     let n = input.coeffs.len();
     let q = input.q as usize;
+    filter.validate(n)?;
     if let Some(w) = weights {
         if w.len() != n {
             return Err(IcerError::invalid(format!(
@@ -315,6 +407,7 @@ fn encode_bitplanes_inner(
             input.height,
             bp,
             input.levels,
+            filter,
         );
 
         // Distortion-reduction model: each newly-significant coefficient
@@ -358,6 +451,7 @@ fn encode_bitplanes_inner(
             input.height,
             bp,
             weights,
+            filter,
         );
 
         encode_refinement_pass(
@@ -370,6 +464,7 @@ fn encode_bitplanes_inner(
             input.height,
             bp,
             input.levels,
+            filter,
         );
 
         // Distortion-reduction model: each refined coefficient halves
@@ -393,6 +488,7 @@ fn encode_bitplanes_inner(
 /// R-D distortion estimate). Matches the iteration inside
 /// [`encode_refinement_pass`] exactly. With `weights = None` this is a
 /// plain count of refined coefficients (each weight 1.0).
+#[allow(clippy::too_many_arguments)]
 fn refinement_weight_sum(
     coeffs: &[i32],
     significant: &[bool],
@@ -400,6 +496,7 @@ fn refinement_weight_sum(
     height: usize,
     bp: usize,
     weights: Option<&[f64]>,
+    filter: &ScanFilter<'_>,
 ) -> f64 {
     let mut sum = 0.0f64;
     let mut stripe_start = 0;
@@ -408,7 +505,7 @@ fn refinement_weight_sum(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if !significant[i] {
+                if !filter.visits(i, bp) || !significant[i] {
                     continue;
                 }
                 let m = coeffs[i].unsigned_abs();
@@ -459,12 +556,29 @@ pub fn decode_bitplanes_multi_with(
     levels: u8,
     kind: crate::entropy::EntropyKind,
 ) -> Result<Vec<i32>> {
+    decode_bitplanes_filtered(packets, width, height, q, levels, kind, &ScanFilter::ALL)
+}
+
+/// Like [`decode_bitplanes_multi_with`], restricted by a [`ScanFilter`]
+/// (must equal the filter the encoder used, or the entropy decode
+/// desynchronises). Coefficients outside the filter decode as `0`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_bitplanes_filtered(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+    levels: u8,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+) -> Result<Vec<i32>> {
     let n = width * height;
     if q == 0 || q > 31 {
         return Err(IcerError::invalid(format!(
             "bit-plane count {q} outside (0,31]"
         )));
     }
+    filter.validate(n)?;
     let q_usize = q as usize;
 
     let mut significant = vec![false; n];
@@ -517,6 +631,7 @@ pub fn decode_bitplanes_multi_with(
             height,
             bp,
             levels,
+            filter,
         )?;
 
         // Find the refinement packet for this bit-plane index. When it is
@@ -544,6 +659,7 @@ pub fn decode_bitplanes_multi_with(
                 height,
                 bp,
                 levels,
+                filter,
             )?;
         } else {
             // No refinement packet at this depth (the budget cut fell
@@ -556,7 +672,7 @@ pub fn decode_bitplanes_multi_with(
             // truncated stream usually has no lower planes either, but
             // this keeps the model exact when only the refinement packet
             // of an intermediate plane is missing.)
-            advance_refinement_categories(&significant, &mag, &mut cat, width, height, bp);
+            advance_refinement_categories(&significant, &mag, &mut cat, width, height, bp, filter);
         }
     }
 
@@ -664,6 +780,7 @@ fn encode_significance_pass(
     height: usize,
     bp: usize,
     levels: u8,
+    filter: &ScanFilter<'_>,
 ) {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -671,7 +788,7 @@ fn encode_significance_pass(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if significant[i] {
+                if !filter.visits(i, bp) || significant[i] {
                     continue;
                 }
                 let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
@@ -730,6 +847,7 @@ fn decode_significance_pass(
     height: usize,
     bp: usize,
     levels: u8,
+    filter: &ScanFilter<'_>,
 ) -> Result<()> {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -737,7 +855,7 @@ fn decode_significance_pass(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if significant[i] {
+                if !filter.visits(i, bp) || significant[i] {
                     continue;
                 }
                 let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
@@ -791,6 +909,7 @@ fn encode_refinement_pass(
     height: usize,
     bp: usize,
     levels: u8,
+    filter: &ScanFilter<'_>,
 ) {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -798,7 +917,7 @@ fn encode_refinement_pass(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if !significant[i] {
+                if !filter.visits(i, bp) || !significant[i] {
                     continue;
                 }
                 let m = coeffs[i].unsigned_abs();
@@ -847,6 +966,7 @@ fn advance_refinement_categories(
     width: usize,
     height: usize,
     bp: usize,
+    filter: &ScanFilter<'_>,
 ) {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -854,7 +974,7 @@ fn advance_refinement_categories(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if !significant[i] {
+                if !filter.visits(i, bp) || !significant[i] {
                     continue;
                 }
                 if highest_set_bit(mag[i]) == Some(bp as u32) {
@@ -888,6 +1008,7 @@ fn decode_refinement_pass(
     height: usize,
     bp: usize,
     levels: u8,
+    filter: &ScanFilter<'_>,
 ) -> Result<()> {
     let mut stripe_start = 0;
     while stripe_start < height {
@@ -895,7 +1016,7 @@ fn decode_refinement_pass(
         for y in stripe_start..stripe_end {
             for x in 0..width {
                 let i = y * width + x;
-                if !significant[i] {
+                if !filter.visits(i, bp) || !significant[i] {
                     continue;
                 }
                 if highest_set_bit(mag[i]) == Some(bp as u32) {
@@ -1938,5 +2059,135 @@ mod tests {
             "with a mid-plane cut the per-coefficient deadzone should \
              strictly beat strip-global (got {per_coef_mse} vs {global_mse})"
         );
+    }
+
+    /// [`ScanFilter::ALL`] must be byte-identical to the unfiltered
+    /// entry points on both entropy backends.
+    #[test]
+    fn scan_filter_all_is_wire_identical() {
+        let (w, h) = (16usize, 16usize);
+        let coeffs = lcg_signal(w * h, 256, 0x51CA);
+        let q = select_bit_plane_count(&coeffs);
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+            levels: 3,
+        };
+        for kind in [
+            crate::entropy::EntropyKind::Arithmetic,
+            crate::entropy::EntropyKind::Interleaved,
+        ] {
+            let plain = encode_bitplanes_with(&input, kind).unwrap();
+            let filtered = encode_bitplanes_filtered(&input, kind, &ScanFilter::ALL).unwrap();
+            assert_eq!(plain.len(), filtered.len());
+            for (a, b) in plain.iter().zip(filtered.iter()) {
+                assert_eq!(a.body, b.body, "backend {kind:?} wire form must not change");
+            }
+        }
+    }
+
+    /// §V.B segment restriction: coding the two halves of a buffer as
+    /// separate segment scans and merging the decodes reproduces the
+    /// original coefficients exactly, and each segment's decode leaves
+    /// out-of-segment coefficients at zero.
+    #[test]
+    fn scan_filter_segment_split_roundtrips() {
+        let (w, h) = (16usize, 12usize);
+        let coeffs = lcg_signal(w * h, 200, 0xB0A7);
+        let q = select_bit_plane_count(&coeffs);
+        // Left/right split map (a §V.B-shaped mask; the real map comes
+        // from partition::coefficient_segment_map in the pipeline).
+        let map: Vec<u16> = (0..w * h).map(|i| u16::from(i % w >= w / 2)).collect();
+        let mut merged = vec![0i32; w * h];
+        for seg in 0..2u16 {
+            let filter = ScanFilter {
+                segment: Some((&map, seg)),
+                skip: None,
+            };
+            let input = BitPlaneInput {
+                coeffs: &coeffs,
+                width: w,
+                height: h,
+                q,
+                levels: 2,
+            };
+            let packets =
+                encode_bitplanes_filtered(&input, crate::entropy::EntropyKind::Arithmetic, &filter)
+                    .unwrap();
+            let out = decode_bitplanes_filtered(
+                &packets,
+                w,
+                h,
+                q,
+                2,
+                crate::entropy::EntropyKind::Arithmetic,
+                &filter,
+            )
+            .unwrap();
+            for i in 0..w * h {
+                if map[i] == seg {
+                    merged[i] = out[i];
+                } else {
+                    assert_eq!(out[i], 0, "out-of-segment coefficient must stay zero");
+                }
+            }
+        }
+        assert_eq!(merged, coeffs, "two-segment merge must be lossless");
+    }
+
+    /// §VI.A skip restriction: a skip map zeroes exactly the excluded
+    /// LSB planes (with the §III.A deadzone bias on the kept planes) and
+    /// decodes without desynchronising.
+    #[test]
+    fn scan_filter_skip_planes_roundtrips() {
+        let (w, h) = (12usize, 12usize);
+        let coeffs = lcg_signal(w * h, 512, 0x0FF5);
+        let q = select_bit_plane_count(&coeffs);
+        // Uniform two-plane exclusion.
+        let skip = vec![2u8; w * h];
+        let filter = ScanFilter {
+            segment: None,
+            skip: Some(&skip),
+        };
+        let input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: w,
+            height: h,
+            q,
+            levels: 2,
+        };
+        let packets =
+            encode_bitplanes_filtered(&input, crate::entropy::EntropyKind::Arithmetic, &filter)
+                .unwrap();
+        let out = decode_bitplanes_filtered(
+            &packets,
+            w,
+            h,
+            q,
+            2,
+            crate::entropy::EntropyKind::Arithmetic,
+            &filter,
+        )
+        .unwrap();
+        for (i, (&orig, &dec)) in coeffs.iter().zip(out.iter()).enumerate() {
+            let mag = orig.unsigned_abs();
+            if mag < 4 {
+                // Entirely inside the excluded planes: deadzone centre.
+                assert_eq!(dec, 0, "coeff {i}: {orig} within deadzone");
+            } else {
+                // Kept planes exact, excluded planes at the §III.A
+                // mid-bin point biased toward the origin: ∆ = 4,
+                // reconstruction = lower_edge + ∆/2 - 1.
+                let expect_mag = (mag & !3) + 1;
+                let expect = if orig < 0 {
+                    -(expect_mag as i32)
+                } else {
+                    expect_mag as i32
+                };
+                assert_eq!(dec, expect, "coeff {i}: {orig}");
+            }
+        }
     }
 }

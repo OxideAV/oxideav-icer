@@ -310,6 +310,61 @@ pub fn subband_stride(x: usize, y: usize, levels: u8) -> usize {
     1usize << level
 }
 
+/// §VI.A Fig. 18 relative-importance offset of a subband: "if the
+/// minimum loss value minus the number shown is positive, then this
+/// difference equals the number of bit planes of the subband that will
+/// not be encoded no matter how large the byte quota is."
+///
+/// Fig. 18 is derived from the Fig. 7 priority weights (§VI.A), with
+/// the level-1 HH subband (the least important) pinned at 0, so the
+/// offset is the subband's `log2` weight relative to level-1 HH's
+/// (`weight_log2 = -1`):
+///
+/// ```text
+///     offset(HH_j)              = j - 1
+///     offset(HL_j) = offset(LH_j) = j
+///     offset(LL_D)              = D + 1
+/// ```
+///
+/// For `D = 3` this reproduces Fig. 18 exactly (LL = 4; level-3 HL/LH =
+/// 3, HH = 2; level-2 HL/LH = 2, HH = 1; level-1 HL/LH = 1, HH = 0).
+pub fn min_loss_offset(subband: Subband, decomposition_levels: u8) -> u32 {
+    (subband.weight_log2(decomposition_levels) + 1) as u32
+}
+
+/// Per-coefficient count of least-significant magnitude bit planes that
+/// the §VI.A minimum-loss parameter `M` excludes from encoding:
+/// `max(0, M - offset)` with the Fig. 18 per-subband offset.
+///
+/// "A minimum loss value of M means that compression will stop before
+/// the last M bit planes of the level-1 HH subband are encoded.
+/// Similarly, bit planes with sufficiently low importance in other
+/// subbands are not encoded, taking into account the relative
+/// importance of the different subbands" (§VI.A). The returned map is
+/// indexed like the interleaved coefficient buffer; entry `i` is the
+/// number of LSB planes never coded for coefficient `i`, so a plane at
+/// magnitude bit position `bp` is coded iff `bp >= map[i]`.
+///
+/// `min_loss == 0` yields the all-zero map (lossless when the byte
+/// quota allows — §VI.A).
+pub fn min_loss_skip_map(width: usize, height: usize, levels: u8, min_loss: u8) -> Vec<u8> {
+    let levels = levels.clamp(1, 6);
+    let m = min_loss as i64;
+    // One skip value per (SubbandType, level) class; small table.
+    let mut out = vec![0u8; width * height];
+    if min_loss == 0 {
+        return out;
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let (kind, level) = classify_position(x, y, levels);
+            let off = min_loss_offset(Subband { kind, level }, levels) as i64;
+            out[y * width + x] = (m - off).clamp(0, u8::MAX as i64) as u8;
+        }
+    }
+    out
+}
+
 /// Per-coefficient image-domain distortion weight for a `levels`-stage
 /// decomposition of a `width * height` strip under `filter`.
 ///
@@ -639,6 +694,72 @@ mod tests {
     fn subband_stride_levels0_is_unit() {
         assert_eq!(subband_stride(3, 7, 0), 1);
         assert_eq!(subband_stride(0, 0, 0), 1);
+    }
+
+    /// §VI.A Fig. 18: relative importance of subbands for a 3-stage
+    /// decomposition — LL = 4, level-3 HL/LH = 3, level-3 HH = 2,
+    /// level-2 HL/LH = 2, level-2 HH = 1, level-1 HL/LH = 1, HH = 0.
+    #[test]
+    fn fig18_offsets_d3() {
+        let d = 3u8;
+        let cases = [
+            (SubbandType::Ll, 3u8, 4u32),
+            (SubbandType::Hl, 3, 3),
+            (SubbandType::Lh, 3, 3),
+            (SubbandType::Hh, 3, 2),
+            (SubbandType::Hl, 2, 2),
+            (SubbandType::Lh, 2, 2),
+            (SubbandType::Hh, 2, 1),
+            (SubbandType::Hl, 1, 1),
+            (SubbandType::Lh, 1, 1),
+            (SubbandType::Hh, 1, 0),
+        ];
+        for (kind, level, expect) in cases {
+            assert_eq!(
+                min_loss_offset(Subband { kind, level }, d),
+                expect,
+                "Fig. 18 offset for {kind:?} level {level}"
+            );
+        }
+    }
+
+    /// §VI.A worked examples: M = 1 excludes exactly the level-1 HH LSB
+    /// plane; M = 2 excludes 2 planes of level-1 HH and 1 plane of each
+    /// of level-1 LH / level-1 HL / level-2 HH.
+    #[test]
+    fn min_loss_skip_map_follows_fig18() {
+        let (w, h, d) = (16usize, 16usize, 3u8);
+        let m0 = min_loss_skip_map(w, h, d, 0);
+        assert!(m0.iter().all(|&v| v == 0), "M = 0 is lossless");
+
+        let m1 = min_loss_skip_map(w, h, d, 1);
+        let m2 = min_loss_skip_map(w, h, d, 2);
+        for y in 0..h {
+            for x in 0..w {
+                let (kind, level) = classify_position(x, y, d);
+                let i = y * w + x;
+                let expect1 = u8::from(kind == SubbandType::Hh && level == 1);
+                assert_eq!(m1[i], expect1, "M=1 at ({x},{y}) {kind:?} L{level}");
+                let expect2 = match (kind, level) {
+                    (SubbandType::Hh, 1) => 2,
+                    (SubbandType::Hl, 1) | (SubbandType::Lh, 1) | (SubbandType::Hh, 2) => 1,
+                    _ => 0,
+                };
+                assert_eq!(m2[i], expect2, "M=2 at ({x},{y}) {kind:?} L{level}");
+            }
+        }
+    }
+
+    /// §VI.A: "When the original image has a dynamic range of B bits per
+    /// pixel, D stages of wavelet decomposition are used, and M >= B + D,
+    /// then little or no bit-plane information will be encoded" — the LL
+    /// offset D + 1 is the largest, so M above it skips planes everywhere.
+    #[test]
+    fn min_loss_saturates_every_subband() {
+        let (w, h, d) = (16usize, 16usize, 3u8);
+        let map = min_loss_skip_map(w, h, d, 12);
+        // Every coefficient skips at least 12 - (D + 1) = 8 planes.
+        assert!(map.iter().all(|&v| v >= 8));
     }
 
     /// The §III.A weight map is well-formed (one positive weight per

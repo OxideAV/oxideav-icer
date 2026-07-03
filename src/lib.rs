@@ -124,7 +124,9 @@ pub use analyze::{
     quality_search_bounds, recommend_filter, region_mae, ssim, supported_for_analysis,
     DistortionReport, ImageStats, DEFAULT_RD_CANDIDATES,
 };
-pub use bitplane::EncodedPacket;
+pub use bitplane::{
+    decode_bitplanes_filtered, encode_bitplanes_filtered, EncodedPacket, ScanFilter,
+};
 pub use context::{
     neighbour_counts, sign_context_subband, sign_prediction_flip_subband,
     significance_context_subband, significance_context_table6, significance_context_table7,
