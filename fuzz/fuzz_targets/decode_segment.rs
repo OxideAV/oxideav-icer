@@ -42,8 +42,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_icer::{
-    parse_icer_lenient_with_limits, parse_icer_metadata, parse_icer_with_limits, walk_segment,
-    DecodeLimits,
+    parse_icer3d_with_limits, parse_icer_lenient_with_limits, parse_icer_metadata,
+    parse_icer_with_limits, walk_segment, DecodeLimits,
 };
 
 /// Per-iteration geometry budget. Far below the public 64 MPx default so
@@ -75,4 +75,11 @@ fuzz_target!(|data: &[u8]| {
     // panics.
     let _ = parse_icer_with_limits(data, &FUZZ_LIMITS);
     let _ = parse_icer_lenient_with_limits(data, &FUZZ_LIMITS);
+
+    // Layer 4: the ICER-3D cube decoder (IPN 42-164) under the same
+    // tight budget — its 0x0000 + 0xC3 magic never collides with the
+    // 2-D layers, so this costs nothing on non-cube inputs while giving
+    // the cube framing parser + 3-D inverse DWT + spectral-context
+    // bit-plane decoder full corpus coverage.
+    let _ = parse_icer3d_with_limits(data, &FUZZ_LIMITS);
 });
