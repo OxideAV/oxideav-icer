@@ -67,7 +67,11 @@ pub fn forward_53_1d(row: &mut [i32]) {
         // Floor-division by shift requires the operand to be non-negative
         // for a deterministic result; coefficients are signed so we use a
         // arithmetic shift via Rust's `>>` on i32 which is arithmetic.
-        row[2 * k + 1] = row[2 * k + 1].wrapping_sub((l_k + l_k1) >> 1);
+        // The inner neighbour sums wrap: a corrupted stream can decode
+        // coefficients near i32::MAX (bit-plane count up to 31), and the
+        // decoder's contract on garbage input is garbage output, never a
+        // panic (found by the header-sweep mutation smoke).
+        row[2 * k + 1] = row[2 * k + 1].wrapping_sub(l_k.wrapping_add(l_k1) >> 1);
         k += 1;
     }
 
@@ -83,7 +87,7 @@ pub fn forward_53_1d(row: &mut [i32]) {
         } else {
             row[2 * k - 1]
         };
-        row[2 * k] = row[2 * k].wrapping_add((h_km1 + h_k + 2) >> 2);
+        row[2 * k] = row[2 * k].wrapping_add(h_km1.wrapping_add(h_k).wrapping_add(2) >> 2);
         k += 1;
     }
 }
@@ -102,7 +106,7 @@ pub fn inverse_53_1d(row: &mut [i32]) {
         let h_k_idx = 2 * k + 1;
         let h_k = if h_k_idx < n { row[h_k_idx] } else { 0 };
         let h_km1 = if k == 0 { h_k } else { row[2 * k - 1] };
-        row[2 * k] = row[2 * k].wrapping_sub((h_km1 + h_k + 2) >> 2);
+        row[2 * k] = row[2 * k].wrapping_sub(h_km1.wrapping_add(h_k).wrapping_add(2) >> 2);
         k += 1;
     }
     // Un-predict step: H[k] += (L[k] + L[k+1]) >> 1.
@@ -115,7 +119,7 @@ pub fn inverse_53_1d(row: &mut [i32]) {
         } else {
             row[2 * k]
         };
-        row[2 * k + 1] = row[2 * k + 1].wrapping_add((l_k + l_k1) >> 1);
+        row[2 * k + 1] = row[2 * k + 1].wrapping_add(l_k.wrapping_add(l_k1) >> 1);
         k += 1;
     }
 }

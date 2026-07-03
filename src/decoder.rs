@@ -542,7 +542,7 @@ fn decode_transform_domain(
     for y in 0..h {
         let dst = &mut plane.data[y * plane.stride..y * plane.stride + w];
         for x in 0..w {
-            let v = coeffs[y * w + x] + 128;
+            let v = coeffs[y * w + x].saturating_add(128);
             dst[x] = v.clamp(0, 255) as u8;
         }
     }
@@ -649,12 +649,13 @@ fn decode_compressed_segment_into(
         )?
     };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
-    // Inverse level-shift + clamp to 0..=255.
+    // Inverse level-shift + clamp to 0..=255. Saturating: a corrupted
+    // stream can decode coefficients near i32::MAX (mutation smoke).
     for y in 0..height {
         let dst =
             &mut plane.data[(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + width];
         for x in 0..width {
-            let v = coeffs[y * width + x] + 128;
+            let v = coeffs[y * width + x].saturating_add(128);
             dst[x] = v.clamp(0, 255) as u8;
         }
     }
