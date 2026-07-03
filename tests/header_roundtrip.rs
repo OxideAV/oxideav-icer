@@ -26,6 +26,8 @@ fn segment_header_roundtrip_all_filters() {
                         height: 192,
                         bit_plane_count: 8,
                         interleaved_entropy,
+                        transform_segmented: false,
+                        total_segments: 0,
                         segment_length: 1234,
                         segment_index: 0,
                     };
@@ -36,6 +38,76 @@ fn segment_header_roundtrip_all_filters() {
                 }
             }
         }
+    }
+}
+
+/// §V.B transform-domain segment headers round-trip the
+/// (total_segments, segment_index) pair carried in bytes 10..12, and
+/// the parser enforces the §V.D validity conditions.
+#[test]
+fn segment_header_transform_segmented_roundtrip() {
+    for (total, index) in [(1u8, 0u16), (2, 1), (17, 16), (255, 254)] {
+        let h = SegmentHeader {
+            sync_prefix: 0xACED,
+            filter: WaveletFilter::Reversible53,
+            decomp_levels: 3,
+            uncompressed: false,
+            width: 64,
+            height: 64,
+            bit_plane_count: 8,
+            interleaved_entropy: false,
+            transform_segmented: true,
+            total_segments: total,
+            segment_length: 0,
+            segment_index: index,
+        };
+        let enc = h.encode();
+        let (parsed, _) = SegmentHeader::parse(&enc).unwrap();
+        assert_eq!(parsed, h);
+    }
+}
+
+#[test]
+fn segment_header_transform_segmented_rejects_bad_counts() {
+    let h = SegmentHeader {
+        sync_prefix: 0xACED,
+        filter: WaveletFilter::Reversible53,
+        decomp_levels: 3,
+        uncompressed: false,
+        width: 64,
+        height: 64,
+        bit_plane_count: 8,
+        interleaved_entropy: false,
+        transform_segmented: true,
+        total_segments: 4,
+        segment_length: 0,
+        segment_index: 0,
+    };
+    // total_segments = 0 is invalid.
+    let mut enc = h.encode();
+    enc[10] = 0;
+    assert!(SegmentHeader::parse(&enc).is_err());
+    // segment_index >= total_segments is invalid.
+    let mut enc = h.encode();
+    enc[11] = 4;
+    assert!(SegmentHeader::parse(&enc).is_err());
+}
+
+/// The §VI.A minimum-loss byte (packet header byte 3, previously
+/// reserved-must-be-zero) round-trips; 0 remains the historical form.
+#[test]
+fn packet_header_min_loss_roundtrip() {
+    for m in [0u8, 1, 7, 255] {
+        let p = PacketHeader {
+            bit_plane: 3,
+            pass: BitPlanePass::Significance,
+            body_length: 99,
+            min_loss: m,
+        };
+        let enc = p.encode();
+        assert_eq!(enc[3], m);
+        let (parsed, _) = PacketHeader::parse(&enc).unwrap();
+        assert_eq!(parsed, p);
     }
 }
 
@@ -78,6 +150,7 @@ fn packet_header_roundtrip() {
                 bit_plane: bp,
                 pass,
                 body_length: 0xCAFE,
+                min_loss: 0,
             };
             let enc = p.encode();
             let (parsed, n) = PacketHeader::parse(&enc).unwrap();
@@ -96,11 +169,13 @@ fn walk_segment_with_two_packets() {
         bit_plane: 0,
         pass: BitPlanePass::Cleanup,
         body_length: body0.len() as u16,
+        min_loss: 0,
     };
     let p1 = PacketHeader {
         bit_plane: 1,
         pass: BitPlanePass::Refinement,
         body_length: body1.len() as u16,
+        min_loss: 0,
     };
     let mut packets_concat = Vec::new();
     packets_concat.extend_from_slice(&p0.encode());
@@ -117,6 +192,8 @@ fn walk_segment_with_two_packets() {
         height: 16,
         bit_plane_count: 8,
         interleaved_entropy: false,
+        transform_segmented: false,
+        total_segments: 0,
         segment_length: packets_concat.len() as u16,
         segment_index: 0,
     };

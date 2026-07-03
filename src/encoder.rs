@@ -838,6 +838,8 @@ fn emit_skipped_placeholders(
             height: this_h as u16,
             bit_plane_count: opts.bit_plane_count.clamp(1, 32),
             interleaved_entropy: opts.interleaved_entropy && !opts.uncompressed,
+            transform_segmented: false,
+            total_segments: 0,
             segment_length: 0,
             segment_index: seg_idx as u16,
         };
@@ -933,6 +935,7 @@ fn encode_one_segment_uncompressed(
         bit_plane: 0,
         pass: BitPlanePass::Cleanup,
         body_length: body_len as u16,
+        min_loss: 0,
     };
     finish_segment(&packet, &body, segment_index, img_w, strip_h, opts, true)
 }
@@ -1150,6 +1153,7 @@ fn encode_one_segment_compressed(
                 bit_plane: pkt.bit_plane,
                 pass,
                 body_length: pkt.body.len() as u16,
+                min_loss: 0,
             };
             body.extend_from_slice(&ph.encode());
             body.extend_from_slice(&pkt.body);
@@ -1208,6 +1212,8 @@ fn emit_segment_header_and_body(
         height: height as u16,
         bit_plane_count: opts.bit_plane_count.clamp(1, 32),
         interleaved_entropy: opts.interleaved_entropy && !uncompressed,
+        transform_segmented: false,
+        total_segments: 0,
         segment_length: segment_length as u16,
         segment_index,
     };
@@ -1497,6 +1503,8 @@ fn finish_segment(
         height: height as u16,
         bit_plane_count: opts.bit_plane_count.clamp(1, 32),
         interleaved_entropy: opts.interleaved_entropy && !uncompressed,
+        transform_segmented: false,
+        total_segments: 0,
         segment_length: segment_length as u16,
         segment_index,
     };

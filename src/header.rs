@@ -137,6 +137,23 @@ pub struct SegmentHeader {
     /// previously-reserved 2-bit field, so every pre-existing stream
     /// (reserved = 0) parses as `false` unchanged.
     pub interleaved_entropy: bool,
+    /// `true` when the segment carries a §V.B **transform-domain**
+    /// segment: the wavelet transform ran over the whole image, the LL
+    /// subband was partitioned by the §V.D algorithm, and this segment
+    /// codes the coefficients the partition maps to it. The header's
+    /// `width` / `height` then carry the **full image** dimensions, and
+    /// bytes 10..12 carry `(total_segments, segment_index)` so the
+    /// decompressor recomputes the identical partition "from the image
+    /// dimensions, the number of stages of wavelet decomposition, and
+    /// the total number of segments" (§V.D) — segment boundaries are
+    /// never encoded. Carried in byte 7's last previously-reserved bit,
+    /// so every pre-existing stream (reserved = 0) parses as `false`
+    /// (the row-strip convention) unchanged.
+    pub transform_segmented: bool,
+    /// §V.D total segment count of the transform-domain partition.
+    /// Meaningful (and non-zero) only when [`Self::transform_segmented`]
+    /// is set; `0` on row-strip segments.
+    pub total_segments: u8,
     /// Total compressed body size of this segment in bytes — does not
     /// include the segment header itself. Used by the demuxer / packet
     /// walker to skip past a segment whose interior it can't (yet)
@@ -188,15 +205,10 @@ impl SegmentHeader {
         }
 
         // Byte 7: 6 bits bit-plane Q (top), 1 bit entropy backend, 1 bit
-        // reserved (bottom).
+        // §V.B transform-domain segmentation (bottom).
         let bit_plane_count = bytes[7] >> 2;
         let interleaved_entropy = (bytes[7] & 0b0000_0010) != 0;
-        let reserved = bytes[7] & 0b0000_0001;
-        if reserved != 0 {
-            return Err(IcerError::invalid(format!(
-                "reserved bit in byte 7 must be zero, got {reserved:#04b}"
-            )));
-        }
+        let transform_segmented = (bytes[7] & 0b0000_0001) != 0;
         if bit_plane_count == 0 || bit_plane_count > 32 {
             return Err(IcerError::invalid(format!(
                 "bit-plane count {bit_plane_count} outside (0,32] (IPN 42-155 §III.B)"
@@ -206,8 +218,27 @@ impl SegmentHeader {
         // Bytes 8..10: segment length BE.
         let segment_length = u16::from_be_bytes([bytes[8], bytes[9]]);
 
-        // Bytes 10..12: segment index BE.
-        let segment_index = u16::from_be_bytes([bytes[10], bytes[11]]);
+        // Bytes 10..12: on a §V.B transform-domain segment,
+        // (total_segments, segment_index) so the decompressor can
+        // recompute the §V.D partition; otherwise the row-strip
+        // segment index BE.
+        let (total_segments, segment_index) = if transform_segmented {
+            let total = bytes[10];
+            let index = bytes[11];
+            if total == 0 {
+                return Err(IcerError::invalid(
+                    "transform-domain segment declares zero total segments (§V.D)",
+                ));
+            }
+            if index >= total {
+                return Err(IcerError::invalid(format!(
+                    "transform-domain segment index {index} >= total {total} (§V.D)"
+                )));
+            }
+            (total, index as u16)
+        } else {
+            (0, u16::from_be_bytes([bytes[10], bytes[11]]))
+        };
 
         Ok((
             SegmentHeader {
@@ -219,6 +250,8 @@ impl SegmentHeader {
                 height,
                 bit_plane_count,
                 interleaved_entropy,
+                transform_segmented,
+                total_segments,
                 segment_length,
                 segment_index,
             },
@@ -239,10 +272,19 @@ impl SegmentHeader {
         out[3..5].copy_from_slice(&self.width.to_be_bytes());
         out[5..7].copy_from_slice(&self.height.to_be_bytes());
         // Byte 7: Q in the top 6 bits, entropy-backend flag in bit 1,
-        // reserved bit 0 stays zero.
-        out[7] = (self.bit_plane_count << 2) | (u8::from(self.interleaved_entropy) << 1);
+        // §V.B transform-domain segmentation flag in bit 0.
+        out[7] = (self.bit_plane_count << 2)
+            | (u8::from(self.interleaved_entropy) << 1)
+            | u8::from(self.transform_segmented);
         out[8..10].copy_from_slice(&self.segment_length.to_be_bytes());
-        out[10..12].copy_from_slice(&self.segment_index.to_be_bytes());
+        if self.transform_segmented {
+            debug_assert!(self.total_segments >= 1);
+            debug_assert!(self.segment_index < self.total_segments as u16);
+            out[10] = self.total_segments;
+            out[11] = self.segment_index as u8;
+        } else {
+            out[10..12].copy_from_slice(&self.segment_index.to_be_bytes());
+        }
         out
     }
 }
@@ -261,7 +303,7 @@ impl SegmentHeader {
 /// |  6   | bit-plane index  |
 /// |  2   | pass id (cleanup / signif / refinement) |
 /// | 16   | body length (bytes) |
-/// |  8   | reserved (must be 0) |
+/// |  8   | §VI.A minimum-loss parameter (0 on pre-existing streams) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketHeader {
     /// Bit-plane this packet refines, counting from the MSB downward.
@@ -272,6 +314,21 @@ pub struct PacketHeader {
     pub pass: BitPlanePass,
     /// Length of the arithmetic-coded body that follows, in bytes.
     pub body_length: u16,
+    /// The IPN 42-155 §VI.A *minimum loss* quality-goal parameter `M`
+    /// the encoder applied to this packet's segment: per subband,
+    /// `max(0, M - Fig.18 offset)` least-significant magnitude bit
+    /// planes were never encoded (see
+    /// [`crate::priority::min_loss_skip_map`]). The decoder must apply
+    /// the identical per-subband plane exclusion or the entropy decode
+    /// desynchronises.
+    ///
+    /// A segment-level parameter, replicated in every one of the
+    /// segment's packet headers (the previously-reserved byte 3) for
+    /// loss resilience: any surviving packet teaches the decoder the
+    /// segment's `M`. Pre-existing streams carry 0 here — the reserved
+    /// byte's mandatory value — which is exactly `M = 0` (no plane
+    /// excluded), so they decode unchanged.
+    pub min_loss: u8,
 }
 
 /// Bit-plane pass identifier — IPN 42-155 §III.B "Bit-Plane Encoder
@@ -319,17 +376,16 @@ impl PacketHeader {
         let bit_plane = b0 >> 2;
         let pass = BitPlanePass::from_bits(b0 & 0b11)?;
         let body_length = u16::from_be_bytes([bytes[1], bytes[2]]);
-        let reserved = bytes[3];
-        if reserved != 0 {
-            return Err(IcerError::invalid(format!(
-                "packet reserved byte must be zero, got {reserved:#04x}"
-            )));
-        }
+        // Byte 3 was reserved-must-be-zero before the §VI.A quality
+        // goal landed; it now carries the segment's minimum-loss
+        // parameter (0 = no plane excluded = the historical meaning).
+        let min_loss = bytes[3];
         Ok((
             PacketHeader {
                 bit_plane,
                 pass,
                 body_length,
+                min_loss,
             },
             Self::ENCODED_BYTES,
         ))
@@ -339,7 +395,7 @@ impl PacketHeader {
         let mut out = [0u8; Self::ENCODED_BYTES];
         out[0] = (self.bit_plane << 2) | (self.pass as u8 & 0b11);
         out[1..3].copy_from_slice(&self.body_length.to_be_bytes());
-        out[3] = 0;
+        out[3] = self.min_loss;
         out
     }
 }
