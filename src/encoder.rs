@@ -20,7 +20,7 @@
 //!   * **Filter G** -- Le Gall 5/3 float variant; wired through both
 //!     encode and decode dispatch paths.
 
-use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket};
+use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
@@ -250,6 +250,56 @@ pub struct EncodeOptions {
     /// entropy-backend flag so the decoder dispatches the matching
     /// backend. No effect on the uncompressed §III.D path.
     pub interleaved_entropy: bool,
+
+    /// §V.B **transform-domain** segmentation (IPN 42-155 §V.B + §V.D).
+    ///
+    /// When `true` (compressed path only), the wavelet transform runs
+    /// over the **whole image** once, the LL subband is partitioned into
+    /// `segment_count` nearly-square rectangles by the §V.D algorithm,
+    /// and the partition is mapped to every subband (§V.B: pixels in
+    /// different subbands corresponding to the same spatial location
+    /// belong to the same segment — see
+    /// [`crate::partition::coefficient_segment_map`]). Each segment is
+    /// then bit-plane-coded independently with its own context modeler
+    /// and entropy coder, exactly the §V.B error-containment contract.
+    ///
+    /// Versus the historical row-strip convention (`false`, the
+    /// default) this eliminates the strip-boundary artifacts §V.B
+    /// warns about ("by segmenting the image in the transform domain,
+    /// we can virtually guarantee that such artifacts will not occur")
+    /// and achieves better decorrelation because the transform sees the
+    /// whole image; a lost segment degrades to a smooth low-detail
+    /// patch (zero coefficients through the shared inverse transform)
+    /// instead of a flat-128 strip.
+    ///
+    /// The §V.D eq (9) validity condition applies: `segment_count`
+    /// must not exceed the LL subband's pixel count
+    /// (`ceil(W/2^D) * ceil(H/2^D)`); the wire form caps the count at
+    /// 255. Composes with `byte_budget` / `target_bytes` /
+    /// `segment_priorities` / `min_loss` and both entropy backends;
+    /// `rd_pruning` and `auto_uncompressed_fallback` remain row-strip
+    /// features and return `Unsupported` when combined.
+    pub transform_segments: bool,
+
+    /// §VI.A *minimum loss* quality-goal parameter `M`.
+    ///
+    /// "The minimum loss parameter is a nonnegative integer that
+    /// determines a minimum number of bit planes that will not be
+    /// encoded in each subband" (§VI.A): a subband with Fig. 18
+    /// relative-importance offset `o` never encodes its
+    /// `max(0, M - o)` least-significant magnitude bit planes, no
+    /// matter how large the byte quota is. `M = 0` (the default) is
+    /// lossless when the byte quota allows; each increment excludes one
+    /// more plane of the level-1 HH subband and correspondingly fewer
+    /// planes of the more important subbands (offsets
+    /// `HH_j = j - 1`, `HL_j = LH_j = j`, `LL = D + 1`; see
+    /// [`crate::priority::min_loss_skip_map`]). Carried on the wire in
+    /// every packet header so the decoder applies the identical
+    /// exclusion. Composes with the byte quota: "ICER stops producing
+    /// compressed bytes once the quality goal or byte quota is met,
+    /// whichever comes first" (§VI). Applies to the compressed path
+    /// only (the §III.D uncompressed path ships raw pixels).
+    pub min_loss: u8,
 }
 
 impl Default for EncodeOptions {
@@ -275,6 +325,8 @@ impl Default for EncodeOptions {
             auto_uncompressed_fallback: false,
             quality_target_psnr: None,
             interleaved_entropy: false,
+            transform_segments: false,
+            min_loss: 0,
         }
     }
 }
@@ -466,6 +518,24 @@ impl EncodeOptions {
         self
     }
 
+    /// Segment the image in the wavelet **transform domain** per IPN
+    /// 42-155 §V.B, using the §V.D LL-subband partitioning algorithm.
+    /// See [`EncodeOptions::transform_segments`] for the full contract.
+    #[must_use]
+    pub fn with_transform_domain_segments(mut self) -> Self {
+        self.transform_segments = true;
+        self
+    }
+
+    /// Set the §VI.A *minimum loss* quality-goal parameter. See
+    /// [`EncodeOptions::min_loss`] for the full contract; `0` keeps the
+    /// lossless-capable default.
+    #[must_use]
+    pub fn with_min_loss(mut self, m: u8) -> Self {
+        self.min_loss = m;
+        self
+    }
+
     /// The entropy backend this option set selects.
     pub(crate) fn entropy_kind(&self) -> crate::entropy::EntropyKind {
         if self.interleaved_entropy {
@@ -609,6 +679,41 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     let segment_count = opts.segment_count.max(1);
     let levels = opts.wavelet_levels.clamp(1, 6);
 
+    // §VI.A minimum loss composes with the quota paths but not with the
+    // row-strip R-D packet selector (whose ΔD model assumes full-plane
+    // packets); §III.D raw pixels have no bit planes to exclude.
+    if opts.min_loss > 0 {
+        if opts.uncompressed {
+            return Err(IcerError::Unsupported(
+                "min_loss applies to the compressed path only (§VI.A)".into(),
+            ));
+        }
+        if opts.rd_pruning {
+            return Err(IcerError::Unsupported(
+                "min_loss + rd_pruning is unsupported; pick one rate-control mode".into(),
+            ));
+        }
+    }
+
+    // §V.B transform-domain segmentation: whole-image DWT, §V.D LL
+    // partition mapped to every subband, one independently-coded
+    // segment per partition rectangle.
+    if opts.transform_segments {
+        if opts.uncompressed {
+            return Err(IcerError::Unsupported(
+                "transform-domain segmentation requires the compressed path (§V.B)".into(),
+            ));
+        }
+        if opts.rd_pruning || opts.auto_uncompressed_fallback {
+            return Err(IcerError::Unsupported(
+                "rd_pruning / uncompressed fallback are row-strip features; \
+                 not combinable with §V.B transform-domain segmentation"
+                    .into(),
+            ));
+        }
+        return encode_transform_segmented(plane, w, h, opts, levels);
+    }
+
     if segment_count == 1 {
         let bytes = encode_one_segment(plane, w, 0, h, 0, opts, levels)?;
         if let Some(budget) = opts.byte_budget {
@@ -663,40 +768,7 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     // 0..segment_count (segment_index order). When
     // `opts.segment_priorities` is supplied the emission order is the
     // permutation that lists segment indices in ascending rank.
-    let emission_order: Vec<u16> = match &opts.segment_priorities {
-        None => (0..segment_count).collect(),
-        Some(prios) => {
-            if prios.len() != n_segs {
-                return Err(IcerError::Unsupported(format!(
-                    "segment_priorities length {} != segment_count {}",
-                    prios.len(),
-                    segment_count
-                )));
-            }
-            // Validate that prios is a permutation of 0..n_segs.
-            let mut seen = vec![false; n_segs];
-            for &r in prios {
-                let r_us = r as usize;
-                if r_us >= n_segs {
-                    return Err(IcerError::Unsupported(format!(
-                        "segment_priorities entry {r} out of range 0..{n_segs}"
-                    )));
-                }
-                if seen[r_us] {
-                    return Err(IcerError::Unsupported(format!(
-                        "segment_priorities entry {r} appears more than once"
-                    )));
-                }
-                seen[r_us] = true;
-            }
-            // Invert: position_of_rank[rank] = segment_index that holds it.
-            let mut position_of_rank = vec![0u16; n_segs];
-            for (seg_idx, &rank) in prios.iter().enumerate() {
-                position_of_rank[rank as usize] = seg_idx as u16;
-            }
-            position_of_rank
-        }
-    };
+    let emission_order: Vec<u16> = resolve_emission_order(opts, n_segs)?;
 
     // Round 6: when ROI priorities are in use AND we have a byte
     // budget, the budgeting strategy is different:
@@ -802,6 +874,339 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     // skipped, in segment_index order.
     emit_skipped_placeholders(&mut out, &kept, &starts_heights, w, levels, opts);
     Ok(out)
+}
+
+/// Resolve the ROI emission order (round 6): identity when no
+/// [`EncodeOptions::segment_priorities`] vector is supplied, else the
+/// validated inverse permutation (ascending rank). Shared by the
+/// row-strip and §V.B transform-domain paths.
+fn resolve_emission_order(opts: &EncodeOptions, n_segs: usize) -> Result<Vec<u16>> {
+    match &opts.segment_priorities {
+        None => Ok((0..n_segs as u16).collect()),
+        Some(prios) => {
+            if prios.len() != n_segs {
+                return Err(IcerError::Unsupported(format!(
+                    "segment_priorities length {} != segment_count {}",
+                    prios.len(),
+                    n_segs
+                )));
+            }
+            // Validate that prios is a permutation of 0..n_segs.
+            let mut seen = vec![false; n_segs];
+            for &r in prios {
+                let r_us = r as usize;
+                if r_us >= n_segs {
+                    return Err(IcerError::Unsupported(format!(
+                        "segment_priorities entry {r} out of range 0..{n_segs}"
+                    )));
+                }
+                if seen[r_us] {
+                    return Err(IcerError::Unsupported(format!(
+                        "segment_priorities entry {r} appears more than once"
+                    )));
+                }
+                seen[r_us] = true;
+            }
+            // Invert: position_of_rank[rank] = segment_index that holds it.
+            let mut position_of_rank = vec![0u16; n_segs];
+            for (seg_idx, &rank) in prios.iter().enumerate() {
+                position_of_rank[rank as usize] = seg_idx as u16;
+            }
+            Ok(position_of_rank)
+        }
+    }
+}
+
+/// §V.B transform-domain segmented encode (IPN 42-155 §V.B + §V.D).
+///
+/// One whole-image forward DWT, then the §V.D partition of the LL
+/// subband is mapped to every subband
+/// ([`crate::partition::coefficient_segment_map`]) and each segment's
+/// coefficients are bit-plane coded independently — separate context
+/// modeler and entropy coder per segment per §V.B. Segments are
+/// emitted whole in [`resolve_emission_order`] order under the byte
+/// budget; a segment that does not fit is emitted as a zero-body
+/// placeholder header so the stream always frames the full geometry
+/// (the decoder reconstructs it as zero coefficients — a smooth
+/// low-detail patch through the shared inverse transform, the §V.B
+/// containment behaviour).
+fn encode_transform_segmented(
+    plane: &IcerPlane,
+    w: usize,
+    h: usize,
+    opts: &EncodeOptions,
+    levels: u8,
+) -> Result<Vec<u8>> {
+    if w < 2 || h < 2 {
+        return Err(IcerError::Unsupported(format!(
+            "compressed encode requires width >= 2 and height >= 2; got {w}x{h}"
+        )));
+    }
+    let n_segs = opts.segment_count.max(1) as usize;
+    if n_segs > u8::MAX as usize {
+        return Err(IcerError::Unsupported(format!(
+            "transform-domain segment count {n_segs} exceeds the wire cap of 255 (§V.D)"
+        )));
+    }
+    // §V.D eq (9) validity (s <= LL pixel count) is enforced inside the
+    // map constructor.
+    let seg_map = crate::partition::coefficient_segment_map(w, h, levels, n_segs)?;
+
+    // §III.A level shift + one whole-image forward DWT.
+    let mut coeffs: Vec<i32> = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = &plane.data[y * plane.stride..y * plane.stride + w];
+        for &px in row {
+            coeffs.push(px as i32 - 128);
+        }
+    }
+    wavelet_float::forward_2d(&mut coeffs, w, h, levels, opts.filter)?;
+
+    // §VI.A minimum-loss plane exclusion (whole-image map; identical
+    // for every segment).
+    let skip_map: Option<Vec<u8>> = (opts.min_loss > 0)
+        .then(|| crate::priority::min_loss_skip_map(w, h, levels, opts.min_loss));
+
+    let emission_order = resolve_emission_order(opts, n_segs)?;
+    let mut out = Vec::new();
+    let mut kept = vec![false; n_segs];
+    for &seg_idx in &emission_order {
+        // Reserve a placeholder header for every other undecided
+        // segment so committing this one never starves the budget
+        // needed to frame the rest of the image.
+        let inner_budget = match opts.byte_budget {
+            Some(budget) => {
+                let not_decided = (0..n_segs)
+                    .filter(|&i| !kept[i] && i != seg_idx as usize)
+                    .count() as u64;
+                let reserve = not_decided * (SegmentHeader::ENCODED_BYTES as u64);
+                Some(
+                    budget
+                        .saturating_sub(out.len() as u64)
+                        .saturating_sub(reserve),
+                )
+            }
+            None => None,
+        };
+        let bytes = encode_one_transform_segment(
+            &coeffs,
+            &seg_map,
+            skip_map.as_deref(),
+            w,
+            h,
+            seg_idx,
+            n_segs as u8,
+            opts,
+            levels,
+            inner_budget,
+        )?;
+        if let Some(budget) = inner_budget {
+            if bytes.len() as u64 > budget {
+                // Even the truncated form does not fit; placeholder.
+                continue;
+            }
+        }
+        out.extend_from_slice(&bytes);
+        kept[seg_idx as usize] = true;
+    }
+    // Placeholder headers for the skipped segments, in index order.
+    for (seg_idx, &was_kept) in kept.iter().enumerate() {
+        if was_kept {
+            continue;
+        }
+        let placeholder = SegmentHeader {
+            sync_prefix: opts.sync_prefix,
+            filter: opts.filter,
+            decomp_levels: levels,
+            uncompressed: false,
+            width: w as u16,
+            height: h as u16,
+            bit_plane_count: opts.bit_plane_count.clamp(1, 32),
+            interleaved_entropy: opts.interleaved_entropy,
+            transform_segmented: true,
+            total_segments: n_segs as u8,
+            segment_length: 0,
+            segment_index: seg_idx as u16,
+        };
+        out.extend_from_slice(&placeholder.encode());
+    }
+    Ok(out)
+}
+
+/// Encode one §V.B transform-domain segment: the coefficients the §V.D
+/// partition maps to `seg_idx`, bit-plane coded with a fresh context
+/// modeler + entropy coder ("ICER maintains separate context modeler
+/// and entropy coder data for each segment", §V.B), serialised MSB-down
+/// under the hard cap / soft target quota semantics.
+#[allow(clippy::too_many_arguments)]
+fn encode_one_transform_segment(
+    coeffs: &[i32],
+    seg_map: &[u16],
+    skip_map: Option<&[u8]>,
+    w: usize,
+    h: usize,
+    seg_idx: u16,
+    total_segments: u8,
+    opts: &EncodeOptions,
+    levels: u8,
+    byte_budget: Option<u64>,
+) -> Result<Vec<u8>> {
+    let filter = ScanFilter {
+        segment: Some((seg_map, seg_idx)),
+        skip: skip_map,
+    };
+    // Bit-plane count sized to this segment's own dynamic range.
+    let max_abs = coeffs
+        .iter()
+        .zip(seg_map.iter())
+        .filter(|(_, &m)| m == seg_idx)
+        .map(|(c, _)| c.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let needed = if max_abs == 0 {
+        1
+    } else {
+        (32 - max_abs.leading_zeros()).clamp(1, 31) as u8
+    };
+    let q = needed.max(opts.bit_plane_count.min(31)).min(31);
+
+    let bp_input = BitPlaneInput {
+        coeffs,
+        width: w,
+        height: h,
+        q,
+        levels,
+    };
+    let packets =
+        crate::bitplane::encode_bitplanes_filtered(&bp_input, opts.entropy_kind(), &filter)?;
+    let body = serialize_packets_msb_down(
+        &packets,
+        q,
+        opts,
+        byte_budget,
+        min_visited_skip(&filter, w * h),
+    )?;
+
+    let segment = SegmentHeader {
+        sync_prefix: opts.sync_prefix,
+        filter: opts.filter,
+        decomp_levels: levels,
+        uncompressed: false,
+        width: w as u16,
+        height: h as u16,
+        bit_plane_count: q,
+        interleaved_entropy: opts.interleaved_entropy,
+        transform_segmented: true,
+        total_segments,
+        segment_length: body.len() as u16,
+        segment_index: seg_idx,
+    };
+    let mut out = Vec::with_capacity(SegmentHeader::ENCODED_BYTES + body.len());
+    out.extend_from_slice(&segment.encode());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// The smallest §VI.A skip value over the coefficients this filter
+/// visits — every magnitude bit plane strictly below it codes nothing,
+/// so the emitter drops those planes' packets entirely (the byte
+/// saving the §VI.A quality goal exists to deliver). Returns 0 when no
+/// skip map is active.
+fn min_visited_skip(filter: &ScanFilter<'_>, n: usize) -> u8 {
+    let Some(skip) = filter.skip else {
+        return 0;
+    };
+    let mut min = u8::MAX;
+    for i in 0..n {
+        let in_seg = match filter.segment {
+            Some((map, seg)) => map[i] == seg,
+            None => true,
+        };
+        if in_seg {
+            min = min.min(skip[i]);
+            if min == 0 {
+                return 0;
+            }
+        }
+    }
+    if min == u8::MAX {
+        0
+    } else {
+        min
+    }
+}
+
+/// Serialise per-bit-plane packets MSB-down (sig before ref, §IV order)
+/// under the hard cap / soft target quota semantics, dropping the
+/// trailing planes the §VI.A `floor_planes` exclusion leaves empty.
+/// Returns the segment body (packet headers + bodies).
+fn serialize_packets_msb_down(
+    packets: &[EncodedPacket],
+    q: u8,
+    opts: &EncodeOptions,
+    byte_budget: Option<u64>,
+    floor_planes: u8,
+) -> Result<Vec<u8>> {
+    let seg_hdr_bytes = SegmentHeader::ENCODED_BYTES as u64;
+    let mut body: Vec<u8> = Vec::new();
+    let mut soft_stop_after_bp: Option<u8> = None;
+    'bp_loop: for bp_idx in 0..q as usize {
+        if let Some(stop_bp) = soft_stop_after_bp {
+            if bp_idx as u8 > stop_bp {
+                break 'bp_loop;
+            }
+        }
+        // Absolute magnitude bit position of this plane; planes fully
+        // below the §VI.A floor code nothing and are not emitted.
+        let abs_bit = q as usize - 1 - bp_idx;
+        if abs_bit < floor_planes as usize {
+            break 'bp_loop;
+        }
+        for &is_sig in &[true, false] {
+            let Some(pkt) = packets
+                .iter()
+                .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig)
+            else {
+                continue;
+            };
+            if pkt.body.len() > u16::MAX as usize {
+                return Err(IcerError::Unsupported(format!(
+                    "packet body {} exceeds u16 limit",
+                    pkt.body.len()
+                )));
+            }
+            let pkt_wire_len = PacketHeader::ENCODED_BYTES as u64 + pkt.body.len() as u64;
+            if let Some(budget) = byte_budget {
+                if seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget {
+                    break 'bp_loop;
+                }
+            }
+            let ph = PacketHeader {
+                bit_plane: pkt.bit_plane,
+                pass: if pkt.is_significance {
+                    BitPlanePass::Significance
+                } else {
+                    BitPlanePass::Refinement
+                },
+                body_length: pkt.body.len() as u16,
+                min_loss: opts.min_loss,
+            };
+            body.extend_from_slice(&ph.encode());
+            body.extend_from_slice(&pkt.body);
+            if let Some(target) = opts.target_bytes {
+                if (seg_hdr_bytes + body.len() as u64) >= target && soft_stop_after_bp.is_none() {
+                    soft_stop_after_bp = Some(bp_idx as u8);
+                }
+            }
+        }
+    }
+    if body.len() > u16::MAX as usize {
+        return Err(IcerError::Unsupported(format!(
+            "compressed segment body {} exceeds u16 limit",
+            body.len()
+        )));
+    }
+    Ok(body)
 }
 
 /// Append a zero-body placeholder segment header for every strip whose
@@ -999,13 +1404,22 @@ fn encode_one_segment_compressed(
     } else {
         None
     };
+    // §VI.A minimum-loss plane exclusion for this strip (None when
+    // M = 0 — the scanner is then bit-identical to the unfiltered one).
+    let skip_map: Option<Vec<u8>> = (opts.min_loss > 0)
+        .then(|| crate::priority::min_loss_skip_map(img_w, strip_h, levels, opts.min_loss));
+    let scan_filter = ScanFilter {
+        segment: None,
+        skip: skip_map.as_deref(),
+    };
     let packets = if let Some(weights) = &rd_weights {
         // R-D weighting is only computed for the arithmetic backend's
         // packet-selection path; the interleaved backend (a distinct wire
-        // form) is not combined with R-D pruning here.
+        // form) is not combined with R-D pruning here. (min_loss +
+        // rd_pruning is rejected up-front, so no filter is needed.)
         crate::bitplane::encode_bitplanes_weighted(&bp_input, Some(weights))?
     } else {
-        crate::bitplane::encode_bitplanes_with(&bp_input, opts.entropy_kind())?
+        crate::bitplane::encode_bitplanes_filtered(&bp_input, opts.entropy_kind(), &scan_filter)?
     };
 
     // Round 91: rate-distortion-driven packet selection (IPN 42-155
@@ -1084,12 +1498,18 @@ fn encode_one_segment_compressed(
     // from encode_bitplanes. We process them two at a time (by bit_plane)
     // to implement the soft-target "finish this bit-plane pair" semantic.
     let q_usize = q as usize;
+    // §VI.A: every magnitude bit plane strictly below the smallest
+    // per-subband skip codes nothing; drop those packets entirely.
+    let floor_planes = min_visited_skip(&scan_filter, img_w * strip_h) as usize;
     'bp_loop: for bp_idx in 0..q_usize {
         // Check if soft-target stop was requested for a previous bit-plane.
         if let Some(stop_bp) = soft_stop_after_bp {
             if bp_idx as u8 > stop_bp {
                 break 'bp_loop;
             }
+        }
+        if q_usize - 1 - bp_idx < floor_planes {
+            break 'bp_loop;
         }
 
         for &is_sig in &[true, false] {
@@ -1153,7 +1573,7 @@ fn encode_one_segment_compressed(
                 bit_plane: pkt.bit_plane,
                 pass,
                 body_length: pkt.body.len() as u16,
-                min_loss: 0,
+                min_loss: opts.min_loss,
             };
             body.extend_from_slice(&ph.encode());
             body.extend_from_slice(&pkt.body);

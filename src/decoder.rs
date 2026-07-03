@@ -31,7 +31,7 @@
 //! to override the policy use [`parse_icer_with_limits`] /
 //! [`parse_icer_metadata_with_limits`].
 
-use crate::bitplane::EncodedPacket;
+use crate::bitplane::{EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
@@ -196,12 +196,24 @@ pub fn parse_icer_metadata_with_limits(
     let mut segments = Vec::new();
     let mut total_pixels: u64 = 0;
     let mut cursor = 0;
+    let mut transform_counted = false;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
         check_segment_pixels(&walked.header, limits)?;
-        total_pixels = total_pixels
-            .checked_add(segment_pixels(&walked.header))
-            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        // §V.B transform-domain segments all declare the full image
+        // dimensions; count the image once against the total cap.
+        let count_pixels = if walked.header.transform_segmented {
+            let first = !transform_counted;
+            transform_counted = true;
+            first
+        } else {
+            true
+        };
+        if count_pixels {
+            total_pixels = total_pixels
+                .checked_add(segment_pixels(&walked.header))
+                .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        }
         if total_pixels > limits.max_total_pixels {
             return Err(IcerError::Unsupported(format!(
                 "multi-segment image pixel-count {} exceeds total cap of {} pixels \
@@ -310,12 +322,25 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
     let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
     let mut cursor = 0usize;
     let mut total_pixels: u64 = 0;
+    let mut transform_counted = false;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
         check_segment_pixels(&walked.header, limits)?;
-        total_pixels = total_pixels
-            .checked_add(segment_pixels(&walked.header))
-            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        // §V.B transform-domain segments each declare the FULL image
+        // dimensions, so the image's pixel count enters the total cap
+        // once, not once per segment.
+        let count_pixels = if walked.header.transform_segmented {
+            let first = !transform_counted;
+            transform_counted = true;
+            first
+        } else {
+            true
+        };
+        if count_pixels {
+            total_pixels = total_pixels
+                .checked_add(segment_pixels(&walked.header))
+                .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        }
         if total_pixels > limits.max_total_pixels {
             return Err(IcerError::Unsupported(format!(
                 "multi-segment image pixel-count {} exceeds total cap of {} pixels \
@@ -332,6 +357,12 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
 
     // Sort by segment_index so out-of-order delivery still composes.
     walked_all.sort_by_key(|w| w.header.segment_index);
+
+    // §V.B transform-domain streams decode through the shared-transform
+    // path (strict: every §V.D segment must be present).
+    if walked_all.iter().any(|w| w.header.transform_segmented) {
+        return decode_transform_domain(&walked_all, true).map(|(img, _, _)| img);
+    }
 
     // Verify width agreement + monotonic-by-1 segment indexing.
     let canonical_width = walked_all[0].header.width as usize;
@@ -369,6 +400,153 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
         y_cursor += strip_h;
     }
     Ok(img)
+}
+
+/// Decode a §V.B transform-domain segmented stream: every segment codes
+/// the coefficients the §V.D LL-partition maps to it; the union decodes
+/// into one shared coefficient buffer and a single whole-image inverse
+/// DWT reconstructs the pixels (IPN 42-155 §V.B).
+///
+/// `strict` requires all `total_segments` segments present with
+/// contiguous indices (the [`parse_icer`] contract); lenient mode
+/// tolerates missing segments — their coefficients stay zero, which
+/// reconstructs as a smooth low-detail patch through the shared inverse
+/// transform (§V.B error containment; the loss "bleeds" only slightly
+/// into adjacent segments via the wavelet support). Returns the image,
+/// the per-index presence map, and the missing count.
+fn decode_transform_domain(
+    walked_all: &[WalkedSegment<'_>],
+    strict: bool,
+) -> Result<(IcerImage, Vec<bool>, usize)> {
+    let first = &walked_all[0].header;
+    if !first.transform_segmented {
+        return Err(IcerError::invalid(
+            "mixed §V.B transform-domain and row-strip segments in one stream",
+        ));
+    }
+    let (w, h) = (first.width as usize, first.height as usize);
+    let levels = first.decomp_levels;
+    let total = first.total_segments as usize;
+
+    // Every segment must agree on the whole-image parameters the §V.D
+    // partition is recomputed from (§V.D: image dimensions, stages of
+    // decomposition, total number of segments — all in each header).
+    for wseg in walked_all {
+        let hd = &wseg.header;
+        if !hd.transform_segmented {
+            return Err(IcerError::invalid(
+                "mixed §V.B transform-domain and row-strip segments in one stream",
+            ));
+        }
+        if hd.uncompressed {
+            return Err(IcerError::invalid(
+                "transform-domain segments carry coefficients, not §III.D raw pixels",
+            ));
+        }
+        if hd.width as usize != w
+            || hd.height as usize != h
+            || hd.decomp_levels != levels
+            || hd.total_segments as usize != total
+            || hd.filter != first.filter
+        {
+            return Err(IcerError::invalid(format!(
+                "transform-domain segment {} disagrees on the shared image parameters",
+                hd.segment_index
+            )));
+        }
+    }
+    // Duplicate indices are a contradiction in either mode.
+    for pair in walked_all.windows(2) {
+        if pair[0].header.segment_index == pair[1].header.segment_index {
+            return Err(IcerError::invalid(format!(
+                "duplicate transform-domain segment index {}",
+                pair[0].header.segment_index
+            )));
+        }
+    }
+    if strict {
+        if walked_all.len() != total {
+            return Err(IcerError::invalid(format!(
+                "transform-domain stream carries {} of {} segments (§V.D)",
+                walked_all.len(),
+                total
+            )));
+        }
+        for (expect, wseg) in walked_all.iter().enumerate() {
+            if wseg.header.segment_index as usize != expect {
+                return Err(IcerError::invalid(format!(
+                    "non-contiguous transform-domain segment indices: got {} at position {expect}",
+                    wseg.header.segment_index
+                )));
+            }
+        }
+    }
+
+    // Recompute the §V.D partition (never encoded — §V.D) and decode
+    // each present segment's coefficients into the shared buffer.
+    let seg_map = crate::partition::coefficient_segment_map(w, h, levels, total)?;
+    let mut coeffs = vec![0i32; w * h];
+    let mut received = vec![false; total];
+    for wseg in walked_all {
+        let seg_idx = wseg.header.segment_index;
+        received[seg_idx as usize] = true;
+        if wseg.packets.is_empty() {
+            // Budget placeholder: zero coefficients (§V.B containment).
+            continue;
+        }
+        // §VI.A minimum loss, replicated in every packet header.
+        let min_loss = wseg.packets[0].header.min_loss;
+        let skip_map: Option<Vec<u8>> =
+            (min_loss > 0).then(|| crate::priority::min_loss_skip_map(w, h, levels, min_loss));
+        let filter = ScanFilter {
+            segment: Some((&seg_map, seg_idx)),
+            skip: skip_map.as_deref(),
+        };
+        let encoded_packets: Vec<EncodedPacket> = wseg
+            .packets
+            .iter()
+            .map(|wp| EncodedPacket {
+                bit_plane: wp.header.bit_plane,
+                is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
+                body: wp.body.to_vec(),
+                delta_distortion: 0.0,
+            })
+            .collect();
+        let kind = if wseg.header.interleaved_entropy {
+            crate::entropy::EntropyKind::Interleaved
+        } else {
+            crate::entropy::EntropyKind::Arithmetic
+        };
+        let part = crate::bitplane::decode_bitplanes_filtered(
+            &encoded_packets,
+            w,
+            h,
+            wseg.header.bit_plane_count,
+            levels,
+            kind,
+            &filter,
+        )?;
+        for (i, &m) in seg_map.iter().enumerate() {
+            if m == seg_idx {
+                coeffs[i] = part[i];
+            }
+        }
+    }
+    let missing_count = received.iter().filter(|&&r| !r).count();
+
+    // One shared inverse transform (§V.B: "the inverse wavelet
+    // transform combines data from adjacent segments").
+    crate::wavelet_float::inverse_2d(&mut coeffs, w, h, levels, first.filter)?;
+    let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
+    let plane = &mut img.planes[0];
+    for y in 0..h {
+        let dst = &mut plane.data[y * plane.stride..y * plane.stride + w];
+        for x in 0..w {
+            let v = coeffs[y * w + x] + 128;
+            dst[x] = v.clamp(0, 255) as u8;
+        }
+    }
+    Ok((img, received, missing_count))
 }
 
 fn decode_segment_into(
@@ -450,13 +628,24 @@ fn decode_compressed_segment_into(
         } else {
             crate::entropy::EntropyKind::Arithmetic
         };
-        crate::bitplane::decode_bitplanes_multi_with(
+        // §VI.A minimum loss, replicated in every packet header: apply
+        // the identical per-subband plane exclusion the encoder used
+        // (0 on every pre-existing stream = no exclusion).
+        let min_loss = walked.packets[0].header.min_loss;
+        let skip_map: Option<Vec<u8>> = (min_loss > 0)
+            .then(|| crate::priority::min_loss_skip_map(width, height, levels, min_loss));
+        let filter = ScanFilter {
+            segment: None,
+            skip: skip_map.as_deref(),
+        };
+        crate::bitplane::decode_bitplanes_filtered(
             &encoded_packets,
             width,
             height,
             q,
             levels,
             kind,
+            &filter,
         )?
     };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
@@ -604,12 +793,24 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
     let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
     let mut cursor = 0usize;
     let mut total_pixels: u64 = 0;
+    let mut transform_counted = false;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
         check_segment_pixels(&walked.header, limits)?;
-        total_pixels = total_pixels
-            .checked_add(segment_pixels(&walked.header))
-            .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        // §V.B transform-domain segments each declare the full image
+        // dimensions; count them once against the total cap.
+        let count_pixels = if walked.header.transform_segmented {
+            let first = !transform_counted;
+            transform_counted = true;
+            first
+        } else {
+            true
+        };
+        if count_pixels {
+            total_pixels = total_pixels
+                .checked_add(segment_pixels(&walked.header))
+                .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+        }
         if total_pixels > limits.max_total_pixels {
             return Err(IcerError::Unsupported(format!(
                 "multi-segment image pixel-count {} exceeds total cap of {} pixels \
@@ -639,6 +840,20 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
                 pair[0].header.segment_index
             )));
         }
+    }
+
+    // §V.B transform-domain streams: any received segment pins the full
+    // geometry (every header carries the image dimensions + total
+    // segment count), so even segment 0 may be lost. Missing segments'
+    // coefficients stay zero — a smooth low-detail patch through the
+    // shared inverse transform rather than a flat-128 strip.
+    if walked_all.iter().any(|w| w.header.transform_segmented) {
+        let (image, received, missing_count) = decode_transform_domain(&walked_all, false)?;
+        return Ok(LenientDecode {
+            image,
+            received,
+            missing_count,
+        });
     }
 
     // Segment 0 must be present so we can pin the canonical width +

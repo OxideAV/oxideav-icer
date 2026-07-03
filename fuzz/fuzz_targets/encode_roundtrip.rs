@@ -134,6 +134,9 @@ fuzz_target!(|data: &[u8]| {
     let use_target_bytes = (opt_d & 0x20) != 0;
     let use_priorities = (opt_d & 0x40) != 0;
     let interleaved_entropy = (opt_d & 0x80) != 0;
+    // §V.B transform-domain segmentation + §VI.A minimum loss (0..=3).
+    let transform_segments = (opt_b & 0x80) != 0;
+    let min_loss = opt_c >> 6;
 
     // Budgets are derived from opt_e + opt_f so a fuzzer can drive the
     // encoder over the full "tiny-budget early-stop" through
@@ -174,6 +177,8 @@ fuzz_target!(|data: &[u8]| {
         auto_uncompressed_fallback,
         quality_target_psnr: None,
         interleaved_entropy,
+        transform_segments,
+        min_loss,
     };
 
     // ---- Encode ------------------------------------------------------

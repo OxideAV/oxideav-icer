@@ -130,6 +130,8 @@ fn drive(data: &[u8]) -> bool {
         auto_uncompressed_fallback,
         quality_target_psnr: None,
         interleaved_entropy,
+        transform_segments: false,
+        min_loss: 0,
     };
 
     let encoded = match encode_icer(&img, &opts) {

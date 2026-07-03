@@ -37,6 +37,8 @@ fn base_opts() -> EncodeOptions {
         auto_uncompressed_fallback: false,
         quality_target_psnr: None,
         interleaved_entropy: false,
+        transform_segments: false,
+        min_loss: 0,
     }
 }
 
