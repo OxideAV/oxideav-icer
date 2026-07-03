@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corpus entries, `encode_roundtrip` fuzz target drives the new
   options); criterion group `transform_segments_64x64_s4` +
   `min_loss_64x64` with wire-form byte-identity pins in the setup.
+- **Windowed §V.B segment scans.** `ScanFilter::window` +
+  `SegmentRect::image_window` confine each transform-domain segment's
+  passes to its contiguous coefficient block (stripe grid kept
+  `y = 0`-aligned, so the wire form is byte-identical — pinned on five
+  fnv-hashed configurations across backends and min-loss values);
+  transform-domain encode drops from ~40% over row strips to parity
+  (−29%) on the criterion 64×64 s = 4 pin.
 
 ### Fixed
 

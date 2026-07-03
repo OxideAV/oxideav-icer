@@ -473,10 +473,13 @@ Properties (all pinned by `tests/transform_segments.rs`):
   decode; the wire caps the count at 255 (the MER build allows at most
   32 segments, §V.C).
 
-Cost: the per-segment scan currently walks the full coefficient buffer
-with a membership predicate, so encode time grows with segment count
-(~40% over row strips at s = 4 on the criterion 64×64 pin); a
-bounding-box scan window is the obvious future trim.
+Cost: each segment's scan is confined to its own bounding window (the
+§V.B block is contiguous in the interleaved buffer —
+`SegmentRect::image_window`), with the stripe grid kept `y = 0`-aligned
+so the visit order — and therefore the wire form — is byte-identical to
+a full-image walk. Transform-domain encode runs at row-strip parity on
+the criterion 64×64 s = 4 pin (~373 µs vs ~378 µs; the window trim
+bought −29% over the initial full-buffer scan).
 
 ## Minimum-loss quality goal (IPN 42-155 §VI.A)
 

@@ -951,6 +951,12 @@ fn encode_transform_segmented(
     // §V.D eq (9) validity (s <= LL pixel count) is enforced inside the
     // map constructor.
     let seg_map = crate::partition::coefficient_segment_map(w, h, levels, n_segs)?;
+    // Per-segment bounding windows: the §V.B block is contiguous in the
+    // interleaved buffer, so each segment's scan is confined to its own
+    // rectangle instead of walking the whole image (byte-identical
+    // output; the stripe grid stays y=0-aligned).
+    let (w_ll, h_ll) = crate::partition::ll_dimensions(w, h, levels);
+    let rects = crate::partition::partition(w_ll, h_ll, n_segs)?;
 
     // §III.A level shift + one whole-image forward DWT.
     let mut coeffs: Vec<i32> = Vec::with_capacity(w * h);
@@ -992,6 +998,7 @@ fn encode_transform_segmented(
             &coeffs,
             &seg_map,
             skip_map.as_deref(),
+            rects[seg_idx as usize].image_window(levels, w, h),
             w,
             h,
             seg_idx,
@@ -1043,6 +1050,7 @@ fn encode_one_transform_segment(
     coeffs: &[i32],
     seg_map: &[u16],
     skip_map: Option<&[u8]>,
+    window: (usize, usize, usize, usize),
     w: usize,
     h: usize,
     seg_idx: u16,
@@ -1054,13 +1062,14 @@ fn encode_one_transform_segment(
     let filter = ScanFilter {
         segment: Some((seg_map, seg_idx)),
         skip: skip_map,
+        window: Some(window),
     };
-    // Bit-plane count sized to this segment's own dynamic range.
-    let max_abs = coeffs
-        .iter()
-        .zip(seg_map.iter())
-        .filter(|(_, &m)| m == seg_idx)
-        .map(|(c, _)| c.unsigned_abs())
+    // Bit-plane count sized to this segment's own dynamic range (the
+    // §V.B block is exactly the window rectangle).
+    let (wx0, wx1, wy0, wy1) = window;
+    let max_abs = (wy0..wy1)
+        .flat_map(|y| (wx0..wx1).map(move |x| y * w + x))
+        .map(|i| coeffs[i].unsigned_abs())
         .max()
         .unwrap_or(0);
     let needed = if max_abs == 0 {
@@ -1411,6 +1420,7 @@ fn encode_one_segment_compressed(
     let scan_filter = ScanFilter {
         segment: None,
         skip: skip_map.as_deref(),
+        window: None,
     };
     let packets = if let Some(weights) = &rd_weights {
         // R-D weighting is only computed for the arithmetic backend's

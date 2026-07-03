@@ -146,6 +146,16 @@ pub struct ScanFilter<'a> {
     pub segment: Option<(&'a [u16], u16)>,
     /// §VI.A per-coefficient skipped-LSB-plane counts.
     pub skip: Option<&'a [u8]>,
+    /// Optional bounding window `(x0, x1, y0, y1)` outside which the
+    /// scan never visits — a pure iteration bound, not a correctness
+    /// filter (the §V.B segment block is contiguous, see
+    /// [`crate::partition::SegmentRect::image_window`]). The stripe
+    /// grid stays aligned to `y = 0`, so restricting the walk to the
+    /// window visits the same coefficients in the same order as a
+    /// full-image walk with the segment mask alone — the output is
+    /// byte-identical, just without the wasted out-of-segment
+    /// iterations.
+    pub window: Option<(usize, usize, usize, usize)>,
 }
 
 impl ScanFilter<'_> {
@@ -153,7 +163,19 @@ impl ScanFilter<'_> {
     pub const ALL: ScanFilter<'static> = ScanFilter {
         segment: None,
         skip: None,
+        window: None,
     };
+
+    /// Iteration bounds `(x0, x1, y0, y1)` clamped to the buffer.
+    #[inline]
+    fn bounds(&self, width: usize, height: usize) -> (usize, usize, usize, usize) {
+        match self.window {
+            Some((x0, x1, y0, y1)) => {
+                (x0.min(width), x1.min(width), y0.min(height), y1.min(height))
+            }
+            None => (0, width, 0, height),
+        }
+    }
 
     /// `true` iff coefficient `i`'s bit at magnitude bit position `bp`
     /// is part of this scan.
@@ -186,6 +208,13 @@ impl ScanFilter<'_> {
                 return Err(IcerError::invalid(format!(
                     "skip map length {} != coeff count {n}",
                     skip.len()
+                )));
+            }
+        }
+        if let Some((x0, x1, y0, y1)) = self.window {
+            if x0 > x1 || y0 > y1 {
+                return Err(IcerError::invalid(format!(
+                    "inverted scan window ({x0}, {x1}, {y0}, {y1})"
                 )));
             }
         }
@@ -499,11 +528,12 @@ fn refinement_weight_sum(
     filter: &ScanFilter<'_>,
 ) -> f64 {
     let mut sum = 0.0f64;
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || !significant[i] {
                     continue;
@@ -782,11 +812,12 @@ fn encode_significance_pass(
     levels: u8,
     filter: &ScanFilter<'_>,
 ) {
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || significant[i] {
                     continue;
@@ -849,11 +880,12 @@ fn decode_significance_pass(
     levels: u8,
     filter: &ScanFilter<'_>,
 ) -> Result<()> {
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || significant[i] {
                     continue;
@@ -911,11 +943,12 @@ fn encode_refinement_pass(
     levels: u8,
     filter: &ScanFilter<'_>,
 ) {
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || !significant[i] {
                     continue;
@@ -968,11 +1001,12 @@ fn advance_refinement_categories(
     bp: usize,
     filter: &ScanFilter<'_>,
 ) {
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || !significant[i] {
                     continue;
@@ -1010,11 +1044,12 @@ fn decode_refinement_pass(
     levels: u8,
     filter: &ScanFilter<'_>,
 ) -> Result<()> {
-    let mut stripe_start = 0;
-    while stripe_start < height {
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut stripe_start = wy0 - (wy0 % STRIPE_HEIGHT);
+    while stripe_start < wy1 {
         let stripe_end = (stripe_start + STRIPE_HEIGHT).min(height);
-        for y in stripe_start..stripe_end {
-            for x in 0..width {
+        for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
+            for x in wx0..wx1 {
                 let i = y * width + x;
                 if !filter.visits(i, bp) || !significant[i] {
                     continue;
@@ -2105,6 +2140,7 @@ mod tests {
             let filter = ScanFilter {
                 segment: Some((&map, seg)),
                 skip: None,
+                window: None,
             };
             let input = BitPlaneInput {
                 coeffs: &coeffs,
@@ -2150,6 +2186,7 @@ mod tests {
         let filter = ScanFilter {
             segment: None,
             skip: Some(&skip),
+            window: None,
         };
         let input = BitPlaneInput {
             coeffs: &coeffs,

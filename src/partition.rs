@@ -88,6 +88,31 @@ pub struct SegmentRect {
     pub height: usize,
 }
 
+impl SegmentRect {
+    /// The bounding window `(x0, x1, y0, y1)` of this segment's
+    /// coefficients in the full-resolution interleaved buffer of a
+    /// `image_w x image_h` image after `d` decomposition stages.
+    ///
+    /// §V.B membership is a pure function of `(x >> d, y >> d)` (see
+    /// [`coefficient_segment_map`]), so the LL rectangle scales to the
+    /// **contiguous** coefficient block `[x << d, (x + w) << d) x
+    /// [y << d, (y + h) << d)`, clipped to the image bounds — the scan
+    /// passes only ever need to walk this window for the segment.
+    pub fn image_window(
+        &self,
+        d: u8,
+        image_w: usize,
+        image_h: usize,
+    ) -> (usize, usize, usize, usize) {
+        (
+            (self.x << d).min(image_w),
+            ((self.x + self.width) << d).min(image_w),
+            (self.y << d).min(image_h),
+            ((self.y + self.height) << d).min(image_h),
+        )
+    }
+}
+
 /// LL-subband dimensions for a `W x H` image after `d` decomposition
 /// stages: `w = ceil(W / 2^d)`, `h = ceil(H / 2^d)` (§V.D, citing
 /// §II.B).

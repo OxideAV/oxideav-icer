@@ -485,6 +485,8 @@ fn decode_transform_domain(
     // Recompute the §V.D partition (never encoded — §V.D) and decode
     // each present segment's coefficients into the shared buffer.
     let seg_map = crate::partition::coefficient_segment_map(w, h, levels, total)?;
+    let (w_ll, h_ll) = crate::partition::ll_dimensions(w, h, levels);
+    let rects = crate::partition::partition(w_ll, h_ll, total)?;
     let mut coeffs = vec![0i32; w * h];
     let mut received = vec![false; total];
     for wseg in walked_all {
@@ -498,9 +500,11 @@ fn decode_transform_domain(
         let min_loss = wseg.packets[0].header.min_loss;
         let skip_map: Option<Vec<u8>> =
             (min_loss > 0).then(|| crate::priority::min_loss_skip_map(w, h, levels, min_loss));
+        let window = rects[seg_idx as usize].image_window(levels, w, h);
         let filter = ScanFilter {
             segment: Some((&seg_map, seg_idx)),
             skip: skip_map.as_deref(),
+            window: Some(window),
         };
         let encoded_packets: Vec<EncodedPacket> = wseg
             .packets
@@ -526,8 +530,10 @@ fn decode_transform_domain(
             kind,
             &filter,
         )?;
-        for (i, &m) in seg_map.iter().enumerate() {
-            if m == seg_idx {
+        let (wx0, wx1, wy0, wy1) = window;
+        for y in wy0..wy1 {
+            for x in wx0..wx1 {
+                let i = y * w + x;
                 coeffs[i] = part[i];
             }
         }
@@ -637,6 +643,7 @@ fn decode_compressed_segment_into(
         let filter = ScanFilter {
             segment: None,
             skip: skip_map.as_deref(),
+            window: None,
         };
         crate::bitplane::decode_bitplanes_filtered(
             &encoded_packets,
