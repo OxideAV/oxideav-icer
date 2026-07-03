@@ -1,5 +1,7 @@
 # oxideav-icer
 
+[![CI](https://github.com/OxideAV/oxideav-icer/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-icer/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-icer.svg)](https://crates.io/crates/oxideav-icer) [![docs.rs](https://docs.rs/oxideav-icer/badge.svg)](https://docs.rs/oxideav-icer) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust ICER -- JPL's progressive wavelet image compressor used by every
 Mars surface mission since the 2003 Mars Exploration Rovers (Spirit and
 Opportunity), continued on Mars Science Laboratory (Curiosity), Mars 2020
