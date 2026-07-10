@@ -64,7 +64,7 @@ pub struct FilterParams {
 /// Lookup table indexed by filter id (`0` = `Q`, `1` = `A`, ..., `7` = `G`).
 /// Kiely & Klimesh's IPN 42-155 §III.A does not publish per-filter
 /// numerical coefficients -- it lists the eight candidates by name
-/// only and refers to a follow-up paper [13] for the exact lifting
+/// only and refers to a follow-up paper \[13\] for the exact lifting
 /// numbers. The non-`Q` entries here use the well-known CDF 9/7
 /// lifting coefficients (Sweldens 1996) for filters A-F, and the
 /// Le Gall 5/3 float variant for filter G.

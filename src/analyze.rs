@@ -334,7 +334,7 @@ impl DistortionReport {
     /// Compare the first plane of `decoded` against `original` and
     /// produce every distortion metric in one pass.
     ///
-    /// Returns [`IcerError::Unsupported`] on a width/height mismatch or
+    /// Returns [`crate::IcerError::Unsupported`] on a width/height mismatch or
     /// when either image has no planes -- the non-panicking complement
     /// to [`psnr_db`]. A zero-pixel image (`width == 0 || height == 0`)
     /// is a bit-exact match by construction: all averaged metrics are
@@ -407,7 +407,7 @@ impl DistortionReport {
 /// measure that a centre strip kept its fidelity (low MAE) while the
 /// periphery was truncated (high MAE) under a tight byte budget.
 ///
-/// Returns [`IcerError::Unsupported`] on a geometry mismatch, a missing
+/// Returns [`crate::IcerError::Unsupported`] on a geometry mismatch, a missing
 /// plane, or a region that does not fit entirely inside the image.
 pub fn region_mae(
     original: &IcerImage,
@@ -498,7 +498,7 @@ const SSIM_WINDOW: usize = 8;
 /// (zero-padded-free) overlap is used; a zero-pixel image is treated as
 /// a perfect match (`1.0`).
 ///
-/// Returns [`IcerError::Unsupported`] on a width/height mismatch or when
+/// Returns [`crate::IcerError::Unsupported`] on a width/height mismatch or when
 /// either image has no planes -- the same geometry contract as
 /// [`DistortionReport::compare`].
 pub fn ssim(original: &IcerImage, decoded: &IcerImage) -> Result<f64> {
