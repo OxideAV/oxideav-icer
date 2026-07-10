@@ -9,6 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IPN 42-155 §III.A subband-priority interleaving, end to end**
+  (`EncodeOptions::with_priority_interleaving()`). The packet schedule
+  becomes the spec's progressive order: subband bit planes walked in
+  decreasing §III.A priority (Fig. 7 weights halved per plane, ties to
+  the higher decomposition level then `LL, HL, LH, HH`), each subband
+  bit plane coded in a **single combined raster pass** over its
+  subband lattice (§III: sign immediately after the first nonzero
+  magnitude bit), the context model persistent across the whole
+  segment (§III.C), and one packet per schedule entry — priority
+  groups, with fat subband bit planes (> 256 coefficients,
+  `priority::FINE_PACKET_COEFFS`) cut into their own packets so a
+  byte-quota truncation stays close to its exact §III.A position. New
+  wire flag in previously-reserved header byte 2 bit 7 (the top of the
+  old 4-bit filter field), packet headers carry the priority-group
+  index; every pre-existing stream parses and decodes unchanged.
+  §VI.A `min_loss` composes at schedule granularity (whole subband bit
+  planes dropped, `priority::min_loss_excludes_unit`); composes with
+  both entropy backends, row-strip + §V.B transform-domain segments,
+  colour, budgets/targets, ROI priorities, `quality_target`, and the
+  §III.D fallback; mutually exclusive with `rd_pruning`. Measured on
+  the textured 64x64 filter-Q fixture at equal budgets vs the
+  whole-strip MSB-down order: **+4.3 / +5.6 dB at deep truncation
+  (250 / 500 B), mean +1.9 dB** over the sweep (one -2.7 dB outlier —
+  the §VI.B "scalloping" of priority-boundary quantisation), at a
+  bounded ~+3% lossless framing overhead (more, smaller packets).
+  Filter-Q full-quality round-trips stay bit-exact in every composed
+  mode. New schedule helpers in `priority`
+  (`priority_groups` / `packet_schedule` / `subband_lattice` /
+  `subband_coeff_count`), codec drivers in `bitplane`
+  (`encode_bitplanes_prioritized` / `decode_bitplanes_prioritized`),
+  a dedicated `tests/priority_interleaving.rs` suite, mutation-smoke
+  configurations, three checked-in fuzz corpus seeds, and the
+  encode-roundtrip fuzz harness drives the new flag.
+
+### Fixed
+
+- **IPN 42-155 §II.B pyramid recursion** (wire-affecting for
+  decompositions deeper than 1 level). The dyadic transforms recursed
+  on the **top-left `ceil(w/2) x ceil(h/2)` rectangle**, which in the
+  interleaved layout contains the previous stage's low- *and*
+  high-pass outputs — a mixture, not the LL subband §II.B says each
+  further stage decomposes. Deeper stages therefore scribbled over
+  detail subbands (a smooth linear ramp grew spurious "HH" energy at
+  2+ levels), and every consumer of the dyadic-parity layout — the
+  §III.B Table 6/7 subband contexts, the same-subband neighbour walk,
+  the §III.A priorities and Fig. 18 min-loss offsets, the §V.B
+  segment maps, the §III.A subband weights — was keyed to subbands the
+  transform did not actually produce. All three 2-D dyadic paths
+  (`wavelet`, `wavelet_float`, `wavelet_int`; the 3-D `wavelet3d` path
+  was already lattice-correct) now gather/scatter the stride-`2^j`
+  even/even lattice per stage. Round-trips remain bit-exact; lossless
+  filter-Q output shrinks ~3% on the 64x64 textured fixture; new
+  regression pins assert deeper stages touch only the LL lattice (all
+  seven §II.A filters + the float path) and that the 5/3 annihilates a
+  linear ramp off the LL lattice. **Streams encoded by earlier
+  revisions with `wavelet_levels >= 2` decode to different pixels**
+  (the crate's wire format is self-defined and pre-1.0; no external
+  interop existed). Byte/PSNR-pinned tests recalibrated
+  (`rd_budget` — the winning fixture moved to the sparse-impulse
+  image, +7 dB at b = 250; `roi_priority`; `truncation_fidelity`).
+- **§IV.C interleaved-entropy-coder mid-stream flush desync.** When
+  the 2048-word buffer filled behind a stuck partial front word
+  (§IV.C.1), the encoder completed that word with flush bits and
+  opened a fresh word for the bin's later source bits — but the
+  decoder kept serving the flush bits *as* source bits and
+  desynchronised. The decoder now replays the encoder's word list from
+  the decoded bit stream (creation order, completion status, drains)
+  and, when the mirrored list hits the buffer-full flush, discards the
+  flushed bin's pending suffix — exactly the flush bits, since every
+  genuinely-arrived bit was already consumed in source order. Found by
+  the §III.A priority packets (bigger bodies + persistent model reach
+  deep Golomb bins with stuck words); reachable in principle from any
+  sufficiently long interleaved-entropy packet. Two regression tests
+  pin the path via a test-only mid-stream-flush counter.
+
 - **§V.B transform-domain segmentation (IPN 42-155 §V.B + §V.D), end to
   end.** `EncodeOptions::with_transform_domain_segments()` runs one
   whole-image DWT, partitions the LL subband with the §V.D algorithm
