@@ -60,7 +60,10 @@ use crate::context::{
 };
 use crate::entropy::{BitSink, BitSource};
 use crate::error::{IcerError, Result};
-use crate::priority::{classify_position, subband_stride, SubbandType};
+use crate::priority::{
+    classify_position, packet_schedule, subband_lattice, subband_stride, SubbandBitPlane,
+    SubbandType,
+};
 
 /// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
 pub const STRIPE_HEIGHT: usize = 4;
@@ -732,8 +735,16 @@ pub fn decode_bitplanes_filtered(
     // is `mag + ∆/2 - 1`. When `∆ = 1` (b == 0, the full stream is
     // present) the offset is zero and the magnitude is exact -- so the
     // lossless / untruncated path is bit-identical to before.
-    let out = mag
-        .iter()
+    Ok(deadzone_reconstruct(&mag, &sign, &last_bit))
+}
+
+/// Apply the per-coefficient §III.A deadzone reconstruction point (see
+/// the comment block above): insignificant coefficients reconstruct to
+/// the origin; a significant magnitude known down to plane `b` gets its
+/// own `∆/2 - 1 = 2^(b-1) - 1` mid-bin offset. Shared by the MSB-down
+/// and the §III.A priority-interleaved decoders.
+fn deadzone_reconstruct(mag: &[u32], sign: &[bool], last_bit: &[u8]) -> Vec<i32> {
+    mag.iter()
         .zip(sign.iter())
         .zip(last_bit.iter())
         .map(|((&m, &s), &b)| {
@@ -756,8 +767,7 @@ pub fn decode_bitplanes_filtered(
                 v
             }
         })
-        .collect();
-    Ok(out)
+        .collect()
 }
 
 /// Number of least-significant magnitude bit planes that were *not*
@@ -1089,6 +1099,380 @@ fn decode_refinement_pass(
         stripe_start += STRIPE_HEIGHT;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// §III.A priority-interleaved codec.
+//
+// IPN 42-155 §III specifies the coding order precisely: "ICER losslessly
+// compresses the bit planes of a subband, starting with the most-
+// significant bit plane and working toward the least significant.
+// Compression of a subband bit plane proceeds one error-containment
+// segment at a time, and the bits within a segment are compressed in
+// raster scan order. The sign bits are handled differently: the sign bit
+// of a pixel is encoded immediately after its first nonzero magnitude
+// bit. Bit planes from different subbands are interleaved during this
+// coding process ... ICER selects the next subband bit plane according
+// to a simple prioritization scheme, described in Section III.A."
+//
+// The functions below realise that ordering: subband bit planes are
+// walked in the §III.A priority order (crate::priority::priority_groups),
+// each subband bit plane is coded in ONE combined raster pass over the
+// subband's lattice (a still-insignificant coefficient contributes a
+// significance bit, followed immediately by its sign when it turns
+// significant; an already-significant coefficient contributes a
+// refinement bit), and one packet is cut per priority *group* so a
+// truncation always lands on a §III.A priority boundary. The context
+// model persists across the whole segment (§III: "this probability-of-
+// zero estimate relies only on previously encoded information from the
+// same segment"), while each packet's body is a fresh entropy-coder run
+// so packet boundaries stay byte-aligned.
+// ---------------------------------------------------------------------------
+
+/// First lattice coordinate `>= lo` with `coord ≡ phase (mod step)`.
+#[inline]
+fn lattice_start(phase: usize, step: usize, lo: usize) -> usize {
+    if lo <= phase {
+        phase
+    } else {
+        phase + (lo - phase).div_ceil(step) * step
+    }
+}
+
+/// Encode one subband bit plane (a §III.A schedule *unit*) in a single
+/// combined raster pass over the subband's lattice (IPN 42-155 §III).
+/// `abs_bit` is the plane's absolute magnitude bit position (`0` = LSB).
+/// Accumulates the newly-significant / refined coefficient counts into
+/// `stats = (newly_significant, refined)` for the packet's
+/// distortion-reduction estimate.
+#[allow(clippy::too_many_arguments)]
+fn encode_priority_unit(
+    enc: &mut dyn BitSink,
+    model: &mut ContextModel,
+    coeffs: &[i32],
+    significant: &mut [bool],
+    sign: &mut [bool],
+    cat: &mut [u8],
+    width: usize,
+    height: usize,
+    unit: &SubbandBitPlane,
+    abs_bit: usize,
+    levels: u8,
+    filter: &ScanFilter<'_>,
+    stats: &mut (u64, u64),
+) {
+    let lat = subband_lattice(unit.subband);
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut y = lattice_start(lat.y0, lat.step, wy0);
+    while y < wy1 {
+        let mut x = lattice_start(lat.x0, lat.step, wx0);
+        while x < wx1 {
+            let i = y * width + x;
+            if !filter.visits(i, abs_bit) {
+                x += lat.step;
+                continue;
+            }
+            if !significant[i] {
+                // Significance bit; sign immediately after the first
+                // nonzero magnitude bit (§III).
+                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
+                let ctx = significance_ctx_for(pat, x, y, levels);
+                debug_assert!(ctx < CONTEXT_COUNT);
+                let mag = coeffs[i].unsigned_abs();
+                let bit = ((mag >> abs_bit) & 1) as u8;
+                let (num, den) = model.probability(ctx);
+                enc.put_bit(bit, num, den);
+                model.observe(ctx, bit);
+                if bit == 1 {
+                    significant[i] = true;
+                    cat[i] = 1;
+                    sign[i] = coeffs[i] < 0;
+                    let (h_pat, v_pat) =
+                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
+                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    debug_assert!(sctx < CONTEXT_COUNT);
+                    let raw_sign = u8::from(sign[i]);
+                    let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
+                    let (sn, sd) = model.probability(sctx);
+                    enc.put_bit(coded_sign, sn, sd);
+                    model.observe(sctx, coded_sign);
+                    stats.0 += 1;
+                }
+            } else {
+                // Refinement bit: the coefficient became significant at a
+                // strictly higher plane of this subband (planes are walked
+                // MSB-down within a subband, so a coefficient whose MSB is
+                // this very plane took the significance branch above).
+                let m = coeffs[i].unsigned_abs();
+                debug_assert!(highest_set_bit(m) > Some(abs_bit as u32));
+                let has_hv = has_hv_significant(neighbour_significance_pattern(
+                    significant,
+                    width,
+                    height,
+                    x,
+                    y,
+                    levels,
+                ));
+                let bit = ((m >> abs_bit) & 1) as u8;
+                match magnitude_context(cat[i], has_hv) {
+                    MagnitudeContext::Coded(rctx) => {
+                        debug_assert!(rctx < CONTEXT_COUNT);
+                        let (num, den) = model.probability(rctx);
+                        enc.put_bit(bit, num, den);
+                        model.observe(rctx, bit);
+                    }
+                    MagnitudeContext::Uncoded => {
+                        let (num, den) = UNCODED_P1;
+                        enc.put_bit(bit, num, den);
+                    }
+                }
+                cat[i] = cat[i].saturating_add(1).min(3);
+                stats.1 += 1;
+            }
+            x += lat.step;
+        }
+        y += lat.step;
+    }
+}
+
+/// Decode counterpart of [`encode_priority_unit`] — the identical
+/// combined raster pass, updating `mag` / `last_bit` as magnitude bits
+/// arrive so the per-coefficient §III.A deadzone reconstruction stays
+/// exact under truncation.
+#[allow(clippy::too_many_arguments)]
+fn decode_priority_unit(
+    dec: &mut dyn BitSource,
+    model: &mut ContextModel,
+    significant: &mut [bool],
+    sign: &mut [bool],
+    mag: &mut [u32],
+    cat: &mut [u8],
+    last_bit: &mut [u8],
+    width: usize,
+    height: usize,
+    unit: &SubbandBitPlane,
+    abs_bit: usize,
+    levels: u8,
+    filter: &ScanFilter<'_>,
+) -> Result<()> {
+    let lat = subband_lattice(unit.subband);
+    let (wx0, wx1, wy0, wy1) = filter.bounds(width, height);
+    let mut y = lattice_start(lat.y0, lat.step, wy0);
+    while y < wy1 {
+        let mut x = lattice_start(lat.x0, lat.step, wx0);
+        while x < wx1 {
+            let i = y * width + x;
+            if !filter.visits(i, abs_bit) {
+                x += lat.step;
+                continue;
+            }
+            if !significant[i] {
+                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
+                let ctx = significance_ctx_for(pat, x, y, levels);
+                let (num, den) = model.probability(ctx);
+                let bit = dec.get_bit(num, den)?;
+                model.observe(ctx, bit);
+                if bit == 1 {
+                    significant[i] = true;
+                    cat[i] = 1;
+                    mag[i] |= 1u32 << abs_bit;
+                    last_bit[i] = abs_bit as u8;
+                    let (h_pat, v_pat) =
+                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
+                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    let (sn, sd) = model.probability(sctx);
+                    let coded_sign = dec.get_bit(sn, sd)?;
+                    model.observe(sctx, coded_sign);
+                    let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
+                    sign[i] = raw_sign == 1;
+                }
+            } else {
+                let has_hv = has_hv_significant(neighbour_significance_pattern(
+                    significant,
+                    width,
+                    height,
+                    x,
+                    y,
+                    levels,
+                ));
+                let bit = match magnitude_context(cat[i], has_hv) {
+                    MagnitudeContext::Coded(rctx) => {
+                        let (num, den) = model.probability(rctx);
+                        let bit = dec.get_bit(num, den)?;
+                        model.observe(rctx, bit);
+                        bit
+                    }
+                    MagnitudeContext::Uncoded => {
+                        let (num, den) = UNCODED_P1;
+                        dec.get_bit(num, den)?
+                    }
+                };
+                if bit == 1 {
+                    mag[i] |= 1u32 << abs_bit;
+                }
+                cat[i] = cat[i].saturating_add(1).min(3);
+                // The refinement bit (0 or 1) confirms the magnitude down
+                // to this plane for this coefficient.
+                last_bit[i] = abs_bit as u8;
+            }
+            x += lat.step;
+        }
+        y += lat.step;
+    }
+    Ok(())
+}
+
+/// Shared schedule validation for the priority-interleaved codec.
+fn validate_prioritized(levels: u8, q: u8) -> Result<()> {
+    if q == 0 || q > 31 {
+        return Err(IcerError::invalid(format!(
+            "bit-plane count {q} outside (0,31]"
+        )));
+    }
+    if !(1..=6).contains(&levels) {
+        return Err(IcerError::invalid(format!(
+            "§III.A priority interleaving requires decomposition levels in [1,6]; got {levels}"
+        )));
+    }
+    Ok(())
+}
+
+/// Encode a coefficient buffer as IPN 42-155 §III.A **priority-
+/// interleaved** packets, one per [`crate::priority::packet_schedule`]
+/// entry: subband bit planes walked in §III.A order, each coded in a
+/// single combined raster pass, cut into packets at priority-group
+/// boundaries with the fat units
+/// (> [`crate::priority::FINE_PACKET_COEFFS`] coefficients) emitted
+/// alone so a byte-quota truncation stays close to its exact §III.A
+/// schedule position. `min_loss` drops whole subband bit planes per
+/// the §VI.A quality goal. The returned packets carry the **priority
+/// group index** in `bit_plane` (`is_significance` is `true` for all
+/// of them — the pass is combined).
+///
+/// The context model persists across the whole segment; each packet's
+/// body is a fresh entropy-coder run (byte-aligned truncation points).
+/// Requires `input.levels` in `[1, 6]` — the §III.A schedule is defined
+/// over subbands.
+pub fn encode_bitplanes_prioritized(
+    input: &BitPlaneInput<'_>,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+    min_loss: u8,
+) -> Result<Vec<EncodedPacket>> {
+    input.validate()?;
+    validate_prioritized(input.levels, input.q)?;
+    let n = input.coeffs.len();
+    filter.validate(n)?;
+    let q = input.q as u32;
+
+    let mut significant = vec![false; n];
+    let mut sign = vec![false; n];
+    let mut cat = vec![0u8; n];
+    let mut model = ContextModel::new();
+
+    let schedule = packet_schedule(input.levels, q, min_loss, input.width, input.height);
+    let mut packets = Vec::with_capacity(schedule.len());
+    for sp in &schedule {
+        let mut enc = kind.make_sink();
+        let mut delta_distortion = 0.0f64;
+        for unit in &sp.units {
+            let abs_bit = (q - 1 - unit.bp_from_msb) as usize;
+            let mut stats = (0u64, 0u64);
+            encode_priority_unit(
+                enc.as_mut(),
+                &mut model,
+                input.coeffs,
+                &mut significant,
+                &mut sign,
+                &mut cat,
+                input.width,
+                input.height,
+                unit,
+                abs_bit,
+                input.levels,
+                filter,
+                &mut stats,
+            );
+            // Same distortion-reduction model as the MSB-down packets
+            // (see EncodedPacket::delta_distortion): ~2 * 4^b per newly
+            // significant coefficient, 4^b / 4 per refined bit.
+            let bp_weight = 4f64.powi(abs_bit as i32);
+            delta_distortion += stats.0 as f64 * 2.0 * bp_weight;
+            delta_distortion += stats.1 as f64 * 0.25 * bp_weight;
+        }
+        packets.push(EncodedPacket {
+            bit_plane: sp.group_index as u8,
+            is_significance: true,
+            body: enc.finish_bits(),
+            delta_distortion,
+        });
+    }
+    Ok(packets)
+}
+
+/// Decode packets produced by [`encode_bitplanes_prioritized`]. Packets
+/// must arrive in schedule order (they are emitted that way); a
+/// truncated stream simply stops at its last delivered packet, and
+/// every coefficient reconstructs at its own §III.A deadzone point from
+/// the deepest magnitude bit actually delivered for it.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_bitplanes_prioritized(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+    levels: u8,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+    min_loss: u8,
+) -> Result<Vec<i32>> {
+    validate_prioritized(levels, q)?;
+    let n = width * height;
+    filter.validate(n)?;
+    let q32 = q as u32;
+
+    let mut significant = vec![false; n];
+    let mut sign = vec![false; n];
+    let mut mag = vec![0u32; n];
+    let mut cat = vec![0u8; n];
+    let mut last_bit = vec![q; n];
+    let mut model = ContextModel::new();
+
+    let schedule = packet_schedule(levels, q32, min_loss, width, height);
+    for (cursor, sp) in schedule.iter().enumerate() {
+        let Some(pkt) = packets.get(cursor) else {
+            // Truncated stream: every remaining packet is undelivered.
+            break;
+        };
+        if pkt.bit_plane != sp.group_index as u8 {
+            // The expected packet is missing (mid-stream loss or
+            // corruption). Later packets cannot be decoded without it —
+            // the context model and significance state would desync — so
+            // stop here, exactly like a truncation at this point.
+            break;
+        }
+        let mut dec = kind.make_source(&pkt.body)?;
+        for unit in &sp.units {
+            let abs_bit = (q32 - 1 - unit.bp_from_msb) as usize;
+            decode_priority_unit(
+                dec.as_mut(),
+                &mut model,
+                &mut significant,
+                &mut sign,
+                &mut mag,
+                &mut cat,
+                &mut last_bit,
+                width,
+                height,
+                unit,
+                abs_bit,
+                levels,
+                filter,
+            )?;
+        }
+    }
+
+    Ok(deadzone_reconstruct(&mag, &sign, &last_bit))
 }
 
 // ---------------------------------------------------------------------------

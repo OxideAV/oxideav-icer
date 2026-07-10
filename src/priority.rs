@@ -235,6 +235,214 @@ pub fn encode_order(decomposition_levels: u8, bit_planes: u32) -> Vec<SubbandBit
     plan
 }
 
+/// One §III.A **priority group**: every subband bit plane sharing a
+/// single `log2`-priority value, listed in the §III.A tie-break order
+/// (higher decomposition level first, then `LL, HL, LH, HH`, then the
+/// per-subband MSB-down order that equal priorities can never violate).
+///
+/// The priority-interleaved packet emitter cuts the progressive stream
+/// at group granularity: one packet per group, so a byte-quota
+/// truncation always lands on a §III.A priority boundary ("all subband
+/// bit planes having some fixed priority value" -- the same boundary
+/// §VI's minimum-loss parameter is defined on).
+#[derive(Debug, Clone)]
+pub struct PriorityGroup {
+    /// The shared `log2`-priority of every unit in this group.
+    pub priority_log2: i32,
+    /// The subband bit planes of this group, §III.A tie-break ordered.
+    pub units: Vec<SubbandBitPlane>,
+}
+
+/// Group the §III.A encode order into [`PriorityGroup`]s of equal
+/// `log2`-priority, highest priority first.
+///
+/// For a `D`-stage decomposition with `bit_planes = q` planes per
+/// subband the group priorities are exactly the contiguous range
+/// `D, D-1, .., -(q)` -- `D + q + 1` groups (LL's MSB plane alone owns
+/// priority `D`; level-1 HH's LSB plane alone owns `-q`). The group
+/// *index* (position in the returned vector, `0` = highest priority) is
+/// what a priority-interleaved packet header carries in its `bit_plane`
+/// field, so both codec sides recompute the identical schedule from
+/// `(D, q)` alone.
+pub fn priority_groups(decomposition_levels: u8, bit_planes: u32) -> Vec<PriorityGroup> {
+    let order = encode_order(decomposition_levels, bit_planes);
+    let mut groups: Vec<PriorityGroup> = Vec::new();
+    for unit in order {
+        match groups.last_mut() {
+            Some(g) if g.priority_log2 == unit.priority_log2 => g.units.push(unit),
+            _ => groups.push(PriorityGroup {
+                priority_log2: unit.priority_log2,
+                units: vec![unit],
+            }),
+        }
+    }
+    groups
+}
+
+/// `true` when the §VI.A minimum-loss parameter `M` excludes this
+/// subband bit plane from encoding entirely: the plane's absolute
+/// magnitude bit position (`q - 1 - bp_from_msb`, `0` = the LSB) lies
+/// below the subband's `max(0, M - offset)` excluded-LSB-plane count
+/// (Fig. 18 offsets, [`min_loss_offset`]).
+///
+/// This is the per-*plane* form of the per-*coefficient*
+/// [`min_loss_skip_map`]: within one subband every coefficient shares
+/// the same exclusion, so a priority-interleaved schedule drops whole
+/// units rather than filtering pixel visits. Both codec sides apply it
+/// to the [`priority_groups`] schedule, keyed off the `M` replicated in
+/// every packet header.
+pub fn min_loss_excludes_unit(
+    unit: &SubbandBitPlane,
+    decomposition_levels: u8,
+    bit_planes: u32,
+    min_loss: u8,
+) -> bool {
+    if min_loss == 0 {
+        return false;
+    }
+    let abs_bit = (bit_planes - 1 - unit.bp_from_msb) as i64;
+    let excluded =
+        (min_loss as i64 - min_loss_offset(unit.subband, decomposition_levels) as i64).max(0);
+    abs_bit < excluded
+}
+
+/// Fine-packetisation threshold for the priority-interleaved wire
+/// schedule (see [`packet_schedule`]): a subband bit plane whose
+/// subband holds **more than** this many coefficients in the strip is
+/// emitted as its own packet instead of sharing its priority group's
+/// packet. Both papers leave packetisation to the implementation
+/// (IPN 42-155 §V.A: "multiple packets may be used for a single
+/// compressed segment"); this value trades per-packet header overhead
+/// (4 bytes) against byte-quota truncation granularity — the fat
+/// low-level subband bit planes carry most of the stream's bytes, so
+/// giving them their own packets keeps a quota cut close to its exact
+/// §III.A schedule position.
+pub const FINE_PACKET_COEFFS: usize = 256;
+
+/// One wire packet of the §III.A priority-interleaved schedule: the
+/// index of the [`priority_groups`] group it belongs to (what the
+/// packet header's `bit_plane` field carries) plus the subband bit
+/// planes its body codes, in §III.A order.
+#[derive(Debug, Clone)]
+pub struct SchedulePacket {
+    /// Index into [`priority_groups`] (`0` = highest priority).
+    pub group_index: usize,
+    /// The units this packet codes, in §III.A tie-break order.
+    pub units: Vec<SubbandBitPlane>,
+}
+
+/// Number of coefficients of `subband` inside a `width x height`
+/// Mallat-interleaved buffer (the count of its [`subband_lattice`]
+/// points).
+pub fn subband_coeff_count(subband: Subband, width: usize, height: usize) -> usize {
+    let lat = subband_lattice(subband);
+    let nx = if lat.x0 < width {
+        (width - lat.x0).div_ceil(lat.step)
+    } else {
+        0
+    };
+    let ny = if lat.y0 < height {
+        (height - lat.y0).div_ceil(lat.step)
+    } else {
+        0
+    };
+    nx * ny
+}
+
+/// The deterministic wire-packet schedule of a priority-interleaved
+/// segment: [`priority_groups`] filtered by the §VI.A `min_loss`
+/// exclusion ([`min_loss_excludes_unit`]), with every *fat* unit (its
+/// subband holds more than [`FINE_PACKET_COEFFS`] coefficients in the
+/// `width x height` strip) cut into its own packet. Unit order — the
+/// concatenation of every packet's `units` — is exactly the §III.A
+/// encode order; only the packet boundaries move. Empty groups produce
+/// no packet.
+///
+/// Both codec sides recompute this schedule from values carried in the
+/// segment + packet headers alone (`decomp_levels`, `bit_plane_count`,
+/// `width`, `height`, `min_loss`), so packet contents are never
+/// signalled — the header's group index is a consistency check, and a
+/// truncated stream simply stops at its last delivered packet.
+pub fn packet_schedule(
+    decomposition_levels: u8,
+    bit_planes: u32,
+    min_loss: u8,
+    width: usize,
+    height: usize,
+) -> Vec<SchedulePacket> {
+    let groups = priority_groups(decomposition_levels, bit_planes);
+    let mut out = Vec::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        let mut open: Option<SchedulePacket> = None;
+        for unit in &group.units {
+            if min_loss_excludes_unit(unit, decomposition_levels, bit_planes, min_loss) {
+                continue;
+            }
+            if subband_coeff_count(unit.subband, width, height) > FINE_PACKET_COEFFS {
+                // Fat unit: close the open run, emit the unit alone.
+                if let Some(p) = open.take() {
+                    out.push(p);
+                }
+                out.push(SchedulePacket {
+                    group_index,
+                    units: vec![*unit],
+                });
+            } else {
+                open.get_or_insert_with(|| SchedulePacket {
+                    group_index,
+                    units: Vec::new(),
+                })
+                .units
+                .push(*unit);
+            }
+        }
+        if let Some(p) = open.take() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The lattice a subband occupies inside the Mallat-interleaved
+/// coefficient buffer: `x ≡ x0 (mod step)`, `y ≡ y0 (mod step)`.
+///
+/// Inverse of [`classify_position`] under the crate's
+/// interleaved-sub-rectangle dyadic layout: one decomposition stage
+/// interleaves low/high outputs at stride 2 per axis, so a subband at
+/// decomposition level `j` lives on the stride-`2^j` sub-lattice whose
+/// per-axis phase is `0` for the low-pass (`L`) axis and `2^(j-1)` for
+/// the high-pass (`H`) axis (the odd index of the level-`j`
+/// interleave). The deepest `LL` sits at phase `(0, 0)` with stride
+/// `2^D`.
+///
+/// The §III raster scan of a subband bit plane ("the bits within a
+/// segment are compressed in raster scan order") walks this lattice
+/// row-major: `y = y0, y0+step, ..` outer, `x = x0, x0+step, ..` inner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubbandLattice {
+    /// Horizontal phase of the lattice (`x % step == x0`).
+    pub x0: usize,
+    /// Vertical phase of the lattice (`y % step == y0`).
+    pub y0: usize,
+    /// Per-axis stride between adjacent lattice points.
+    pub step: usize,
+}
+
+/// The [`SubbandLattice`] of `subband` (see the struct docs). `level`
+/// must be `1..=6` per the segment-header range.
+pub fn subband_lattice(subband: Subband) -> SubbandLattice {
+    let j = subband.level as u32;
+    let step = 1usize << j;
+    let half = 1usize << (j - 1);
+    let (x0, y0) = match subband.kind {
+        SubbandType::Ll => (0, 0),
+        SubbandType::Hl => (half, 0),
+        SubbandType::Lh => (0, half),
+        SubbandType::Hh => (half, half),
+    };
+    SubbandLattice { x0, y0, step }
+}
+
 /// Classify the transform-coefficient position `(x, y)` into its
 /// `(SubbandType, level)` under the crate's interleaved-sub-rectangle
 /// dyadic layout (the one produced by
@@ -242,8 +450,10 @@ pub fn encode_order(decomposition_levels: u8, bit_planes: u32) -> Vec<SubbandBit
 ///
 /// The crate's dyadic transform leaves each level in Mallat-interleaved
 /// form (low-pass at even indices, high-pass at odd indices per axis)
-/// and then applies the next level to the **top-left sub-rectangle** of
-/// the active region. So a coefficient's subband is found by repeatedly
+/// and then applies the next level to the **even/even low-pass
+/// lattice** (stride doubling per stage — IPN 42-155 §II.B: each
+/// further stage decomposes the LL subband). So a coefficient's subband
+/// is found by repeatedly
 /// halving: at the current level, if both coordinates are even the
 /// coefficient belongs to the low/low band that the next level
 /// re-transforms (descend); otherwise the parity pair `(x%2, y%2)` names
@@ -637,6 +847,125 @@ mod tests {
     fn levels_clamped_to_1_6() {
         assert_eq!(subbands(0).len(), subbands(1).len());
         assert_eq!(subbands(9).len(), subbands(6).len());
+    }
+
+    /// The §III.A priority groups form the contiguous descending
+    /// priority range `D ..= -q` (`D + q + 1` groups), partition the
+    /// full `(subband, plane)` set, and preserve the encode-order
+    /// tie-breaks within each group.
+    #[test]
+    fn priority_groups_are_contiguous_and_partition() {
+        for d in 1..=6u8 {
+            for q in [1u32, 3, 8, 12] {
+                let groups = priority_groups(d, q);
+                assert_eq!(
+                    groups.len(),
+                    d as usize + q as usize + 1,
+                    "D={d} q={q} group count"
+                );
+                assert_eq!(groups[0].priority_log2, d as i32, "top group is LL MSB");
+                assert_eq!(
+                    groups.last().unwrap().priority_log2,
+                    -(q as i32),
+                    "bottom group is level-1 HH LSB"
+                );
+                for w in groups.windows(2) {
+                    assert_eq!(
+                        w[0].priority_log2 - 1,
+                        w[1].priority_log2,
+                        "groups descend by exactly 1 in log2 priority"
+                    );
+                }
+                let total: usize = groups.iter().map(|g| g.units.len()).sum();
+                assert_eq!(total, (3 * d as usize + 1) * q as usize);
+                // Flattening the groups reproduces the encode order.
+                let flat: Vec<_> = groups.iter().flat_map(|g| g.units.iter()).collect();
+                let order = encode_order(d, q);
+                assert_eq!(flat.len(), order.len());
+                for (a, b) in flat.iter().zip(order.iter()) {
+                    assert_eq!(**a, *b, "grouping must preserve the §III.A order");
+                }
+            }
+        }
+    }
+
+    /// §III.A worked example at group granularity: with D = 3 the LL
+    /// plane 4 steps below its MSB shares a group with level-1 HH's MSB
+    /// plane (the 16x / four-plane offset).
+    #[test]
+    fn priority_groups_pin_ll_hh1_offset() {
+        let groups = priority_groups(3, 12);
+        let g = groups
+            .iter()
+            .find(|g| {
+                g.units.iter().any(|u| {
+                    u.subband.kind == SubbandType::Hh && u.subband.level == 1 && u.bp_from_msb == 0
+                })
+            })
+            .unwrap();
+        assert!(
+            g.units
+                .iter()
+                .any(|u| u.subband.kind == SubbandType::Ll && u.bp_from_msb == 4),
+            "LL bp 4 must tie level-1 HH bp 0 (D=3, 16x weight)"
+        );
+    }
+
+    /// `min_loss_excludes_unit` agrees with the per-coefficient
+    /// `min_loss_skip_map` on every subband bit plane.
+    #[test]
+    fn min_loss_unit_exclusion_matches_skip_map() {
+        let (w, h) = (32usize, 32usize);
+        for d in 1..=4u8 {
+            for m in [0u8, 1, 2, 4, 7] {
+                let q = 8u32;
+                let skip = min_loss_skip_map(w, h, d, m);
+                for unit in encode_order(d, q) {
+                    let lat = subband_lattice(unit.subband);
+                    // Representative coefficient of this subband.
+                    let i = lat.y0 * w + lat.x0;
+                    let abs_bit = q - 1 - unit.bp_from_msb;
+                    let expect = abs_bit < skip[i] as u32;
+                    assert_eq!(
+                        min_loss_excludes_unit(&unit, d, q, m),
+                        expect,
+                        "D={d} M={m} {unit:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `subband_lattice` is the exact inverse of `classify_position`:
+    /// every buffer position lies on precisely its own subband's
+    /// lattice, and walking all lattices covers the buffer once.
+    #[test]
+    fn subband_lattice_inverts_classify_position() {
+        let (w, h) = (48usize, 40usize); // non-power-of-two on purpose
+        for d in 1..=5u8 {
+            let mut visited = vec![0u32; w * h];
+            for subband in subbands(d) {
+                let lat = subband_lattice(subband);
+                let mut y = lat.y0;
+                while y < h {
+                    let mut x = lat.x0;
+                    while x < w {
+                        assert_eq!(
+                            classify_position(x, y, d),
+                            (subband.kind, subband.level),
+                            "D={d} ({x},{y}) lattice/classify disagree"
+                        );
+                        visited[y * w + x] += 1;
+                        x += lat.step;
+                    }
+                    y += lat.step;
+                }
+            }
+            assert!(
+                visited.iter().all(|&v| v == 1),
+                "D={d}: lattices must tile the buffer exactly once"
+            );
+        }
     }
 
     /// `classify_position` follows the interleaved sub-rectangle dyadic

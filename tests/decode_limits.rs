@@ -31,6 +31,7 @@ fn synth_header(width: u16, height: u16, uncompressed: bool) -> Vec<u8> {
         interleaved_entropy: false,
         transform_segmented: false,
         total_segments: 0,
+        priority_interleaved: false,
         segment_length: 0,
         segment_index: 0,
     };

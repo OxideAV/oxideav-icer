@@ -122,6 +122,9 @@ fuzz_target!(|data: &[u8]| {
     let opt_f = data[7];
 
     let filter = pick_filter(opt_a);
+    // §III.A subband-priority interleaving rides an otherwise-unused
+    // opt_a bit (the filter uses only the low three).
+    let priority_interleaving = (opt_a & 0x08) != 0;
     let wavelet_levels = (opt_b & 0x07).clamp(1, MAX_LEVELS);
     let bit_plane_count = ((opt_b >> 3) & 0x0F).max(1); // 1..=15
     let uncompressed = (opt_c & 0x01) != 0;
@@ -179,6 +182,7 @@ fuzz_target!(|data: &[u8]| {
         interleaved_entropy,
         transform_segments,
         min_loss,
+        priority_interleaving,
     };
 
     // ---- Encode ------------------------------------------------------

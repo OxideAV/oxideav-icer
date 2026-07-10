@@ -17,24 +17,27 @@ fn segment_header_roundtrip_all_filters() {
         for levels in 1..=6 {
             for uncompressed in [false, true] {
                 for interleaved_entropy in [false, true] {
-                    let h = SegmentHeader {
-                        sync_prefix: 0xACED,
-                        filter,
-                        decomp_levels: levels,
-                        uncompressed,
-                        width: 256,
-                        height: 192,
-                        bit_plane_count: 8,
-                        interleaved_entropy,
-                        transform_segmented: false,
-                        total_segments: 0,
-                        segment_length: 1234,
-                        segment_index: 0,
-                    };
-                    let enc = h.encode();
-                    let (parsed, n) = SegmentHeader::parse(&enc).unwrap();
-                    assert_eq!(n, SegmentHeader::ENCODED_BYTES);
-                    assert_eq!(parsed, h);
+                    for priority_interleaved in [false, true] {
+                        let h = SegmentHeader {
+                            sync_prefix: 0xACED,
+                            filter,
+                            decomp_levels: levels,
+                            uncompressed,
+                            width: 256,
+                            height: 192,
+                            bit_plane_count: 8,
+                            interleaved_entropy,
+                            transform_segmented: false,
+                            total_segments: 0,
+                            priority_interleaved,
+                            segment_length: 1234,
+                            segment_index: 0,
+                        };
+                        let enc = h.encode();
+                        let (parsed, n) = SegmentHeader::parse(&enc).unwrap();
+                        assert_eq!(n, SegmentHeader::ENCODED_BYTES);
+                        assert_eq!(parsed, h);
+                    }
                 }
             }
         }
@@ -58,6 +61,7 @@ fn segment_header_transform_segmented_roundtrip() {
             interleaved_entropy: false,
             transform_segmented: true,
             total_segments: total,
+            priority_interleaved: false,
             segment_length: 0,
             segment_index: index,
         };
@@ -80,6 +84,7 @@ fn segment_header_transform_segmented_rejects_bad_counts() {
         interleaved_entropy: false,
         transform_segmented: true,
         total_segments: 4,
+        priority_interleaved: false,
         segment_length: 0,
         segment_index: 0,
     };
@@ -194,6 +199,7 @@ fn walk_segment_with_two_packets() {
         interleaved_entropy: false,
         transform_segmented: false,
         total_segments: 0,
+        priority_interleaved: false,
         segment_length: packets_concat.len() as u16,
         segment_index: 0,
     };

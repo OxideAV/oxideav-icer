@@ -43,9 +43,13 @@ use crate::error::{IcerError, Result};
 
 /// Wavelet filter identifier -- IPN 42-155 §III.A enumerates eight
 /// candidates: filters `A` through `G` (float lifting variants) plus
-/// filter `Q` (the integer 5/3). The field is 4 bits wide in the
-/// segment header; values 0..=7 cover the eight filter ids, 8..=15
-/// are reserved.
+/// filter `Q` (the integer 5/3). The field occupies bits 6..4 of
+/// header byte 2; values 0..=7 cover the eight filter ids. (The
+/// field was originally documented as 4 bits wide with 8..=15
+/// reserved; the top bit of that space now carries the §III.A
+/// subband-priority interleaving flag -- see
+/// [`SegmentHeader::priority_interleaved`] -- and every pre-existing
+/// stream has it clear.)
 ///
 /// The deployed Mars rover configurations use filter `Q` for lossless
 /// and filter `A` (a 9/7-style float lifting filter) for lossy.
@@ -97,7 +101,8 @@ impl WaveletFilter {
 /// | bits | field          | source                         |
 /// |------|----------------|--------------------------------|
 /// | 16   | sync prefix    | IPN 42-155 §IV implementation  |
-/// |  4   | filter id      | IPN 42-155 §III.A              |
+/// |  1   | §III.A priority interleaving | IPN 42-155 §III.A |
+/// |  3   | filter id      | IPN 42-155 §III.A              |
 /// |  3   | decomp levels  | IPN 42-155 §III.A `D` ∈ {1..6} |
 /// |  1   | uncompressed   | IPN 42-155 §III.D              |
 /// | 16   | width          | §III.E image partitioning      |
@@ -154,6 +159,21 @@ pub struct SegmentHeader {
     /// Meaningful (and non-zero) only when [`Self::transform_segmented`]
     /// is set; `0` on row-strip segments.
     pub total_segments: u8,
+    /// `true` when this compressed segment's packets follow the IPN
+    /// 42-155 §III.A **subband-priority interleaving**: instead of one
+    /// significance + refinement packet pair per whole-strip bit plane,
+    /// the coder walks subband bit planes in decreasing §III.A priority
+    /// (Fig. 7 weight halved per plane, ties to the higher decomposition
+    /// level then `LL, HL, LH, HH`), coding each subband bit plane in a
+    /// single combined raster pass over the subband (sign immediately
+    /// after the first nonzero magnitude bit, §III). Each packet then
+    /// carries one *priority group* (every subband bit plane sharing one
+    /// priority value) and the packet header's `bit_plane` field holds
+    /// the group index. Carried in the top bit of header byte 2 (the
+    /// previously-reserved top bit of the old 4-bit filter field), so
+    /// every pre-existing stream (bit = 0) parses as the whole-strip
+    /// MSB-down ordering unchanged.
+    pub priority_interleaved: bool,
     /// Total compressed body size of this segment in bytes — does not
     /// include the segment header itself. Used by the demuxer / packet
     /// walker to skip past a segment whose interior it can't (yet)
@@ -186,9 +206,11 @@ impl SegmentHeader {
             return Err(IcerError::invalid("segment sync prefix is zero"));
         }
 
-        // Byte 2: 4 bits filter id, 3 bits decomp levels, 1 bit uncompressed.
+        // Byte 2: 1 bit §III.A priority interleaving, 3 bits filter id,
+        // 3 bits decomp levels, 1 bit uncompressed.
         let b2 = bytes[2];
-        let filter = WaveletFilter::from_bits(b2 >> 4)?;
+        let priority_interleaved = (b2 & 0x80) != 0;
+        let filter = WaveletFilter::from_bits((b2 >> 4) & 0b0111)?;
         let decomp_levels = (b2 >> 1) & 0b0000_0111;
         if !(1..=6).contains(&decomp_levels) {
             return Err(IcerError::invalid(format!(
@@ -252,6 +274,7 @@ impl SegmentHeader {
                 interleaved_entropy,
                 transform_segmented,
                 total_segments,
+                priority_interleaved,
                 segment_length,
                 segment_index,
             },
@@ -265,10 +288,13 @@ impl SegmentHeader {
     pub fn encode(&self) -> [u8; Self::ENCODED_BYTES] {
         let mut out = [0u8; Self::ENCODED_BYTES];
         out[0..2].copy_from_slice(&self.sync_prefix.to_be_bytes());
-        let filter_bits = self.filter as u8;
+        let filter_bits = self.filter as u8 & 0b0111;
         let levels_bits = self.decomp_levels & 0b0000_0111;
         let uncompressed_bit = u8::from(self.uncompressed);
-        out[2] = (filter_bits << 4) | (levels_bits << 1) | uncompressed_bit;
+        out[2] = (u8::from(self.priority_interleaved) << 7)
+            | (filter_bits << 4)
+            | (levels_bits << 1)
+            | uncompressed_bit;
         out[3..5].copy_from_slice(&self.width.to_be_bytes());
         out[5..7].copy_from_slice(&self.height.to_be_bytes());
         // Byte 7: Q in the top 6 bits, entropy-backend flag in bit 1,
@@ -308,6 +334,13 @@ impl SegmentHeader {
 pub struct PacketHeader {
     /// Bit-plane this packet refines, counting from the MSB downward.
     /// `0` means the most significant magnitude bit, `Q-1` the LSB.
+    ///
+    /// On a [`SegmentHeader::priority_interleaved`] segment this field
+    /// instead carries the §III.A **priority-group index** (0 = the
+    /// highest-priority group; see
+    /// [`crate::priority::priority_groups`]), and the packet body holds
+    /// the combined raster pass of every subband bit plane in that
+    /// group.
     pub bit_plane: u8,
     /// Which of the three bit-plane passes (IPN 42-155 §III.B) this
     /// packet contributes to.

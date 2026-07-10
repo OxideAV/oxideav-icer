@@ -498,14 +498,7 @@ fn decode_transform_domain(
         }
         // §VI.A minimum loss, replicated in every packet header.
         let min_loss = wseg.packets[0].header.min_loss;
-        let skip_map: Option<Vec<u8>> =
-            (min_loss > 0).then(|| crate::priority::min_loss_skip_map(w, h, levels, min_loss));
         let window = rects[seg_idx as usize].image_window(levels, w, h);
-        let filter = ScanFilter {
-            segment: Some((&seg_map, seg_idx)),
-            skip: skip_map.as_deref(),
-            window: Some(window),
-        };
         let encoded_packets: Vec<EncodedPacket> = wseg
             .packets
             .iter()
@@ -521,15 +514,43 @@ fn decode_transform_domain(
         } else {
             crate::entropy::EntropyKind::Arithmetic
         };
-        let part = crate::bitplane::decode_bitplanes_filtered(
-            &encoded_packets,
-            w,
-            h,
-            wseg.header.bit_plane_count,
-            levels,
-            kind,
-            &filter,
-        )?;
+        let part = if wseg.header.priority_interleaved {
+            // §III.A subband-priority interleaving over this §V.B
+            // segment (min_loss excludes whole subband bit planes from
+            // the schedule; no per-coefficient skip map applies).
+            let filter = ScanFilter {
+                segment: Some((&seg_map, seg_idx)),
+                skip: None,
+                window: Some(window),
+            };
+            crate::bitplane::decode_bitplanes_prioritized(
+                &encoded_packets,
+                w,
+                h,
+                wseg.header.bit_plane_count,
+                levels,
+                kind,
+                &filter,
+                min_loss,
+            )?
+        } else {
+            let skip_map: Option<Vec<u8>> =
+                (min_loss > 0).then(|| crate::priority::min_loss_skip_map(w, h, levels, min_loss));
+            let filter = ScanFilter {
+                segment: Some((&seg_map, seg_idx)),
+                skip: skip_map.as_deref(),
+                window: Some(window),
+            };
+            crate::bitplane::decode_bitplanes_filtered(
+                &encoded_packets,
+                w,
+                h,
+                wseg.header.bit_plane_count,
+                levels,
+                kind,
+                &filter,
+            )?
+        };
         let (wx0, wx1, wy0, wy1) = window;
         for y in wy0..wy1 {
             for x in wx0..wx1 {
@@ -638,22 +659,38 @@ fn decode_compressed_segment_into(
         // the identical per-subband plane exclusion the encoder used
         // (0 on every pre-existing stream = no exclusion).
         let min_loss = walked.packets[0].header.min_loss;
-        let skip_map: Option<Vec<u8>> = (min_loss > 0)
-            .then(|| crate::priority::min_loss_skip_map(width, height, levels, min_loss));
-        let filter = ScanFilter {
-            segment: None,
-            skip: skip_map.as_deref(),
-            window: None,
-        };
-        crate::bitplane::decode_bitplanes_filtered(
-            &encoded_packets,
-            width,
-            height,
-            q,
-            levels,
-            kind,
-            &filter,
-        )?
+        if walked.header.priority_interleaved {
+            // §III.A subband-priority interleaving: replay the identical
+            // priority-group schedule (min_loss drops whole subband bit
+            // planes from it, so no per-coefficient skip map applies).
+            crate::bitplane::decode_bitplanes_prioritized(
+                &encoded_packets,
+                width,
+                height,
+                q,
+                levels,
+                kind,
+                &ScanFilter::ALL,
+                min_loss,
+            )?
+        } else {
+            let skip_map: Option<Vec<u8>> = (min_loss > 0)
+                .then(|| crate::priority::min_loss_skip_map(width, height, levels, min_loss));
+            let filter = ScanFilter {
+                segment: None,
+                skip: skip_map.as_deref(),
+                window: None,
+            };
+            crate::bitplane::decode_bitplanes_filtered(
+                &encoded_packets,
+                width,
+                height,
+                q,
+                levels,
+                kind,
+                &filter,
+            )?
+        }
     };
     wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
     // Inverse level-shift + clamp to 0..=255. Saturating: a corrupted

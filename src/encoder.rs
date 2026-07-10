@@ -300,6 +300,42 @@ pub struct EncodeOptions {
     /// whichever comes first" (§VI). Applies to the compressed path
     /// only (the §III.D uncompressed path ships raw pixels).
     pub min_loss: u8,
+
+    /// IPN 42-155 §III.A **subband-priority interleaving**.
+    ///
+    /// When `true` (compressed path only), each segment's packets follow
+    /// the spec's progressive order instead of the crate's historical
+    /// whole-strip MSB-down packet pairs: subband bit planes are walked
+    /// in decreasing §III.A priority (Fig. 7 weight, halved per plane;
+    /// ties to the higher decomposition level, then `LL, HL, LH, HH`),
+    /// each subband bit plane is coded in a **single combined raster
+    /// pass** over the subband (§III: significance and refinement bits
+    /// pixel-interleaved, sign immediately after the first nonzero
+    /// magnitude bit), and one packet is cut per priority group so a
+    /// byte-quota truncation always lands on a §III.A priority boundary.
+    /// The context model persists across the segment (§III: estimates
+    /// rely on "previously encoded information from the same segment").
+    ///
+    /// This is what makes a truncated stream "the best image achievable
+    /// for that many bytes" (§III.A): under the historical whole-strip
+    /// plane order a truncation spends bytes on low-weight level-1 HH
+    /// bits before high-weight LL planes; the §III.A order defers them.
+    ///
+    /// The mode is recorded per segment in a previously-reserved header
+    /// bit ([`crate::header::SegmentHeader::priority_interleaved`]), so
+    /// every pre-existing stream decodes unchanged and the decoder
+    /// dispatches on the wire flag with no caller-side awareness.
+    ///
+    /// Compose-rules: composes with both entropy backends, row-strip
+    /// and §V.B transform-domain segmentation, `min_loss` (whole
+    /// subband bit planes are dropped from the schedule), the byte
+    /// quota / soft target, ROI segment priorities, colour, the §III.D
+    /// uncompressed fallback, and `quality_target_psnr`. Mutually
+    /// exclusive with `rd_pruning` (two different packet schedulers;
+    /// the §III.A order already places every packet at its
+    /// distortion-priority position). Ignored when
+    /// [`Self::uncompressed`] forces the raw-pixel path.
+    pub priority_interleaving: bool,
 }
 
 impl Default for EncodeOptions {
@@ -327,6 +363,7 @@ impl Default for EncodeOptions {
             interleaved_entropy: false,
             transform_segments: false,
             min_loss: 0,
+            priority_interleaving: false,
         }
     }
 }
@@ -527,6 +564,19 @@ impl EncodeOptions {
         self
     }
 
+    /// Enable IPN 42-155 §III.A subband-priority interleaving: packets
+    /// follow the spec's cross-subband progressive order (one packet
+    /// per §III.A priority group, combined single-raster-pass subband
+    /// bit planes) instead of the historical whole-strip MSB-down packet
+    /// pairs. See [`EncodeOptions::priority_interleaving`] for the full
+    /// contract. Recorded on the wire per segment; pre-existing streams
+    /// decode unchanged.
+    #[must_use]
+    pub fn with_priority_interleaving(mut self) -> Self {
+        self.priority_interleaving = true;
+        self
+    }
+
     /// Set the §VI.A *minimum loss* quality-goal parameter. See
     /// [`EncodeOptions::min_loss`] for the full contract; `0` keeps the
     /// lossless-capable default.
@@ -693,6 +743,17 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
                 "min_loss + rd_pruning is unsupported; pick one rate-control mode".into(),
             ));
         }
+    }
+
+    // §III.A subband-priority interleaving is a packet *scheduler*; the
+    // R-D selector is a competing one (its ΔD model and dependency
+    // graph assume the whole-strip MSB-down packet pairs).
+    if opts.priority_interleaving && opts.rd_pruning {
+        return Err(IcerError::Unsupported(
+            "priority_interleaving + rd_pruning is unsupported; the §III.A order \
+             already schedules packets by distortion priority"
+                .into(),
+        ));
     }
 
     // §V.B transform-domain segmentation: whole-image DWT, §V.D LL
@@ -1032,6 +1093,7 @@ fn encode_transform_segmented(
             interleaved_entropy: opts.interleaved_entropy,
             transform_segmented: true,
             total_segments: n_segs as u8,
+            priority_interleaved: opts.priority_interleaving,
             segment_length: 0,
             segment_index: seg_idx as u16,
         };
@@ -1086,15 +1148,33 @@ fn encode_one_transform_segment(
         q,
         levels,
     };
-    let packets =
-        crate::bitplane::encode_bitplanes_filtered(&bp_input, opts.entropy_kind(), &filter)?;
-    let body = serialize_packets_msb_down(
-        &packets,
-        q,
-        opts,
-        byte_budget,
-        min_visited_skip(&filter, w * h),
-    )?;
+    let body = if opts.priority_interleaving {
+        // §III.A priority schedule over this §V.B segment's coefficients
+        // (segment mask + window; min_loss drops whole subband bit
+        // planes from the schedule, no per-coefficient skip map).
+        let priority_filter = ScanFilter {
+            segment: Some((seg_map, seg_idx)),
+            skip: None,
+            window: Some(window),
+        };
+        let packets = crate::bitplane::encode_bitplanes_prioritized(
+            &bp_input,
+            opts.entropy_kind(),
+            &priority_filter,
+            opts.min_loss,
+        )?;
+        serialize_priority_packets(&packets, opts, byte_budget)?
+    } else {
+        let packets =
+            crate::bitplane::encode_bitplanes_filtered(&bp_input, opts.entropy_kind(), &filter)?;
+        serialize_packets_msb_down(
+            &packets,
+            q,
+            opts,
+            byte_budget,
+            min_visited_skip(&filter, w * h),
+        )?
+    };
 
     let segment = SegmentHeader {
         sync_prefix: opts.sync_prefix,
@@ -1107,6 +1187,7 @@ fn encode_one_transform_segment(
         interleaved_entropy: opts.interleaved_entropy,
         transform_segmented: true,
         total_segments,
+        priority_interleaved: opts.priority_interleaving,
         segment_length: body.len() as u16,
         segment_index: seg_idx,
     };
@@ -1218,6 +1299,59 @@ fn serialize_packets_msb_down(
     Ok(body)
 }
 
+/// Serialise §III.A priority-interleaved packets in schedule order
+/// under the hard cap / soft target quota semantics. Packets are
+/// already in decreasing-priority order (one per priority group), so
+/// the quota cut is simply a prefix — exactly the §IV.B "compression
+/// can be terminated once the byte quota is met" behaviour, landing on
+/// a §III.A priority boundary. The soft target finishes the in-progress
+/// packet, then stops. Returns the segment body (packet headers +
+/// bodies); each packet header carries the group index in `bit_plane`,
+/// the `Cleanup` pass id (the pass is combined), and the replicated
+/// §VI.A `min_loss`.
+fn serialize_priority_packets(
+    packets: &[EncodedPacket],
+    opts: &EncodeOptions,
+    byte_budget: Option<u64>,
+) -> Result<Vec<u8>> {
+    let seg_hdr_bytes = SegmentHeader::ENCODED_BYTES as u64;
+    let mut body: Vec<u8> = Vec::new();
+    for pkt in packets {
+        if pkt.body.len() > u16::MAX as usize {
+            return Err(IcerError::Unsupported(format!(
+                "packet body {} exceeds u16 limit",
+                pkt.body.len()
+            )));
+        }
+        let pkt_wire_len = PacketHeader::ENCODED_BYTES as u64 + pkt.body.len() as u64;
+        if let Some(budget) = byte_budget {
+            if seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget {
+                break;
+            }
+        }
+        let ph = PacketHeader {
+            bit_plane: pkt.bit_plane,
+            pass: BitPlanePass::Cleanup,
+            body_length: pkt.body.len() as u16,
+            min_loss: opts.min_loss,
+        };
+        body.extend_from_slice(&ph.encode());
+        body.extend_from_slice(&pkt.body);
+        if let Some(target) = opts.target_bytes {
+            if seg_hdr_bytes + body.len() as u64 >= target {
+                break;
+            }
+        }
+    }
+    if body.len() > u16::MAX as usize {
+        return Err(IcerError::Unsupported(format!(
+            "compressed segment body {} exceeds u16 limit",
+            body.len()
+        )));
+    }
+    Ok(body)
+}
+
 /// Append a zero-body placeholder segment header for every strip whose
 /// `kept[seg_idx]` flag is `false`, in ascending `segment_index` order.
 ///
@@ -1254,6 +1388,7 @@ fn emit_skipped_placeholders(
             interleaved_entropy: opts.interleaved_entropy && !opts.uncompressed,
             transform_segmented: false,
             total_segments: 0,
+            priority_interleaved: opts.priority_interleaving && !opts.uncompressed,
             segment_length: 0,
             segment_index: seg_idx as u16,
         };
@@ -1386,6 +1521,38 @@ fn encode_one_segment_compressed(
     // than the caller-requested floor.
     let needed = select_bit_plane_count(&coeffs);
     let q = needed.max(opts.bit_plane_count.min(31)).min(31);
+
+    // §III.A subband-priority interleaving: the packet schedule is the
+    // spec's cross-subband priority order (one packet per priority
+    // group), coded with the combined single-raster-pass subband scan.
+    // min_loss drops whole subband bit planes from the schedule, so no
+    // per-coefficient skip map is needed on this path.
+    if opts.priority_interleaving {
+        let bp_input = BitPlaneInput {
+            coeffs: &coeffs,
+            width: img_w,
+            height: strip_h,
+            q,
+            levels,
+        };
+        let packets = crate::bitplane::encode_bitplanes_prioritized(
+            &bp_input,
+            opts.entropy_kind(),
+            &ScanFilter::ALL,
+            opts.min_loss,
+        )?;
+        let body = serialize_priority_packets(&packets, opts, opts.byte_budget)?;
+        let mut opts_copy = opts.clone();
+        opts_copy.bit_plane_count = q;
+        return emit_segment_header_and_body(
+            &body,
+            segment_index,
+            img_w,
+            strip_h,
+            &opts_copy,
+            false,
+        );
+    }
 
     // Encode as per-bit-plane packets (IPN 42-155 §IV multi-packet
     // ordering). When rate-distortion pruning is active, weight each
@@ -1644,6 +1811,7 @@ fn emit_segment_header_and_body(
         interleaved_entropy: opts.interleaved_entropy && !uncompressed,
         transform_segmented: false,
         total_segments: 0,
+        priority_interleaved: opts.priority_interleaving && !uncompressed,
         segment_length: segment_length as u16,
         segment_index,
     };
@@ -1935,6 +2103,7 @@ fn finish_segment(
         interleaved_entropy: opts.interleaved_entropy && !uncompressed,
         transform_segmented: false,
         total_segments: 0,
+        priority_interleaved: opts.priority_interleaving && !uncompressed,
         segment_length: segment_length as u16,
         segment_index,
     };

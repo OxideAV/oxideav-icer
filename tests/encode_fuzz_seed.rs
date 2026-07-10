@@ -83,6 +83,9 @@ fn drive(data: &[u8]) -> bool {
     let opt_f = data[7];
 
     let filter = pick_filter(opt_a);
+    // §III.A subband-priority interleaving rides an otherwise-unused
+    // opt_a bit (the filter uses only the low three).
+    let priority_interleaving = (opt_a & 0x08) != 0;
     let wavelet_levels = (opt_b & 0x07).clamp(1, MAX_LEVELS);
     let bit_plane_count = ((opt_b >> 3) & 0x0F).max(1);
     let uncompressed = (opt_c & 0x01) != 0;
@@ -132,6 +135,7 @@ fn drive(data: &[u8]) -> bool {
         interleaved_entropy,
         transform_segments: false,
         min_loss: 0,
+        priority_interleaving,
     };
 
     let encoded = match encode_icer(&img, &opts) {

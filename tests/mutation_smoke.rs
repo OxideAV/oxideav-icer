@@ -55,7 +55,34 @@ fn seeds() -> Vec<Vec<u8>> {
     let mut out = vec![encode_icer(&img, &tf).unwrap()];
     out.push(encode_icer(&img, &tf.clone().with_byte_budget(200)).unwrap());
     out.push(encode_icer(&img, &EncodeOptions::compressed().with_min_loss(3)).unwrap());
-    out.push(encode_icer(&img, &tf.with_min_loss(2).with_interleaved_entropy()).unwrap());
+    out.push(
+        encode_icer(
+            &img,
+            &tf.clone().with_min_loss(2).with_interleaved_entropy(),
+        )
+        .unwrap(),
+    );
+    // §III.A subband-priority interleaving (r405): plain, min-loss +
+    // interleaved-entropy, and composed with §V.B transform-domain
+    // segments — the three wire shapes the priority flag admits.
+    out.push(
+        encode_icer(
+            &img,
+            &EncodeOptions::compressed().with_priority_interleaving(),
+        )
+        .unwrap(),
+    );
+    out.push(
+        encode_icer(
+            &img,
+            &EncodeOptions::compressed()
+                .with_priority_interleaving()
+                .with_min_loss(2)
+                .with_interleaved_entropy(),
+        )
+        .unwrap(),
+    );
+    out.push(encode_icer(&img, &tf.with_priority_interleaving()).unwrap());
     out
 }
 

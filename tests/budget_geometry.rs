@@ -39,6 +39,7 @@ fn base_opts() -> EncodeOptions {
         interleaved_entropy: false,
         transform_segments: false,
         min_loss: 0,
+        priority_interleaving: false,
     }
 }
 
