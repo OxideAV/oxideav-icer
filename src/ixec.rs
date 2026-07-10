@@ -591,6 +591,11 @@ pub struct InterleavedEncoder {
     words: std::collections::VecDeque<Word>,
     /// The emitted channel bits.
     out: BitSink,
+    /// Number of mid-stream buffer-full front flushes performed
+    /// (§IV.C.1). Test-only observability: the flush-desync regression
+    /// tests assert their streams genuinely exercise this path.
+    #[cfg(test)]
+    pub(crate) mid_stream_flushes: usize,
 }
 
 /// A growable MSB-first bit buffer that packs into bytes on `finish`.
@@ -635,6 +640,8 @@ impl InterleavedEncoder {
             bins: bins(),
             words: std::collections::VecDeque::new(),
             out: BitSink::default(),
+            #[cfg(test)]
+            mid_stream_flushes: 0,
         }
     }
 
@@ -682,6 +689,10 @@ impl InterleavedEncoder {
 
         // §IV.C.1: if the buffer is full, flush the front (partial) word.
         while self.words.len() >= BUFFER_WORDS {
+            #[cfg(test)]
+            {
+                self.mid_stream_flushes += 1;
+            }
             self.flush_front();
             self.drain_front();
         }
@@ -771,6 +782,19 @@ pub struct InterleavedDecoder<'a> {
     bit_pos: usize,
     /// Per-bin stored suffix of the in-progress input codeword.
     suffix: Vec<std::collections::VecDeque<bool>>,
+    /// Mirror of the **encoder's** word list (§IV.C.1), rebuilt from the
+    /// decoded source bits. The decoder learns every source bit in
+    /// arrival order, so it can replay the encoder's list state exactly
+    /// — which is what lets it *detect the mid-stream buffer-full
+    /// flush*: when the mirrored list reaches [`BUFFER_WORDS`], the
+    /// encoder flushed its front partial word by completing it with
+    /// flush bits the source never produced. Those flush bits are
+    /// exactly the not-yet-consumed remainder of that bin's parsed
+    /// input codeword (every genuinely-arrived bit of the flushed word
+    /// was already served — source bits are consumed in order), so the
+    /// decoder discards the bin's suffix and stays in sync with the
+    /// fresh word the encoder opens for that bin's next source bit.
+    words: std::collections::VecDeque<Word>,
 }
 
 impl<'a> InterleavedDecoder<'a> {
@@ -784,6 +808,7 @@ impl<'a> InterleavedDecoder<'a> {
             chan: channel,
             bit_pos: 0,
             suffix: (0..n).map(|_| std::collections::VecDeque::new()).collect(),
+            words: std::collections::VecDeque::new(),
         }
     }
 
@@ -812,7 +837,58 @@ impl<'a> InterleavedDecoder<'a> {
             }
         }
         // The first remaining bit of the suffix is the decoded bit.
-        self.suffix[bin].pop_front().unwrap_or(false)
+        let bit = self.suffix[bin].pop_front().unwrap_or(false);
+        self.replay_encoder_list(bit, bin);
+        bit
+    }
+
+    /// Replay the encoder's §IV.C.1 word-list transition for one decoded
+    /// source bit (see the [`Self::words`] field docs): append the bit
+    /// to the bin's open word (or open a new word), drain complete front
+    /// words, and — when the mirrored list reaches [`BUFFER_WORDS`] —
+    /// reproduce the encoder's mid-stream flush by discarding the
+    /// flushed bin's pending suffix (the flush bits).
+    fn replay_encoder_list(&mut self, bit: bool, bin: usize) {
+        let open = self
+            .words
+            .iter_mut()
+            .rev()
+            .find(|w| w.bin == bin && !w.complete);
+        match open {
+            Some(w) => {
+                w.bits.push(bit);
+                if self.bins[bin].code.classify_input(&w.bits) == InputStatus::Complete {
+                    w.complete = true;
+                }
+            }
+            None => {
+                let bits = vec![bit];
+                let complete = self.bins[bin].code.classify_input(&bits) == InputStatus::Complete;
+                self.words.push_back(Word {
+                    bin,
+                    bits,
+                    complete,
+                });
+            }
+        }
+        // Mirror of the encoder's drain_front: complete front words left
+        // the encoder's list (their codewords were emitted).
+        while self.words.front().is_some_and(|w| w.complete) {
+            self.words.pop_front();
+        }
+        // Mirror of the encoder's buffer-full flush: the front partial
+        // word was completed with flush bits and emitted. Every arrived
+        // bit of that word has already been decoded (source bits are
+        // consumed in order), so the bin's remaining suffix holds
+        // exactly the flush bits — drop them.
+        while self.words.len() >= BUFFER_WORDS {
+            if let Some(front) = self.words.pop_front() {
+                self.suffix[front.bin].clear();
+            }
+            while self.words.front().is_some_and(|w| w.complete) {
+                self.words.pop_front();
+            }
+        }
     }
 
     /// Parse one output codeword from the channel and return its paired
@@ -1097,16 +1173,25 @@ mod tests {
     /// encode, then decode with the identical per-bit bin assignment, and
     /// recover every source bit exactly (§IV.C end-to-end).
     fn roundtrip(stream: &[(bool, u8)]) {
+        roundtrip_counting_flushes(stream);
+    }
+
+    /// Round-trip `stream` and return how many mid-stream buffer-full
+    /// flushes the encoder performed (so flush-regression tests can
+    /// assert they genuinely exercise the path).
+    fn roundtrip_counting_flushes(stream: &[(bool, u8)]) -> usize {
         let mut enc = InterleavedEncoder::new();
         for &(b, j) in stream {
             enc.encode_bit(b, j);
         }
+        let flushes = enc.mid_stream_flushes;
         let channel = enc.finish();
         let mut dec = InterleavedDecoder::new(&channel);
         for (idx, &(b, j)) in stream.iter().enumerate() {
             let got = dec.decode_bit(j);
             assert_eq!(got, b, "bit {idx} bin {j}: decoded {got} != source {b}");
         }
+        flushes
     }
 
     #[test]
@@ -1197,6 +1282,77 @@ mod tests {
                 .collect();
             roundtrip(&stream);
         }
+    }
+
+    /// Regression: a **mid-stream** buffer-full flush (§IV.C.1) followed
+    /// by more source bits for the flushed bin. The encoder completes
+    /// the stuck front word with flush bits and opens a fresh word for
+    /// the bin's later bits; the decoder must detect the flush (by
+    /// replaying the encoder's word list) and discard the flush bits
+    /// instead of serving them as source bits. Before the fix the
+    /// decoder desynchronised here — the path was reachable from real
+    /// packets once bodies grew past ~2048 words with a stuck
+    /// high-Golomb front word.
+    #[test]
+    fn interleave_mid_stream_flush_resyncs() {
+        // A lone zero in bin 17 (G512) opens a word that stays partial
+        // for up to 512 bits; single-`1` Golomb words in bin 9 (G5's
+        // input `1` is a complete one-bit codeword) pile up complete
+        // behind it until the 2048-word buffer forces a front flush.
+        let mut stream: Vec<(bool, u8)> = Vec::new();
+        stream.push((false, 17));
+        for _ in 0..(BUFFER_WORDS + 40) {
+            stream.push((true, 9));
+        }
+        // Post-flush bits for bin 17: the decoder must serve these from
+        // the encoder's fresh word, not from the flushed word's flush
+        // bits.
+        for i in 0..24 {
+            stream.push((i % 3 == 0, 17));
+            stream.push((i % 5 == 0, 9));
+        }
+        let flushes = roundtrip_counting_flushes(&stream);
+        assert!(flushes > 0, "stream must hit the mid-stream flush path");
+    }
+
+    /// Randomized stress over the mid-stream flush path: skewed streams
+    /// long enough to hit the 2048-word cap repeatedly, mixing stuck
+    /// high-Golomb words with fast-completing tree-code words across
+    /// several bins.
+    #[test]
+    fn interleave_mid_stream_flush_randomized() {
+        let mut state = 0xC0FF_EE11u32;
+        let mut next = |m: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) % m
+        };
+        let mut total_flushes = 0usize;
+        for _ in 0..4 {
+            let n = BUFFER_WORDS * 3;
+            let stream: Vec<(bool, u8)> = (0..n)
+                .map(|_| {
+                    // Mostly single-`1` Golomb words (complete in one
+                    // bit, so the list genuinely grows) with occasional
+                    // zeros into deep Golomb bins so front words get
+                    // stuck and flush mid-stream.
+                    let j = match next(40) {
+                        0 => 17u8,
+                        1 => 16,
+                        v => 9 + (v % 4) as u8,
+                    };
+                    // Deep Golomb bins receive zeros (their words stay
+                    // partial and block the front); shallow bins mostly
+                    // receive ones (complete words pile behind).
+                    let b = if j >= 16 { false } else { next(16) != 0 };
+                    (b, j)
+                })
+                .collect();
+            total_flushes += roundtrip_counting_flushes(&stream);
+        }
+        assert!(
+            total_flushes > 0,
+            "streams must hit the mid-stream flush path"
+        );
     }
 
     #[test]
