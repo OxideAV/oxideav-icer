@@ -203,7 +203,7 @@ fn rd_budget_matches_or_beats_strict_msb() {
     ];
     // Budgets chosen to land *inside* the bit-plane chain (not so
     // tight that no packets fit; not so loose that everything fits).
-    let budgets: &[u64] = &[200, 400, 800, 1600, 3200];
+    let budgets: &[u64] = &[200, 250, 400, 800, 1600, 3200];
 
     let mut strict_wins = 0;
     let mut rd_wins = 0;
@@ -299,27 +299,28 @@ fn weight_map_reflects_non_unitary_subband_structure() {
     eprintln!("weights: LL3={ll3:.4} HL1={hl1:.4} HH1={hh1:.4}");
 }
 
-/// The R-D selector must never make the output worse than strict-MSB, and
-/// on the high-frequency checkerboard fixture it should deliver a
-/// measurable PSNR win at a budget whose strict-MSB cut falls on a
-/// poorly-ranked packet.
+/// The R-D selector must never make the output worse than strict-MSB,
+/// and on a fixture whose strict-MSB cut falls on a poorly-ranked
+/// packet it should deliver a measurable PSNR win.
 ///
-/// Round-359/365/368 note: the IPN 42-155 §III.B four-category context
-/// model (r359) plus the subband-aware Table 6/7 contexts + §III.C MER
-/// estimator (r365) plus the same-subband de-interleaved neighbour walk
-/// (r368) compress the checkerboard far better than earlier models, which
-/// shifts where the strict-MSB cut lands relative to the per-packet
-/// boundaries. The R-D packet-ranking slack now shows up at the tight
-/// budgets whose strict cut falls just short of a high-value refinement
-/// packet that R-D's residual-fill picks up (b=210 and b=310 on the r368
-/// model, where the win is +3..+8 dB). We sweep a budget band that
-/// brackets those boundaries and require R-D to (a) never regress and
-/// (b) win by a measurable margin at at least one budget.
+/// Round-359/365/368 note: model improvements repeatedly shift where
+/// the strict-MSB cut lands relative to the per-packet boundaries, so
+/// the winning (fixture, budget) points move as the codec improves.
+/// r405 note: the §II.B pyramid fix (deeper stages now decompose the
+/// LL *lattice*, not the top-left rectangle) moved them again — the
+/// checkerboard's content now lands cleanly in the level-1 HH planes,
+/// where the strict order is already R-D-optimal, so the demonstration
+/// fixture is the sparse-impulse image: its strict cut at ~250 B
+/// spends the tail bytes on a wide low-value significance packet where
+/// R-D's residual-fill instead picks up the high-value refinements
+/// (+7 dB measured at b = 250). We sweep a budget band bracketing that
+/// boundary and require R-D to (a) never regress and (b) win by a
+/// measurable margin at at least one budget.
 #[test]
-fn weighted_rd_beats_strict_on_checkerboard() {
-    let image = checker_64x64();
+fn weighted_rd_beats_strict_on_sparse_impulses() {
+    let image = sparse_impulses_64x64();
     let mut best_delta = f64::NEG_INFINITY;
-    for &budget in &[210u64, 310, 700] {
+    for &budget in &[230u64, 250, 270] {
         let strict = encode_icer(
             &image,
             &EncodeOptions::compressed().with_byte_budget(budget),
@@ -330,7 +331,7 @@ fn weighted_rd_beats_strict_on_checkerboard() {
         assert!(strict.len() as u64 <= budget && rd.len() as u64 <= budget);
         let strict_psnr = psnr(&image, &parse_icer(&strict).unwrap());
         let rd_psnr = psnr(&image, &parse_icer(&rd).unwrap());
-        eprintln!("checker64 b={budget}: strict={strict_psnr:.2} dB rd={rd_psnr:.2} dB");
+        eprintln!("impulses64 b={budget}: strict={strict_psnr:.2} dB rd={rd_psnr:.2} dB");
         // R-D must never regress vs strict at any budget.
         assert!(
             rd_psnr >= strict_psnr - 0.01,
@@ -339,8 +340,8 @@ fn weighted_rd_beats_strict_on_checkerboard() {
         best_delta = best_delta.max(rd_psnr - strict_psnr);
     }
     assert!(
-        best_delta >= 0.3,
-        "R-D should beat strict by >= 0.3 dB on the checkerboard at some budget in the swept band; \
+        best_delta >= 1.0,
+        "R-D should beat strict by >= 1 dB on the sparse impulses at some budget in the swept band; \
          best delta was {best_delta:.2} dB"
     );
 }

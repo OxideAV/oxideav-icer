@@ -174,8 +174,12 @@ fn center_roi_preserves_centre_under_tight_budget() {
     let h = 128u32;
     let w = 64u32;
     let image = striped_test_image(w, h);
-    // Budget chosen so only the first two segments fit.
-    let budget = 220u64;
+    // Budget chosen so the top-priority centre strip fits (internally
+    // truncated) but nothing else does: the r405 §II.B pyramid fix
+    // moved the per-packet boundaries, so the centre strip's truncated
+    // encode is ~875 B on this fixture (measured); 900 keeps exactly
+    // segment 1 and drops the rest to placeholders.
+    let budget = 900u64;
     let opts = EncodeOptions {
         segment_count: 4,
         ..EncodeOptions::compressed()

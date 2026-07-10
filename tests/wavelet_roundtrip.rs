@@ -90,3 +90,76 @@ fn deinterleave_separates_quadrants() {
         "HH abs-sum ({hh_sum_abs}) should be < |LL sum| ({ll_sum})"
     );
 }
+
+/// IPN 42-155 §II.B pyramid semantics: "each further stage decomposes
+/// the LL subband" — so stage `k` may only modify coefficients on the
+/// stride-`2^(k-1)` even/even lattice. Every position off that lattice
+/// must be byte-identical between a `(k-1)`-level and a `k`-level
+/// decomposition. (Regression pin for the pre-r405 recursion, which
+/// re-transformed the top-left *rectangle* — a mixture of the previous
+/// stage's low- and high-pass outputs — and therefore scribbled over
+/// detail subbands on deeper stages.)
+#[test]
+fn dyadic_deeper_stages_touch_only_the_ll_lattice() {
+    for &(w, h) in &[(64usize, 48usize), (33, 17)] {
+        let original = deterministic_signal(w * h, 99);
+        for k in 2u8..=4 {
+            let mut shallow = original.clone();
+            forward_53_dyadic(&mut shallow, w, h, k - 1);
+            let mut deep = original.clone();
+            forward_53_dyadic(&mut deep, w, h, k);
+            let stride = 1usize << (k - 1);
+            for y in 0..h {
+                for x in 0..w {
+                    if x % stride == 0 && y % stride == 0 {
+                        continue; // the stage-k input lattice (LL of stage k-1)
+                    }
+                    assert_eq!(
+                        shallow[y * w + x],
+                        deep[y * w + x],
+                        "{w}x{h}: stage {k} modified off-lattice position ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// §II.B smoke on a linear ramp: the 5/3 high-pass annihilates linear
+/// signals, so away from the boundary-extension transient every detail
+/// coefficient of a `4*(x+y)` ramp is exactly zero at every depth, and
+/// the LL lattice carries the ramp's own values (DC gain 1). The
+/// pre-r405 rectangle recursion failed this at every depth >= 2 (it
+/// generated spurious detail energy from re-transforming interleaved
+/// low/high mixtures).
+#[test]
+fn dyadic_pyramid_annihilates_linear_ramp() {
+    let (w, h) = (64usize, 64usize);
+    let levels = 3u8;
+    let step = 1usize << levels;
+    let mut buf: Vec<i32> = (0..w * h)
+        .map(|i| 4 * ((i % w) as i32 + (i / w) as i32))
+        .collect();
+    forward_53_dyadic(&mut buf, w, h, levels);
+    let interior = |v: usize, dim: usize| v + 2 * step < dim;
+    for y in 0..h {
+        for x in 0..w {
+            if !interior(x, w) || !interior(y, h) {
+                continue;
+            }
+            let v = buf[y * w + x];
+            if x % step == 0 && y % step == 0 {
+                assert_eq!(
+                    v,
+                    4 * (x as i32 + y as i32),
+                    "LL lattice ({x},{y}) must carry the ramp value"
+                );
+            } else {
+                assert_eq!(
+                    v, 0,
+                    "interior detail ({x},{y}) must vanish on a linear ramp"
+                );
+            }
+        }
+    }
+}

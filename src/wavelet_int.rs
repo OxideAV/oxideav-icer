@@ -367,60 +367,51 @@ pub fn inverse_1d_interleaved(row: &mut [i32], p: &IntFilterParams) {
     row.copy_from_slice(&back);
 }
 
-/// One spec-exact forward 2-D stage (rows then columns) on the top-left
-/// `sub_w x sub_h` sub-rectangle of a buffer with row stride `stride`,
-/// in interleaved layout. IPN 42-155 §II.B: each 2-D stage applies the
-/// 1-D transform to every row, then to every column of the result.
-fn forward_2d_one_level_sub(
-    buf: &mut [i32],
-    stride: usize,
-    sub_w: usize,
-    sub_h: usize,
-    p: &IntFilterParams,
-) {
-    for y in 0..sub_h {
-        forward_1d_interleaved(&mut buf[y * stride..y * stride + sub_w], p);
+/// One spec-exact forward 2-D stage (rows then columns) on a compact
+/// `w x h` buffer in interleaved layout. IPN 42-155 §II.B: each 2-D
+/// stage applies the 1-D transform to every row, then to every column
+/// of the result.
+fn forward_2d_one_level(buf: &mut [i32], w: usize, h: usize, p: &IntFilterParams) {
+    for y in 0..h {
+        forward_1d_interleaved(&mut buf[y * w..y * w + w], p);
     }
-    let mut col = vec![0i32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
+    let mut col = vec![0i32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = buf[y * w + x];
         }
         forward_1d_interleaved(&mut col, p);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
+        for y in 0..h {
+            buf[y * w + x] = col[y];
         }
     }
 }
 
-/// Inverse of [`forward_2d_one_level_sub`]. IPN 42-155 §II.B: a 2-D
+/// Inverse of [`forward_2d_one_level`]. IPN 42-155 §II.B: a 2-D
 /// stage is inverted in reverse order -- columns first, then rows.
-fn inverse_2d_one_level_sub(
-    buf: &mut [i32],
-    stride: usize,
-    sub_w: usize,
-    sub_h: usize,
-    p: &IntFilterParams,
-) {
-    let mut col = vec![0i32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
+fn inverse_2d_one_level(buf: &mut [i32], w: usize, h: usize, p: &IntFilterParams) {
+    let mut col = vec![0i32; h];
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = buf[y * w + x];
         }
         inverse_1d_interleaved(&mut col, p);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
+        for y in 0..h {
+            buf[y * w + x] = col[y];
         }
     }
-    for y in 0..sub_h {
-        inverse_1d_interleaved(&mut buf[y * stride..y * stride + sub_w], p);
+    for y in 0..h {
+        inverse_1d_interleaved(&mut buf[y * w..y * w + w], p);
     }
 }
 
 /// `D`-level dyadic forward 2-D reversible integer transform for any of
 /// the seven ICER filters (IPN 42-155 §II.B pyramidal decomposition).
-/// Each level transforms the current low-frequency (top-left) region and
-/// then recurses on its `ceil(w/2) x ceil(h/2)` LL sub-band.
+/// Each further stage decomposes the **LL subband** of the previous
+/// stage — in the interleaved layout, the even/even lattice at stride
+/// `2^j` (see [`crate::wavelet::forward_53_dyadic`] for the layout
+/// contract and the CHANGELOG note on the earlier top-left-rectangle
+/// recursion this replaces).
 pub fn forward_2d_dyadic(
     buf: &mut [i32],
     width: usize,
@@ -430,14 +421,17 @@ pub fn forward_2d_dyadic(
 ) {
     debug_assert_eq!(buf.len(), width * height);
     let p = filter.int_params();
-    let (mut w, mut h) = (width, height);
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 3 || h < 3 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 3 || sh < 3 {
             break;
         }
-        forward_2d_one_level_sub(buf, width, w, h, &p);
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        let mut sub = crate::wavelet::gather_lattice(buf, width, stride, sw, sh);
+        forward_2d_one_level(&mut sub, sw, sh, &p);
+        crate::wavelet::scatter_lattice(buf, width, stride, sw, sh, &sub);
+        stride *= 2;
     }
 }
 
@@ -451,18 +445,21 @@ pub fn inverse_2d_dyadic(
 ) {
     debug_assert_eq!(buf.len(), width * height);
     let p = filter.int_params();
-    let mut sizes = Vec::with_capacity(levels as usize);
-    let (mut w, mut h) = (width, height);
+    let mut stages = Vec::with_capacity(levels as usize);
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 3 || h < 3 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 3 || sh < 3 {
             break;
         }
-        sizes.push((w, h));
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        stages.push((stride, sw, sh));
+        stride *= 2;
     }
-    for (sw, sh) in sizes.into_iter().rev() {
-        inverse_2d_one_level_sub(buf, width, sw, sh, &p);
+    for (stride, sw, sh) in stages.into_iter().rev() {
+        let mut sub = crate::wavelet::gather_lattice(buf, width, stride, sw, sh);
+        inverse_2d_one_level(&mut sub, sw, sh, &p);
+        crate::wavelet::scatter_lattice(buf, width, stride, sw, sh, &sub);
     }
 }
 
@@ -568,6 +565,38 @@ mod tests {
                 forward_2d_dyadic(&mut buf, w, h, 3, f);
                 inverse_2d_dyadic(&mut buf, w, h, 3, f);
                 assert_eq!(buf, original, "filter {f:?} 2-D {w}x{h} mismatch");
+            }
+        }
+    }
+
+    /// IPN 42-155 §II.B: each further stage decomposes only the LL
+    /// subband — the stride-`2^(k-1)` even/even lattice. Every
+    /// off-lattice coefficient must be identical between `(k-1)`- and
+    /// `k`-level decompositions, for all seven filters. (Regression pin
+    /// for the pre-r405 top-left-rectangle recursion.)
+    #[test]
+    fn dyadic_deeper_stages_touch_only_the_ll_lattice() {
+        for f in ALL {
+            let (w, h) = (48usize, 40usize);
+            let original: Vec<i32> = (0..w * h).map(|i| (i as i32 * 37) % 255 - 128).collect();
+            for k in 2u8..=4 {
+                let mut shallow = original.clone();
+                forward_2d_dyadic(&mut shallow, w, h, k - 1, f);
+                let mut deep = original.clone();
+                forward_2d_dyadic(&mut deep, w, h, k, f);
+                let stride = 1usize << (k - 1);
+                for y in 0..h {
+                    for x in 0..w {
+                        if x % stride == 0 && y % stride == 0 {
+                            continue;
+                        }
+                        assert_eq!(
+                            shallow[y * w + x],
+                            deep[y * w + x],
+                            "filter {f:?}: stage {k} modified off-lattice ({x},{y})"
+                        );
+                    }
+                }
             }
         }
     }

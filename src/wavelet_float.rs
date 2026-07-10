@@ -306,15 +306,20 @@ pub fn forward_2d(
         ));
     }
     let mut buf: Vec<f32> = coeffs.iter().map(|&v| v as f32).collect();
-    let mut w = width;
-    let mut h = height;
+    // §II.B pyramid: each further stage decomposes the LL subband,
+    // i.e. the even/even lattice of the previous stage (see
+    // `crate::wavelet::forward_53_dyadic`).
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 2 || h < 2 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 2 || sh < 2 {
             break;
         }
-        forward_2d_one_level_sub_float(&mut buf, width, w, h, &p);
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        let mut sub = gather_lattice_f32(&buf, width, stride, sw, sh);
+        forward_2d_one_level_float(&mut sub, sw, sh, &p);
+        scatter_lattice_f32(&mut buf, width, stride, sw, sh, &sub);
+        stride *= 2;
     }
     for (dst, src) in coeffs.iter_mut().zip(buf.iter()) {
         *dst = src.round() as i32;
@@ -344,19 +349,21 @@ pub fn inverse_2d(
         ));
     }
     let mut buf: Vec<f32> = coeffs.iter().map(|&v| v as f32).collect();
-    let mut sizes = Vec::with_capacity(levels as usize);
-    let mut w = width;
-    let mut h = height;
+    let mut stages = Vec::with_capacity(levels as usize);
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 2 || h < 2 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 2 || sh < 2 {
             break;
         }
-        sizes.push((w, h));
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        stages.push((stride, sw, sh));
+        stride *= 2;
     }
-    for (sw, sh) in sizes.into_iter().rev() {
-        inverse_2d_one_level_sub_float(&mut buf, width, sw, sh, &p);
+    for (stride, sw, sh) in stages.into_iter().rev() {
+        let mut sub = gather_lattice_f32(&buf, width, stride, sw, sh);
+        inverse_2d_one_level_float(&mut sub, sw, sh, &p);
+        scatter_lattice_f32(&mut buf, width, stride, sw, sh, &sub);
     }
     for (dst, src) in coeffs.iter_mut().zip(buf.iter()) {
         *dst = src.round() as i32;
@@ -364,49 +371,38 @@ pub fn inverse_2d(
     Ok(())
 }
 
-fn forward_2d_one_level_sub_float(
-    buf: &mut [f32],
+/// Float twin of [`crate::wavelet::gather_lattice`].
+fn gather_lattice_f32(
+    buf: &[f32],
+    row_stride: usize,
     stride: usize,
-    sub_w: usize,
-    sub_h: usize,
-    p: &FilterParams,
-) {
-    for y in 0..sub_h {
-        let row = &mut buf[y * stride..y * stride + sub_w];
-        forward_1d_float(row, p);
-    }
-    let mut col = vec![0f32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
-        }
-        forward_1d_float(&mut col, p);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
+    sw: usize,
+    sh: usize,
+) -> Vec<f32> {
+    let mut sub = vec![0f32; sw * sh];
+    for yy in 0..sh {
+        let src_row = yy * stride * row_stride;
+        for xx in 0..sw {
+            sub[yy * sw + xx] = buf[src_row + xx * stride];
         }
     }
+    sub
 }
 
-fn inverse_2d_one_level_sub_float(
+/// Float twin of [`crate::wavelet::scatter_lattice`].
+fn scatter_lattice_f32(
     buf: &mut [f32],
+    row_stride: usize,
     stride: usize,
-    sub_w: usize,
-    sub_h: usize,
-    p: &FilterParams,
+    sw: usize,
+    sh: usize,
+    sub: &[f32],
 ) {
-    let mut col = vec![0f32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
+    for yy in 0..sh {
+        let dst_row = yy * stride * row_stride;
+        for xx in 0..sw {
+            buf[dst_row + xx * stride] = sub[yy * sw + xx];
         }
-        inverse_1d_float(&mut col, p);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
-        }
-    }
-    for y in 0..sub_h {
-        let row = &mut buf[y * stride..y * stride + sub_w];
-        inverse_1d_float(row, p);
     }
 }
 
@@ -530,6 +526,38 @@ mod tests {
                 (a - b).abs() <= 4,
                 "filter G round-trip error too large: {a} vs {b}"
             );
+        }
+    }
+
+    /// IPN 42-155 §II.B on the float path: each further stage
+    /// decomposes only the LL subband (the stride-`2^(k-1)` even/even
+    /// lattice); every off-lattice coefficient is identical between
+    /// `(k-1)`- and `k`-level decompositions. Positions untouched by
+    /// the deeper stage carry the same f32 value, so their final i32
+    /// roundings agree exactly. (Regression pin for the pre-r405
+    /// top-left-rectangle recursion.)
+    #[test]
+    fn float_dyadic_deeper_stages_touch_only_the_ll_lattice() {
+        let (w, h) = (48usize, 40usize);
+        let original: Vec<i32> = (0..w * h).map(|i| (i as i32 * 23) % 251 - 125).collect();
+        for k in 2u8..=4 {
+            let mut shallow = original.clone();
+            forward_2d(&mut shallow, w, h, k - 1, WaveletFilter::NineSevenA).unwrap();
+            let mut deep = original.clone();
+            forward_2d(&mut deep, w, h, k, WaveletFilter::NineSevenA).unwrap();
+            let stride = 1usize << (k - 1);
+            for y in 0..h {
+                for x in 0..w {
+                    if x % stride == 0 && y % stride == 0 {
+                        continue;
+                    }
+                    assert_eq!(
+                        shallow[y * w + x],
+                        deep[y * w + x],
+                        "stage {k} modified off-lattice ({x},{y})"
+                    );
+                }
+            }
         }
     }
 }

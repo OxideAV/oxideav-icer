@@ -171,83 +171,95 @@ pub fn inverse_53_2d_one_level(buf: &mut [i32], width: usize, height: usize) {
     }
 }
 
-/// `D`-level dyadic forward 5/3 transform. Each level halves the
-/// active region (rounding *up* — odd dimensions are handled by the
-/// boundary extension in [`forward_53_1d`]). After `D` levels, the
-/// top-left `ceil(width/2^D) x ceil(height/2^D)` block holds the LL
-/// subband, the rest is interleaved LH / HL / HH detail.
+/// `D`-level dyadic forward 5/3 transform — the IPN 42-155 §II.B
+/// pyramidal decomposition: **each further stage decomposes the LL
+/// subband** produced by the previous stage. In the interleaved layout
+/// the stage-`j` LL subband is the even/even **lattice** at stride
+/// `2^j` (low-pass outputs land on even indices per axis), so stage
+/// `j+1` gathers that lattice, runs one 2-D level over it, and
+/// scatters the result back. After `D` levels a coefficient's subband
+/// is a pure function of its coordinates' dyadic parities — exactly
+/// the layout [`crate::priority::classify_position`] /
+/// [`crate::priority::subband_lattice`] describe.
+///
+/// (Earlier revisions recursed on the top-left `ceil(w/2) x ceil(h/2)`
+/// *rectangle*, which after stage 1 holds interleaved low **and** high
+/// outputs — a mixture, not the LL subband. That contradicted §II.B
+/// and every consumer of the dyadic-parity layout; see the CHANGELOG.)
 pub fn forward_53_dyadic(buf: &mut [i32], width: usize, height: usize, levels: u8) {
-    let mut w = width;
-    let mut h = height;
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 2 || h < 2 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 2 || sh < 2 {
             break;
         }
-        // Transform the active LL region (top-left wxh sub-rectangle).
-        forward_53_2d_one_level_sub(buf, width, w, h);
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        let mut sub = gather_lattice(buf, width, stride, sw, sh);
+        forward_53_2d_one_level(&mut sub, sw, sh);
+        scatter_lattice(buf, width, stride, sw, sh, &sub);
+        stride *= 2;
     }
 }
 
 /// `D`-level dyadic inverse 5/3 — exact reverse of
-/// [`forward_53_dyadic`].
+/// [`forward_53_dyadic`] (deepest lattice first).
 pub fn inverse_53_dyadic(buf: &mut [i32], width: usize, height: usize, levels: u8) {
-    // Pre-compute per-level sub-rectangle sizes so we can iterate in
+    // Pre-compute per-level lattice geometries so we can iterate in
     // reverse without recomputing.
-    let mut sizes = Vec::with_capacity(levels as usize);
-    let mut w = width;
-    let mut h = height;
+    let mut stages = Vec::with_capacity(levels as usize);
+    let mut stride = 1usize;
     for _ in 0..levels {
-        if w < 2 || h < 2 {
+        let sw = width.div_ceil(stride);
+        let sh = height.div_ceil(stride);
+        if sw < 2 || sh < 2 {
             break;
         }
-        sizes.push((w, h));
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        stages.push((stride, sw, sh));
+        stride *= 2;
     }
-    for (sw, sh) in sizes.into_iter().rev() {
-        inverse_53_2d_one_level_sub(buf, width, sw, sh);
-    }
-}
-
-/// Helper: 1-level forward 5/3 on the top-left `sub_w x sub_h`
-/// sub-rectangle of a buffer whose row stride is `stride` (in
-/// `i32` samples).
-fn forward_53_2d_one_level_sub(buf: &mut [i32], stride: usize, sub_w: usize, sub_h: usize) {
-    // Rows.
-    for y in 0..sub_h {
-        let row = &mut buf[y * stride..y * stride + sub_w];
-        forward_53_1d(row);
-    }
-    // Columns.
-    let mut col = vec![0i32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
-        }
-        forward_53_1d(&mut col);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
-        }
+    for (stride, sw, sh) in stages.into_iter().rev() {
+        let mut sub = gather_lattice(buf, width, stride, sw, sh);
+        inverse_53_2d_one_level(&mut sub, sw, sh);
+        scatter_lattice(buf, width, stride, sw, sh, &sub);
     }
 }
 
-/// Helper: 1-level inverse 5/3 on the top-left sub-rectangle.
-fn inverse_53_2d_one_level_sub(buf: &mut [i32], stride: usize, sub_w: usize, sub_h: usize) {
-    let mut col = vec![0i32; sub_h];
-    for x in 0..sub_w {
-        for y in 0..sub_h {
-            col[y] = buf[y * stride + x];
-        }
-        inverse_53_1d(&mut col);
-        for y in 0..sub_h {
-            buf[y * stride + x] = col[y];
+/// Gather the stride-`stride` even lattice (`x` and `y` multiples of
+/// `stride`) of a `row_stride`-wide buffer into a compact `sw x sh`
+/// block. Shared by the dyadic recursions here and in
+/// [`crate::wavelet_float`] / [`crate::wavelet_int`].
+pub(crate) fn gather_lattice(
+    buf: &[i32],
+    row_stride: usize,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+) -> Vec<i32> {
+    let mut sub = vec![0i32; sw * sh];
+    for yy in 0..sh {
+        let src_row = yy * stride * row_stride;
+        for xx in 0..sw {
+            sub[yy * sw + xx] = buf[src_row + xx * stride];
         }
     }
-    for y in 0..sub_h {
-        let row = &mut buf[y * stride..y * stride + sub_w];
-        inverse_53_1d(row);
+    sub
+}
+
+/// Inverse of [`gather_lattice`]: write the compact block back onto
+/// the lattice positions.
+pub(crate) fn scatter_lattice(
+    buf: &mut [i32],
+    row_stride: usize,
+    stride: usize,
+    sw: usize,
+    sh: usize,
+    sub: &[i32],
+) {
+    for yy in 0..sh {
+        let dst_row = yy * stride * row_stride;
+        for xx in 0..sw {
+            buf[dst_row + xx * stride] = sub[yy * sw + xx];
+        }
     }
 }
 
