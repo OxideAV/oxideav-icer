@@ -6,25 +6,25 @@
 //!     stage and ship raw 8-bit pixels in a single packet. This is
 //!     the fallback Mars-rover deployments use when the entropy
 //!     coder would *expand* the payload.
-//!   * **Compressed path** -- wavelet transform (filter `Q` integer
-//!     5/3 by default; float filters A-G also accepted) followed by
+//!   * **Compressed path** -- the IPN 42-155 §II.A reversible integer
+//!     wavelet transform (any of the seven Table 1 filters A-F + Q,
+//!     filter `Q` by default; see [`crate::wavelet_int`]) followed by
 //!     the stripe-ordered bit-plane scanner in [`crate::bitplane`]
-//!     feeding the binary arithmetic coder. Self-roundtrips with the
-//!     matching decoder.
+//!     feeding the binary arithmetic coder. Self-roundtrips bit-exact
+//!     with the matching decoder under every filter; lossy operation
+//!     is progressive truncation, never the transform.
 //!   * **Multi-packet ordering** -- the compressed path now emits one
 //!     packet pair per bit-plane (significance + refinement) per IPN
 //!     42-155 §IV. Truncated streams reconstruct at lower quality.
 //!   * **Multi-segment** -- large images split into `segment_count`
 //!     row-strip segments, each carrying an independently-decodable
 //!     coefficient buffer per IPN 42-155 §III.E.
-//!   * **Filter G** -- Le Gall 5/3 float variant; wired through both
-//!     encode and decode dispatch paths.
 
 use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
-use crate::wavelet_float;
+use crate::wavelet_int;
 
 /// Encoder options.
 ///
@@ -219,8 +219,9 @@ pub struct EncodeOptions {
     /// encode-then-decode trials, where `N` is the byte-count range. A
     /// `target_db` already met by the smallest trial returns the smallest
     /// trial; a `target_db` above the unbudgeted encode's PSNR returns
-    /// the unbudgeted encode (best-effort: we can't synthesise quality
-    /// the lossy filter doesn't supply).
+    /// the unbudgeted encode (with the §II.A reversible integer
+    /// transform the unbudgeted encode is lossless, so every finite
+    /// target is reachable there).
     ///
     /// Compose-rules:
     ///
@@ -1027,7 +1028,7 @@ fn encode_transform_segmented(
             coeffs.push(px as i32 - 128);
         }
     }
-    wavelet_float::forward_2d(&mut coeffs, w, h, levels, opts.filter)?;
+    wavelet_int::forward_2d_dyadic(&mut coeffs, w, h, levels, opts.filter);
 
     // §VI.A minimum-loss plane exclusion (whole-image map; identical
     // for every segment).
@@ -1515,8 +1516,9 @@ fn encode_one_segment_compressed(
             coeffs.push(px as i32 - 128);
         }
     }
-    // Forward DWT (filter-aware dispatch).
-    wavelet_float::forward_2d(&mut coeffs, img_w, strip_h, levels, opts.filter)?;
+    // Forward DWT -- the §II.A reversible integer transform for the
+    // selected Table 1 filter.
+    wavelet_int::forward_2d_dyadic(&mut coeffs, img_w, strip_h, levels, opts.filter);
     // Pick bit-plane count to fit the largest |coeff|, but never less
     // than the caller-requested floor.
     let needed = select_bit_plane_count(&coeffs);
@@ -2048,7 +2050,7 @@ fn pick_lower_distortion_mask(
             .collect();
         let mut coeffs =
             crate::bitplane::decode_bitplanes_multi(&kept, width, height, q, levels).ok()?;
-        wavelet_float::inverse_2d(&mut coeffs, width, height, levels, filter).ok()?;
+        wavelet_int::inverse_2d_dyadic(&mut coeffs, width, height, levels, filter);
         let mut acc = 0.0f64;
         for (&o, &r) in orig.iter().zip(coeffs.iter()) {
             // Apply the decoder's inverse level-shift + [0,255] clamp so the

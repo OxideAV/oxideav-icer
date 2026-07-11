@@ -8,13 +8,13 @@
 //! * **Framing parser** -- segment + packet header walk over the
 //!   on-the-wire byte stream; both directions (encode + decode).
 //!   See [`header::SegmentHeader`] / [`header::PacketHeader`].
-//! * **Integer 5/3 wavelet transform** -- forward + inverse, 1-D + 2-D
-//!   one-level + dyadic D-level. Round-trip-bit-exact on signed i32
-//!   coefficients. (See [`wavelet`].)
-//! * **Float wavelet filters A-G** -- round-trip to IEEE-754 tolerance
-//!   on the 1-D + 2-D + dyadic paths; integer/float dispatch helper
-//!   in [`wavelet_float::forward_2d`] / [`wavelet_float::inverse_2d`].
-//!   Filter G (Le Gall 5/3 float variant) completes the full A-G set.
+//! * **Spec-exact reversible integer wavelet transform** -- the IPN
+//!   42-155 §II.A equations (1)-(3) recurrence with the Table 1
+//!   parameters for all seven filters (A-F + Q); forward + inverse,
+//!   1-D + interleaved + dyadic D-level, bit-exact reversible under
+//!   every filter. The encode/decode pipeline runs on it (see
+//!   [`wavelet_int`]); [`wavelet`] keeps the pre-spec textbook 5/3
+//!   lifting as an internal layout-contract reference.
 //! * **Binary arithmetic coder + context model** -- registers, range
 //!   renormalisation, follow-bit handling, and the IPN 42-155 §III.C MER
 //!   probability estimator (initial counts 2/4, rescale when the total
@@ -110,7 +110,6 @@ pub mod registry;
 pub mod subband3d;
 pub mod wavelet;
 pub mod wavelet3d;
-pub mod wavelet_float;
 pub mod wavelet_int;
 
 /// Codec identifier string used by the registry + by container demuxers

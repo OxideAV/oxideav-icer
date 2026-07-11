@@ -446,7 +446,7 @@ pub fn subband_lattice(subband: Subband) -> SubbandLattice {
 /// Classify the transform-coefficient position `(x, y)` into its
 /// `(SubbandType, level)` under the crate's interleaved-sub-rectangle
 /// dyadic layout (the one produced by
-/// [`crate::wavelet_float::forward_2d`]).
+/// [`crate::wavelet_int::forward_2d_dyadic`]).
 ///
 /// The crate's dyadic transform leaves each level in Mallat-interleaved
 /// form (low-pass at even indices, high-pass at odd indices per axis)
@@ -586,11 +586,11 @@ pub fn min_loss_skip_map(width: usize, height: usize, levels: u8, min_loss: u8) 
 /// the approximate relative effect (per pixel of the subband) on the
 /// reconstructed image of root-mean-squared distortion values in the
 /// subbands". Fig. 7 publishes those weights for the *idealised*
-/// approximately-unitary scaled transform. This crate's integer /
-/// float lifting transforms are a concrete, non-standard realisation
-/// whose actual per-subband effect differs from the idealised figure,
-/// so rather than assume the Fig. 7 numbers literally this routine
-/// **measures** the §III.A effect directly from the transform in use.
+/// approximately-unitary scaled transform. The §II.A integer
+/// transforms are concrete non-unitary realisations whose actual
+/// per-subband effect differs from the idealised figure, so rather
+/// than assume the Fig. 7 numbers literally this routine **measures**
+/// the §III.A effect directly from the transform in use.
 ///
 /// The image-domain energy injected by a unit error in transform
 /// coefficient `i` is `||T^{-1} e_i||^2` — the squared norm of the
@@ -673,17 +673,13 @@ fn basis_energy(
     px: usize,
     py: usize,
 ) -> f64 {
-    // A scaled delta survives the integer-rounding step inside the float
-    // dispatch path; the energy is normalised back by the delta squared
-    // so the result is per-unit-coefficient.
+    // A scaled delta survives the integer-rounding steps inside the
+    // §II.A reversible integer transform; the energy is normalised back
+    // by the delta squared so the result is per-unit-coefficient.
     const DELTA: i32 = 64;
     let mut buf = vec![0i32; width * height];
     buf[py * width + px] = DELTA;
-    // inverse_2d is infallible for width,height >= 2 (validated by the
-    // caller's segment-size guard); fall back to a unit weight otherwise.
-    if crate::wavelet_float::inverse_2d(&mut buf, width, height, levels, filter).is_err() {
-        return 1.0;
-    }
+    crate::wavelet_int::inverse_2d_dyadic(&mut buf, width, height, levels, filter);
     let energy: f64 = buf.iter().map(|&v| (v as f64).powi(2)).sum();
     energy / ((DELTA as f64) * (DELTA as f64))
 }

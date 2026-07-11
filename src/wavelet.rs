@@ -227,7 +227,7 @@ pub fn inverse_53_dyadic(buf: &mut [i32], width: usize, height: usize, levels: u
 /// Gather the stride-`stride` even lattice (`x` and `y` multiples of
 /// `stride`) of a `row_stride`-wide buffer into a compact `sw x sh`
 /// block. Shared by the dyadic recursions here and in
-/// [`crate::wavelet_float`] / [`crate::wavelet_int`].
+/// [`crate::wavelet_int`].
 pub(crate) fn gather_lattice(
     buf: &[i32],
     row_stride: usize,

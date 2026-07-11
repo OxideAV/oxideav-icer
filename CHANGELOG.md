@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The encode/decode pipeline now runs the spec-exact IPN 42-155
+  §II.A reversible integer wavelet transform for every filter**
+  (`wavelet_int`), retiring the pre-spec stand-ins: the "textbook" 5/3
+  lifting that previously backed filter Q (reversible, but a different
+  rounding/boundary formulation than the §II.A eq (3) recurrence) and
+  the lossy float lifting that backed filters A-G. All seven Table 1
+  filters (A-F + Q) are now **losslessly bit-exact end to end** —
+  §II.A specifies lossless operation with *any* of the seven; lossy
+  operation is progressive truncation, never the transform. Wire
+  filter id 7 (the pre-spec float "filter G", which IPN 42-155 does
+  not define) is reserved-invalid again and `WaveletFilter::FilterG`
+  is removed; the `wavelet_float` module is deleted. **Wire-affecting
+  for every compressed stream** (the crate's wire format is
+  self-defined and pre-1.0; no external interop existed): filter-Q
+  coefficients differ wherever the eq (3) rounding differs from the
+  old lifting, and filters A-F change from lossy-float to reversible
+  semantics. Consequences pinned by tests: the all-HH checkerboard
+  truncation fidelity jumps ~15 dB at equal budgets (Table 7 contexts
+  now see eq (3) HH statistics); §V.B lost-segment containment becomes
+  a decaying profile rather than a hard support cutoff (the inverse
+  eq (3) `d[n+1]` recursion propagates a floor-truncated tail:
+  residual ≤ 4 grey levels beyond a `3·2^D` dilation, bit-exact beyond
+  `8·2^D` on the pinned fixtures, vs the old strict `3·2^D`); the
+  truncation-fidelity PSNR floors are re-measured. Filter selection
+  (`recommend_filter`, `DEFAULT_RD_CANDIDATES`) is unchanged in shape
+  but now a pure byte-count trade — every candidate is lossless.
+
 ### Added
 
 - **IPN 42-155 §III.A subband-priority interleaving, end to end**

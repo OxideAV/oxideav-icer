@@ -162,8 +162,7 @@ impl IcerCube {
 pub struct CubeEncodeOptions {
     /// Reversible integer wavelet filter (IPN 42-155 §II.A Table 1;
     /// IPN 42-164 uses filter A for its examples and extends the
-    /// dynamic-range analysis to all seven). The float legacy filter G
-    /// is not part of the integer set and is rejected.
+    /// dynamic-range analysis to all seven).
     pub filter: WaveletFilter,
     /// Requested decomposition stages, clamped to 1..=6 (the 42-164
     /// examples use three).
@@ -338,11 +337,6 @@ fn segment_fixed_bytes(bands: usize) -> usize {
 /// Encode a hyperspectral cube into the ICER-3D wire form.
 pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8>> {
     cube.validate()?;
-    if opts.filter == WaveletFilter::FilterG {
-        return Err(IcerError::unsupported(
-            "cube pipeline requires one of the seven reversible integer filters (A-F, Q)",
-        ));
-    }
     if opts.segment_count == 0 {
         return Err(IcerError::unsupported("segment_count must be >= 1"));
     }
@@ -494,9 +488,6 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
         return Err(IcerError::invalid(format!(
             "cube bit depth {bit_depth} outside 1..=16"
         )));
-    }
-    if filter == WaveletFilter::FilterG {
-        return Err(IcerError::invalid("cube stream with non-integer filter id"));
     }
     if !(1..=6).contains(&levels) {
         return Err(IcerError::invalid(format!(
@@ -727,16 +718,6 @@ mod tests {
     fn quota_below_floor_is_refused() {
         let cube = hyperspectral_fixture(8, 8, 4);
         let opts = CubeEncodeOptions::default().with_byte_quota(10);
-        assert!(matches!(
-            encode_icer3d(&cube, &opts),
-            Err(IcerError::Unsupported(_))
-        ));
-    }
-
-    #[test]
-    fn filter_g_is_rejected() {
-        let cube = hyperspectral_fixture(8, 8, 4);
-        let opts = CubeEncodeOptions::default().with_filter(WaveletFilter::FilterG);
         assert!(matches!(
             encode_icer3d(&cube, &opts),
             Err(IcerError::Unsupported(_))

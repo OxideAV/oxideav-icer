@@ -1,13 +1,13 @@
 //! Image analysis + automatic filter selection (round 5).
 //!
-//! IPN 42-155 §III.A enumerates eight wavelet filter candidates (A-G
-//! float lifting variants plus Q integer 5/3) but does **not** prescribe
-//! a fixed assignment of filter to image content. The paper notes in
-//! §I that filter selection is image-dependent: smooth, low-texture
-//! payloads compress best under the reversible integer 5/3 filter
-//! (filter `Q`); high-frequency, high-variance imagery (gravel, dust,
-//! rock textures from a Mars rover Pancam) benefits from the float CDF
-//! 9/7 family (filter `A`).
+//! IPN 42-155 §II.A specifies seven reversible integer wavelet filter
+//! candidates (A-F plus Q) but does **not** prescribe a fixed
+//! assignment of filter to image content. §II.D ("Quantitative Filter
+//! Comparison") shows the choice is image-dependent -- the per-filter
+//! rate-distortion and lossless-rate rankings differ across imagery,
+//! and the lossless ranking differs from the lossy one. Every filter
+//! is losslessly reversible, so the selection is purely a byte-count /
+//! truncated-quality trade, never a fidelity one.
 //!
 //! This module gives the encoder two ways to pick a filter:
 //!
@@ -20,15 +20,14 @@
 //!   2. [`pick_filter_by_rate_distortion`] -- actually try each filter
 //!      from a small candidate set, encode the image, and pick the
 //!      filter that produced the smallest output. This is the true
-//!      rate-distortion approach, useful when the caller wants the
+//!      rate-allocation approach, useful when the caller wants the
 //!      absolute minimum byte count and can afford `N * encode_time`.
 //!
 //! Neither approach requires any unpublished JPL data: the decision
 //! tree thresholds in [`recommend_filter`] are derived from open
-//! wavelet-coding intuition (smooth -> reversible; high-frequency ->
-//! biorthogonal 9/7) plus the obvious property that filter `Q` is the
-//! only lossless option in the set. The thresholds are deliberately
-//! conservative + documented so callers can audit them.
+//! wavelet-coding intuition (smooth -> shorter support; textured ->
+//! stronger high-pass prediction) and are deliberately conservative +
+//! documented so callers can audit them.
 
 use crate::encoder::{encode_icer, EncodeOptions};
 use crate::error::Result;
@@ -151,21 +150,23 @@ impl ImageStats {
 /// explicit `EncodeOptions::filter` setter when a particular image
 /// class is known.
 ///
-/// Decision tree:
+/// Decision tree (every branch is losslessly reversible -- IPN 42-155
+/// §II.A -- so the choice only moves the byte count and the truncated
+/// progressive quality, never the full-quality fidelity):
 ///
 ///   * **Flat image** (dynamic range == 0 or variance < 1.0):
-///     filter `Q` -- the integer 5/3 is the only reversible option, and
-///     for a flat input it costs essentially nothing.
+///     filter `Q` -- for a flat input every filter is near-free; the
+///     deployed default wins ties.
 ///   * **Low-frequency** (edge_energy < 4.0): filter `Q` -- smooth
-///     content compresses well under the reversible 5/3 and a lossless
-///     output is preferable when payload is tiny.
+///     content compresses well under the 5/3-support kernel.
 ///   * **High-frequency, high-variance** (edge_energy >= 16.0 and
-///     variance >= 200.0): filter `A` -- the CDF 9/7-style biorthogonal
-///     lifting kernel handles textured imagery (Mars rover Pancam
-///     gravel) better than the 5/3.
-///   * **Mid-range / default**: filter `Q` -- when in doubt, stay
-///     lossless. This keeps the decision tree well-behaved on imagery
-///     that doesn't fit either extreme.
+///     variance >= 200.0): filter `A` -- with `beta = 0` its high-pass
+///     predictor ignores the next raw difference, which empirically
+///     tracks textured imagery better than filter Q's `beta = 1/4`
+///     (the two share the same `alpha` triple, §II.A Table 1).
+///   * **Mid-range / default**: filter `Q` -- the deployed default.
+///     This keeps the decision tree well-behaved on imagery that
+///     doesn't fit either extreme.
 pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
     if stats.dynamic_range == 0 || stats.variance < 1.0 {
         return WaveletFilter::Reversible53;
@@ -180,9 +181,10 @@ pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
 }
 
 /// The default candidate-filter set explored by
-/// [`pick_filter_by_rate_distortion`]. Q + A cover the two extremes
-/// the paper highlights (lossless reversible vs. biorthogonal 9/7).
-/// Callers needing the wider A-G set can pass their own candidate slice.
+/// [`pick_filter_by_rate_distortion`]. Q + A are the pair the paper's
+/// deployments highlight; they share the same `alpha` triple and
+/// differ only in `beta` (IPN 42-155 §II.A Table 1). Callers needing
+/// the wider A-F set can pass their own candidate slice.
 pub const DEFAULT_RD_CANDIDATES: &[WaveletFilter] =
     &[WaveletFilter::Reversible53, WaveletFilter::NineSevenA];
 

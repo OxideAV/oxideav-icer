@@ -11,7 +11,7 @@
 //! coefficients (IPN 42-155 §III.E "Image Partitioning"). Every
 //! segment starts with a fixed-prefix header that announces:
 //!
-//!   * which wavelet filter was used (one of 7 — IPN 42-155 §III.A
+//!   * which wavelet filter was used (one of 7 — IPN 42-155 §II.A
 //!     "Wavelet Transform"),
 //!   * the number of decomposition levels (1..=6, IPN 42-155 §III.A),
 //!   * the segment's coordinate range inside the larger image,
@@ -41,44 +41,50 @@
 
 use crate::error::{IcerError, Result};
 
-/// Wavelet filter identifier -- IPN 42-155 §III.A enumerates eight
-/// candidates: filters `A` through `G` (float lifting variants) plus
-/// filter `Q` (the integer 5/3). The field occupies bits 6..4 of
-/// header byte 2; values 0..=7 cover the eight filter ids. (The
-/// field was originally documented as 4 bits wide with 8..=15
-/// reserved; the top bit of that space now carries the §III.A
-/// subband-priority interleaving flag -- see
-/// [`SegmentHeader::priority_interleaved`] -- and every pre-existing
-/// stream has it clear.)
+/// Wavelet filter identifier -- IPN 42-155 §II.A specifies **seven**
+/// reversible integer wavelet transforms: filters `A` through `F` plus
+/// filter `Q`, all computed by the same equations (1)-(3) and differing
+/// only in their Table 1 parameters `(alpha_{-1}, alpha_0, alpha_1,
+/// beta)`. Every one is an exact integer-to-integer transform, so
+/// lossless compression works with *any* of the seven (§I, §II.A);
+/// lossy operation comes from truncating the progressive bit-plane
+/// stream, never from the transform itself.
 ///
-/// The deployed Mars rover configurations use filter `Q` for lossless
-/// and filter `A` (a 9/7-style float lifting filter) for lossy.
+/// The field occupies bits 6..4 of header byte 2; values 0..=6 cover
+/// the seven filter ids and 7 is reserved. (The field was originally
+/// documented as 4 bits wide; the top bit of that space now carries
+/// the §III.A subband-priority interleaving flag -- see
+/// [`SegmentHeader::priority_interleaved`] -- and every pre-existing
+/// stream has it clear. Wire id 7 briefly carried a pre-spec float
+/// "filter G"; IPN 42-155 defines no such filter, so the id is
+/// reserved-invalid again.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WaveletFilter {
-    /// Filter `Q` (IPN 42-155 §III.A bullet 7) -- integer 5/3 lifting,
-    /// reversible. Matches the JPEG 2000 5/3 reversible filter
-    /// modulo notation (well-known in the wavelet literature; not a
-    /// JPL invention).
+    /// Filter `Q` (IPN 42-155 §II.A Table 1) -- `alpha = (0, 1/4,
+    /// 1/4)`, `beta = 1/4`. Devised for ICER; the deployed lossless
+    /// choice.
     Reversible53 = 0,
-    /// Filter `A` -- float 9/7-style CDF lifting, lossy.
+    /// Filter `A` (IPN 42-155 §II.A Table 1) -- `alpha = (0, 1/4,
+    /// 1/4)`, `beta = 0`. Shares filter Q's `alpha` triple.
     NineSevenA = 1,
+    /// Filter `B` (Table 1) -- `alpha = (0, 2/8, 3/8)`, `beta = 2/8`.
     FilterB = 2,
+    /// Filter `C` (Table 1) -- `alpha = (-1/16, 4/16, 8/16)`,
+    /// `beta = 6/16`. The only filter with `alpha_{-1} != 0`.
     FilterC = 3,
+    /// Filter `D` (Table 1) -- `alpha = (0, 4/16, 5/16)`, `beta = 2/16`.
     FilterD = 4,
+    /// Filter `E` (Table 1) -- `alpha = (0, 3/16, 8/16)`, `beta = 6/16`.
     FilterE = 5,
+    /// Filter `F` (Table 1) -- `alpha = (0, 3/16, 9/16)`, `beta = 8/16`.
     FilterF = 6,
-    /// Filter `G` (IPN 42-155 §III.A) -- Le Gall 5/3 float lifting
-    /// variant with a post-scale zeta derived from the filter's
-    /// polyphase matrix norms. Encodes and decodes; self-roundtrips
-    /// to IEEE-754 tolerance. This completes the full A-G filter set.
-    FilterG = 7,
 }
 
 impl WaveletFilter {
-    /// Parse the 4-bit filter id from the segment header. Returns
-    /// `InvalidData` for the reserved range 8..=15 to fail-fast on
-    /// truncation / corruption rather than silently aliasing.
+    /// Parse the 3-bit filter id from the segment header. Returns
+    /// `InvalidData` for the reserved id 7 to fail-fast on truncation /
+    /// corruption rather than silently aliasing.
     pub fn from_bits(v: u8) -> Result<Self> {
         match v {
             0 => Ok(WaveletFilter::Reversible53),
@@ -88,7 +94,6 @@ impl WaveletFilter {
             4 => Ok(WaveletFilter::FilterD),
             5 => Ok(WaveletFilter::FilterE),
             6 => Ok(WaveletFilter::FilterF),
-            7 => Ok(WaveletFilter::FilterG),
             _ => Err(IcerError::invalid(format!(
                 "reserved wavelet filter id {v}"
             ))),
@@ -102,7 +107,7 @@ impl WaveletFilter {
 /// |------|----------------|--------------------------------|
 /// | 16   | sync prefix    | IPN 42-155 §IV implementation  |
 /// |  1   | §III.A priority interleaving | IPN 42-155 §III.A |
-/// |  3   | filter id      | IPN 42-155 §III.A              |
+/// |  3   | filter id      | IPN 42-155 §II.A               |
 /// |  3   | decomp levels  | IPN 42-155 §III.A `D` ∈ {1..6} |
 /// |  1   | uncompressed   | IPN 42-155 §III.D              |
 /// | 16   | width          | §III.E image partitioning      |

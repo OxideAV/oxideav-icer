@@ -35,7 +35,7 @@ use crate::bitplane::{EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
-use crate::wavelet_float;
+use crate::wavelet_int;
 
 /// Per-decode resource caps.
 ///
@@ -563,7 +563,7 @@ fn decode_transform_domain(
 
     // One shared inverse transform (§V.B: "the inverse wavelet
     // transform combines data from adjacent segments").
-    crate::wavelet_float::inverse_2d(&mut coeffs, w, h, levels, first.filter)?;
+    crate::wavelet_int::inverse_2d_dyadic(&mut coeffs, w, h, levels, first.filter);
     let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
     let plane = &mut img.planes[0];
     for y in 0..h {
@@ -692,7 +692,7 @@ fn decode_compressed_segment_into(
             )?
         }
     };
-    wavelet_float::inverse_2d(&mut coeffs, width, height, levels, walked.header.filter)?;
+    wavelet_int::inverse_2d_dyadic(&mut coeffs, width, height, levels, walked.header.filter);
     // Inverse level-shift + clamp to 0..=255. Saturating: a corrupted
     // stream can decode coefficients near i32::MAX (mutation smoke).
     for y in 0..height {

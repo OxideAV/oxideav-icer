@@ -72,9 +72,10 @@ fn compressed_segment_metadata_marks_compressed_flag() {
 }
 
 #[test]
-fn compressed_roundtrip_filter_a_within_tolerance() {
-    // Float filter A is lossy through the float DWT + integer round
-    // step; assert pixel error stays bounded.
+fn compressed_roundtrip_filter_a_is_bit_exact() {
+    // Filter A is one of the seven IPN 42-155 §II.A reversible integer
+    // transforms: a full-quality round-trip must be bit-exact, exactly
+    // like filter Q.
     let original = ramp_image(16, 16);
     let opts = EncodeOptions {
         filter: WaveletFilter::NineSevenA,
@@ -85,16 +86,9 @@ fn compressed_roundtrip_filter_a_within_tolerance() {
     };
     let bytes = encode_icer(&original, &opts).unwrap();
     let decoded = parse_icer(&bytes).unwrap();
-    let err: i32 = original.planes[0]
-        .data
-        .iter()
-        .zip(decoded.planes[0].data.iter())
-        .map(|(a, b)| (*a as i32 - *b as i32).abs())
-        .sum();
-    let mean_err = err as f32 / (original.width * original.height) as f32;
-    assert!(
-        mean_err < 8.0,
-        "filter A mean abs error {mean_err} too high"
+    assert_eq!(
+        decoded.planes[0].data, original.planes[0].data,
+        "filter A lossless round-trip must be bit-exact (§II.A)"
     );
 }
 
@@ -165,34 +159,6 @@ fn compressed_payload_smaller_than_uncompressed_for_smooth_image() {
 }
 
 #[test]
-fn compressed_roundtrip_filter_g_within_tolerance() {
-    // Filter G (Le Gall 5/3 float variant) -- end-to-end encode + decode
-    // through the full pipeline. Expected to be lossy (float DWT + integer
-    // rounding) but within a reasonable error bound.
-    let original = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterG,
-        wavelet_levels: 2,
-        bit_plane_count: 12,
-        uncompressed: false,
-        ..EncodeOptions::default()
-    };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
-    let err: i32 = original.planes[0]
-        .data
-        .iter()
-        .zip(decoded.planes[0].data.iter())
-        .map(|(a, b)| (*a as i32 - *b as i32).abs())
-        .sum();
-    let mean_err = err as f32 / (original.width * original.height) as f32;
-    assert!(
-        mean_err < 12.0,
-        "filter G mean abs error {mean_err} too high"
-    );
-}
-
-#[test]
 fn compressed_roundtrip_filter_q_multi_packet_metadata() {
     // Verify that the multi-packet encoder produces more than one packet
     // per segment when using filter Q (one pair per bit-plane).
@@ -217,46 +183,43 @@ fn compressed_roundtrip_filter_q_multi_packet_metadata() {
 }
 
 #[test]
-fn compressed_roundtrip_all_filters() {
-    // Verify that all seven float filters A-G round-trip through the
-    // full encode/decode pipeline (bounded error, not bit-exact).
-    let original = smooth_image(16, 16);
-    for filter in [
-        WaveletFilter::NineSevenA,
-        WaveletFilter::FilterB,
-        WaveletFilter::FilterC,
-        WaveletFilter::FilterD,
-        WaveletFilter::FilterE,
-        WaveletFilter::FilterF,
-        WaveletFilter::FilterG,
-    ] {
-        let opts = EncodeOptions {
-            filter,
-            wavelet_levels: 2,
-            bit_plane_count: 10,
-            uncompressed: false,
-            ..EncodeOptions::default()
-        };
-        let bytes = encode_icer(&original, &opts).unwrap();
-        let decoded = parse_icer(&bytes).unwrap();
-        let err: i32 = original.planes[0]
-            .data
-            .iter()
-            .zip(decoded.planes[0].data.iter())
-            .map(|(a, b)| (*a as i32 - *b as i32).abs())
-            .sum();
-        let mean_err = err as f32 / (original.width * original.height) as f32;
-        assert!(
-            mean_err < 16.0,
-            "filter {filter:?} mean abs error {mean_err} too high on smooth image"
-        );
+fn compressed_roundtrip_all_filters_bit_exact() {
+    // IPN 42-155 §II.A: all seven filters (A-F + Q) are reversible
+    // integer transforms, so a full-quality round-trip must be
+    // bit-exact under every one -- on both a friendly constant image
+    // and a textured ramp.
+    for original in [smooth_image(16, 16), ramp_image(16, 16)] {
+        for filter in [
+            WaveletFilter::Reversible53,
+            WaveletFilter::NineSevenA,
+            WaveletFilter::FilterB,
+            WaveletFilter::FilterC,
+            WaveletFilter::FilterD,
+            WaveletFilter::FilterE,
+            WaveletFilter::FilterF,
+        ] {
+            let opts = EncodeOptions {
+                filter,
+                wavelet_levels: 2,
+                bit_plane_count: 10,
+                uncompressed: false,
+                ..EncodeOptions::default()
+            };
+            let bytes = encode_icer(&original, &opts).unwrap();
+            let decoded = parse_icer(&bytes).unwrap();
+            assert_eq!(
+                decoded.planes[0].data, original.planes[0].data,
+                "filter {filter:?} lossless round-trip must be bit-exact (§II.A)"
+            );
+        }
     }
 }
 
 #[test]
 fn multi_segment_compressed_all_filters() {
-    // Multi-segment encode/decode with filters Q and G.
-    for filter in [WaveletFilter::Reversible53, WaveletFilter::FilterG] {
+    // Multi-segment encode/decode is bit-exact under every §II.A
+    // filter; Q and F bracket the Table 1 parameter range.
+    for filter in [WaveletFilter::Reversible53, WaveletFilter::FilterF] {
         let original = ramp_image(16, 16);
         let opts = EncodeOptions {
             filter,
@@ -268,21 +231,9 @@ fn multi_segment_compressed_all_filters() {
         };
         let bytes = encode_icer(&original, &opts).unwrap();
         let decoded = parse_icer(&bytes).unwrap();
-        let err: i32 = original.planes[0]
-            .data
-            .iter()
-            .zip(decoded.planes[0].data.iter())
-            .map(|(a, b)| (*a as i32 - *b as i32).abs())
-            .sum();
-        let mean_err = err as f32 / (original.width * original.height) as f32;
-        let max_err = if filter == WaveletFilter::Reversible53 {
-            0.0
-        } else {
-            16.0
-        };
-        assert!(
-            mean_err <= max_err,
-            "filter {filter:?} multi-segment mean error {mean_err} > {max_err}"
+        assert_eq!(
+            decoded.planes[0].data, original.planes[0].data,
+            "filter {filter:?} multi-segment round-trip must be bit-exact"
         );
     }
 }

@@ -104,8 +104,8 @@ fn quality_target_returns_target_meeting_psnr() {
 
 #[test]
 fn quality_target_monotone_in_target_db() {
-    // Higher target -> at least as many bytes emitted. We use filter A
-    // (lossy) so the binary search has room to step the byte count.
+    // Higher target -> at least as many bytes emitted. The truncated
+    // budget trials supply the quality steps the search walks over.
     let img = ramp_image(32, 32);
     let lo_target = 20.0f32;
     let hi_target = 35.0f32;

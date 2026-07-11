@@ -297,7 +297,7 @@ fn lenient_uncompressed_path_also_supported() {
 
 #[test]
 fn lenient_filter_a_round_trip() {
-    // Float-filter path: drop a middle segment from a filter-A encoding.
+    // Filter-A path: drop a middle segment from a filter-A encoding.
     let img = ramp_image(16, 12);
     let opts = EncodeOptions {
         filter: WaveletFilter::NineSevenA,

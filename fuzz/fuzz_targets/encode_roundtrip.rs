@@ -60,8 +60,7 @@ fn pick_filter(b: u8) -> WaveletFilter {
         3 => WaveletFilter::FilterC,
         4 => WaveletFilter::FilterD,
         5 => WaveletFilter::FilterE,
-        6 => WaveletFilter::FilterF,
-        _ => WaveletFilter::FilterG,
+        _ => WaveletFilter::FilterF,
     }
 }
 

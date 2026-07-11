@@ -103,7 +103,7 @@ fn auto_filter_picks_q_on_smooth_gradient() {
 #[test]
 fn auto_filter_picks_filter_a_on_checkerboard() {
     // Checkerboard has very high edge energy + variance -> heuristic
-    // picks filter A (CDF 9/7).
+    // picks filter A (beta = 0 high-pass predictor, §II.A Table 1).
     let img = checkerboard_image(32, 32);
     let (stats, recommended) = analyze(&img);
     assert_eq!(
@@ -114,19 +114,23 @@ fn auto_filter_picks_filter_a_on_checkerboard() {
 
     let opts = EncodeOptions::compressed().with_auto_filter();
     let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let _decoded = parse_icer(&bytes).expect("decode failed");
-    // Filter A is lossy -- we just assert the pipeline produces a valid
-    // decodable output. (Auto picked A; no panic.)
+    let decoded = parse_icer(&bytes).expect("decode failed");
+    // Filter A is a §II.A reversible integer transform: the
+    // full-quality round-trip is bit-exact under it too.
+    assert_eq!(
+        decoded.planes[0].data, img.planes[0].data,
+        "auto-picked filter A must still round-trip bit-exact"
+    );
 }
 
 #[test]
 fn auto_filter_overrides_explicit_filter_setting() {
     // Confirm that setting auto_filter overrides whatever filter the
-    // caller specified explicitly. We set filter G then enable auto on
+    // caller specified explicitly. We set filter F then enable auto on
     // a flat image -> auto must pick Q, lossless output.
     let img = flat_image(16, 16, 100);
     let opts = EncodeOptions {
-        filter: WaveletFilter::FilterG,
+        filter: WaveletFilter::FilterF,
         uncompressed: false,
         ..EncodeOptions::default()
     }
@@ -135,7 +139,7 @@ fn auto_filter_overrides_explicit_filter_setting() {
     let decoded = parse_icer(&bytes).expect("decode failed");
     assert_eq!(
         decoded.planes[0].data, img.planes[0].data,
-        "auto-mode should override explicit filter G in favour of Q on flat input"
+        "auto-mode should override explicit filter F in favour of Q on flat input"
     );
 }
 
@@ -145,14 +149,16 @@ fn auto_filter_disabled_uses_caller_filter() {
     // is honoured exactly as before.
     let img = flat_image(16, 16, 100);
     let opts = EncodeOptions {
-        filter: WaveletFilter::FilterG,
+        filter: WaveletFilter::FilterF,
         uncompressed: false,
         ..EncodeOptions::default()
     };
     let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let _decoded = parse_icer(&bytes).expect("decode failed");
-    // We can't easily peek at the segment header from the public API,
-    // but the round-trip succeeding means filter G was actually used.
+    let decoded = parse_icer(&bytes).expect("decode failed");
+    assert_eq!(
+        decoded.planes[0].data, img.planes[0].data,
+        "explicit filter F round-trip must be bit-exact"
+    );
 }
 
 // ---------------------------------------------------------------------------

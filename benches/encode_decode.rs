@@ -183,13 +183,11 @@ fn bench_uncompressed_path(c: &mut Criterion) {
     group.finish();
 }
 
-/// Float-filter (`A`) encode-options. Filter A is the lossy 9/7-style
-/// CDF lifting filter named in IPN 42-155 §III.A; it is the Mars-rover
-/// lossy default and is the natural perf contrast against the integer
-/// Q (`Reversible53`) lossless path -- the wavelet stage now runs in
-/// `f64` lifting + integer quantisation rather than pure `i32`, so the
-/// numbers exposed here are the baseline for any future float-DWT
-/// vectorisation work.
+/// Filter-A encode-options. Filter A is one of the seven IPN 42-155
+/// §II.A reversible integer transforms; it shares filter Q's `alpha`
+/// triple and differs only in `beta` (Table 1), so the Q-vs-A delta
+/// isolates the cost of the `beta * d[n+1]` predictor term in the
+/// shared eq (3) recurrence.
 fn compressed_filter_a_opts() -> EncodeOptions {
     EncodeOptions {
         filter: WaveletFilter::NineSevenA,
@@ -201,9 +199,9 @@ fn compressed_filter_a_opts() -> EncodeOptions {
 }
 
 fn bench_filter_a_path(c: &mut Criterion) {
-    // Mirrors the filter-Q encode + decode groups but on the lossy float
-    // 9/7 CDF path. Same three input shapes so the criterion report
-    // makes the Q-vs-A delta directly readable.
+    // Mirrors the filter-Q encode + decode groups but on filter A.
+    // Same three input shapes so the criterion report makes the
+    // Q-vs-A delta directly readable.
     let opts = compressed_filter_a_opts();
 
     let mut enc_group = c.benchmark_group("encode_compressed_filter_a");
@@ -471,21 +469,18 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
     dec_group.finish();
 }
 
-/// Round 262 -- wavelet-decomposition-depth sweep on the lossy float
-/// 9/7 (`NineSevenA`) path. Round 210 added the same shape of sweep
-/// over `wavelet_levels` for filter Q (integer 5/3); this group is the
-/// filter-A counterpart so the per-depth cost of the **float** dyadic
-/// recursion is directly readable rather than averaged into the
+/// Round 262 -- wavelet-decomposition-depth sweep on the filter-A
+/// path. Round 210 added the same shape of sweep over `wavelet_levels`
+/// for filter Q; this group is the filter-A counterpart so the
+/// per-depth cost is directly readable rather than averaged into the
 /// round-205 default-depth (`wavelet_levels = 2`) filter-A number.
 ///
-/// The interesting Q-vs-A delta on a per-depth basis is the lifting
-/// arithmetic cost -- filter Q's integer 5/3 lifting is pure `i32`
-/// add/shift, filter A's float 9/7 CDF lifting is `f64` multiply-add.
-/// Both paths share the same bit-plane scanner + arithmetic coder, so
-/// the per-depth slope difference between this group and the round-210
-/// `encode_compressed_filter_q_levels_64x64` group isolates the float
-/// vs. integer lifting overhead in the dyadic recursion (each added
-/// level adds a forward-lifting pass over a half-sized buffer).
+/// Since r411 both filters run the same §II.A integer recurrence and
+/// differ only in the Table 1 parameters (filter A's `beta = 0` even
+/// skips the `d[n+1]` predictor term), so the per-depth slope
+/// difference between this group and the round-210
+/// `encode_compressed_filter_q_levels_64x64` group is expected to be
+/// small; the sweep is retained to catch a divergence.
 ///
 /// Encode + decode are reported as separate benches against the same
 /// per-depth input so the forward + inverse DWT cost split is directly

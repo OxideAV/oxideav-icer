@@ -11,9 +11,9 @@
 //!   * **decomposition levels** -- 1..=5 (past depth ~3 the LL subband
 //!     stops shrinking on small images, so the deeper levels are no-ops
 //!     that the decoder must still reproduce exactly);
-//!   * **filter** -- the reversible integer 5/3 (filter Q) path is
-//!     lossless and must be bit-exact; the float 9/7 (filter A) path is
-//!     lossy but must stay within a bounded error.
+//!   * **filter** -- all seven IPN 42-155 §II.A filters are reversible
+//!     integer transforms; filter Q is swept across the full matrix,
+//!     and filter A across the same geometries, both bit-exact.
 //!
 //! This complements `compressed_roundtrip.rs` (which pins a couple of
 //! fixed configs) with a systematic matrix, and `truncation_fidelity.rs`
@@ -117,17 +117,14 @@ fn filter_q_progressive_monotone_matrix() {
     }
 }
 
-/// The lossy float 9/7 (filter A) decode path reconstructs within a
-/// bounded error across geometries and levels (it is lossy by the float
-/// lifting + integer-rounding round-trip, but must not blow up). A wide
-/// `>= 20 dB` floor on the structured ramp guards against a decode-config
-/// regression that would corrupt the inverse float DWT for a particular
-/// strip shape.
+/// Filter A is one of the seven IPN 42-155 §II.A reversible integer
+/// transforms: a full-quality decode must be bit-exact across the same
+/// geometry / level matrix as filter Q (guards against a decode-config
+/// regression that would corrupt the inverse DWT for a particular
+/// strip shape).
 #[test]
-fn filter_a_decode_bounded_error_matrix() {
+fn filter_a_decode_bit_exact_matrix() {
     for &(w, h) in GEOMETRIES {
-        // Float DWT needs width/height >= 2; the 5x200 / 200x5 strips are
-        // fine (both dims >= 2). Skip nothing here.
         for levels in [1u8, 2, 3] {
             let img = ramp(w, h);
             let mut opts = EncodeOptions::compressed();
@@ -139,10 +136,9 @@ fn filter_a_decode_bounded_error_matrix() {
                 parse_icer(&bytes).unwrap_or_else(|e| panic!("decode A {w}x{h} L{levels}: {e:?}"));
             assert_eq!(dec.width, w);
             assert_eq!(dec.height, h);
-            let p = psnr(&img, &dec);
-            assert!(
-                p >= 20.0,
-                "filter-A full-quality {w}x{h} L{levels}: PSNR {p:.2} dB below 20 dB floor"
+            assert_eq!(
+                dec.planes[0].data, img.planes[0].data,
+                "filter-A full-quality {w}x{h} L{levels} must be bit-exact (§II.A)"
             );
         }
     }

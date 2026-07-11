@@ -191,7 +191,7 @@ fn fallback_no_op_when_forced_uncompressed() {
 
 #[test]
 fn fallback_composes_with_filter_choice() {
-    // Setting the fallback on a non-default float filter should still
+    // Setting the fallback on a non-default filter should still
     // produce a valid decode-roundtrip — the fallback decision is
     // orthogonal to the filter choice on the compressed candidate.
     let img = noise_image(16, 16, 0xF00D);

@@ -75,17 +75,18 @@ fn mid_plane_truncation_clears_per_coefficient_floor() {
     let img = texture_64x64();
     // (requested budget, PSNR floor in dB). Floors sit between the
     // strip-global and per-coefficient measurements at each cut.
-    // Recalibrated after the r405 §II.B pyramid fix (deeper stages now
-    // decompose the LL lattice, not the top-left rectangle), which
+    // Recalibrated after the r411 migration of the pipeline onto the
+    // spec-exact IPN 42-155 §II.A integer transform (filter Q's eq (3)
+    // recurrence replaces the pre-spec textbook 5/3 lifting), which
     // moved every packet boundary. Floors sit ~1 dB below the measured
     // per-coefficient PSNR at each cut; a regression to strip-global
     // reconstruction loses ~1.4..3 dB at these mid-plane cuts and
     // fails the floor.
     let cases: &[(u64, f64)] = &[
-        (2200, 28.0), // measured per-coef 28.9
-        (2400, 31.5), // measured per-coef 32.6
-        (2800, 37.0), // measured per-coef 38.0
-        (3400, 41.5), // measured per-coef 42.6
+        (2200, 26.0), // measured per-coef 27.1
+        (2400, 30.0), // measured per-coef 30.9
+        (2800, 35.6), // measured per-coef 36.6
+        (3400, 40.1), // measured per-coef 41.1
     ];
     for &(budget, floor) in cases {
         let bytes = encode_at(&img, budget);
