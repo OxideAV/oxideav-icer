@@ -849,6 +849,37 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     let mut out = Vec::new();
     let priorities_active = opts.segment_priorities.is_some();
 
+    // §VI.B cross-segment progressive quota (row strips): without ROI
+    // priorities, a byte quota / soft target truncates the global
+    // interleaved packet stream — each segment of a bit plane before
+    // the next bit plane — so the budget spreads progressively across
+    // every strip rather than deep-refining the first strips while the
+    // later ones starve. R-D pruning, the §III.D fallback, and forced
+    // uncompressed keep their per-segment scheduling (their selection
+    // logic is per-segment by construction); ROI priorities keep the
+    // sequential whole-segment scheduling (starving low-priority
+    // strips is that mode's documented intent).
+    if (opts.byte_budget.is_some() || opts.target_bytes.is_some())
+        && !priorities_active
+        && !opts.uncompressed
+        && !opts.rd_pruning
+        && !opts.auto_uncompressed_fallback
+    {
+        let mut plans = Vec::with_capacity(n_segs);
+        for (seg_idx, &(y_start, this_h)) in starts_heights.iter().enumerate() {
+            plans.push(plan_one_row_segment_compressed(
+                plane,
+                w,
+                y_start,
+                this_h,
+                seg_idx as u16,
+                opts,
+                levels,
+            )?);
+        }
+        return emit_planned_interleaved(plans, opts.byte_budget, opts.target_bytes);
+    }
+
     if !priorities_active {
         // Legacy path: encode + emit in index order, respect the budget
         // strip-by-strip via per-segment budget propagation.
@@ -1036,6 +1067,37 @@ fn encode_transform_segmented(
         .then(|| crate::priority::min_loss_skip_map(w, h, levels, opts.min_loss));
 
     let emission_order = resolve_emission_order(opts, n_segs)?;
+
+    // §VI.B cross-segment progressive quota: without ROI priorities, a
+    // byte quota (or soft target) truncates the *global interleaved*
+    // packet stream — each segment of a subband bit plane before the
+    // next subband bit plane — so the budget spreads progressively
+    // across every segment rather than deep-refining the first segment
+    // while later ones starve. ROI priorities keep the sequential
+    // whole-segment scheduling below (starving the periphery is that
+    // mode's documented intent).
+    if (opts.byte_budget.is_some() || opts.target_bytes.is_some())
+        && opts.segment_priorities.is_none()
+        && n_segs > 1
+    {
+        let mut plans = Vec::with_capacity(n_segs);
+        for seg_idx in 0..n_segs as u16 {
+            plans.push(plan_one_transform_segment(
+                &coeffs,
+                &seg_map,
+                skip_map.as_deref(),
+                rects[seg_idx as usize].image_window(levels, w, h),
+                w,
+                h,
+                seg_idx,
+                n_segs as u8,
+                opts,
+                levels,
+            )?);
+        }
+        return emit_planned_interleaved(plans, opts.byte_budget, opts.target_bytes);
+    }
+
     let mut out = Vec::new();
     let mut kept = vec![false; n_segs];
     for &seg_idx in &emission_order {
@@ -1099,6 +1161,304 @@ fn encode_transform_segmented(
             segment_index: seg_idx as u16,
         };
         out.extend_from_slice(&placeholder.encode());
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// §VI.B cross-segment progressive byte quota
+// ---------------------------------------------------------------------------
+
+/// One planned (not yet quota-cut) wire packet: fully-formed packet
+/// header + entropy-coded body, plus the §VI.B global-interleave key.
+///
+/// IPN 42-155 §VI.B: "because ICER compresses each error-containment
+/// segment of a subband bit plane before moving on to another subband
+/// bit plane, the output bitstream interleaves data from the segments.
+/// This organization of the output bitstream represents progressive
+/// compression across all of the segments" — so a byte quota is met by
+/// truncating that *global* interleaved stream, and the surviving
+/// blocks are then rearranged per segment for transmission ("the
+/// compressed bitstream should be rearranged prior to transmission so
+/// that portions corresponding to a given segment are concatenated in
+/// order", Fig. 23). The key orders packets across segments; higher
+/// keys are compressed (and therefore kept) first.
+struct PlannedPacket {
+    header: PacketHeader,
+    body: Vec<u8>,
+    /// Global interleave key (higher = earlier in the §VI.B schedule).
+    /// Default packet mode: `2 * absolute_magnitude_bit + is_sig`, so
+    /// planes align across segments with different bit-plane counts
+    /// and significance precedes refinement within a plane. §III.A
+    /// priority-interleaved mode: the schedule group's `log2` priority.
+    key: i64,
+}
+
+impl PlannedPacket {
+    fn wire_len(&self) -> u64 {
+        PacketHeader::ENCODED_BYTES as u64 + self.body.len() as u64
+    }
+}
+
+/// One segment's unbudgeted encode plan: the segment header template
+/// (`segment_length` filled at serialisation time) plus the canonical
+/// packet sequence in the segment's own emission order (keys
+/// non-increasing, so any per-segment *prefix* of the sequence is a
+/// valid truncated segment).
+struct SegmentPlan {
+    header: SegmentHeader,
+    packets: Vec<PlannedPacket>,
+}
+
+/// Order per-bit-plane packets MSB-down (sig before ref, §IV order)
+/// into [`PlannedPacket`]s, dropping the trailing planes the §VI.A
+/// `floor_planes` exclusion leaves empty — the exact packet sequence
+/// [`serialize_packets_msb_down`] emits, without the quota cut.
+fn plan_packets_msb_down(
+    packets: &[EncodedPacket],
+    q: u8,
+    min_loss: u8,
+    floor_planes: u8,
+) -> Result<Vec<PlannedPacket>> {
+    let mut out = Vec::new();
+    for bp_idx in 0..q as usize {
+        let abs_bit = q as usize - 1 - bp_idx;
+        if abs_bit < floor_planes as usize {
+            break;
+        }
+        for &is_sig in &[true, false] {
+            let Some(pkt) = packets
+                .iter()
+                .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance == is_sig)
+            else {
+                continue;
+            };
+            if pkt.body.len() > u16::MAX as usize {
+                return Err(IcerError::Unsupported(format!(
+                    "packet body {} exceeds u16 limit",
+                    pkt.body.len()
+                )));
+            }
+            out.push(PlannedPacket {
+                header: PacketHeader {
+                    bit_plane: pkt.bit_plane,
+                    pass: if pkt.is_significance {
+                        BitPlanePass::Significance
+                    } else {
+                        BitPlanePass::Refinement
+                    },
+                    body_length: pkt.body.len() as u16,
+                    min_loss,
+                },
+                body: pkt.body.clone(),
+                key: 2 * abs_bit as i64 + i64::from(is_sig),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Order §III.A priority-interleaved packets (already in schedule
+/// order, one or more per priority group) into [`PlannedPacket`]s —
+/// the exact sequence [`serialize_priority_packets`] emits, without
+/// the quota cut. The key is the group's `log2` priority so groups
+/// align across segments whose bit-plane counts differ.
+fn plan_packets_priority(
+    packets: &[EncodedPacket],
+    levels: u8,
+    q: u8,
+    min_loss: u8,
+) -> Result<Vec<PlannedPacket>> {
+    let groups = crate::priority::priority_groups(levels, q as u32);
+    let mut out = Vec::new();
+    for pkt in packets {
+        if pkt.body.len() > u16::MAX as usize {
+            return Err(IcerError::Unsupported(format!(
+                "packet body {} exceeds u16 limit",
+                pkt.body.len()
+            )));
+        }
+        let group = groups.get(pkt.bit_plane as usize).ok_or_else(|| {
+            IcerError::invalid(format!(
+                "priority packet group {} outside schedule",
+                pkt.bit_plane
+            ))
+        })?;
+        out.push(PlannedPacket {
+            header: PacketHeader {
+                bit_plane: pkt.bit_plane,
+                pass: BitPlanePass::Cleanup,
+                body_length: pkt.body.len() as u16,
+                min_loss,
+            },
+            body: pkt.body.clone(),
+            key: i64::from(group.priority_log2),
+        });
+    }
+    Ok(out)
+}
+
+/// Plan one row-strip compressed segment: the same DWT + bit-plane
+/// encode as [`encode_one_segment_compressed`] (no R-D pruning, no
+/// §III.D fallback), returning the unbudgeted packet sequence instead
+/// of quota-cut wire bytes.
+fn plan_one_row_segment_compressed(
+    plane: &IcerPlane,
+    img_w: usize,
+    y_start: usize,
+    strip_h: usize,
+    segment_index: u16,
+    opts: &EncodeOptions,
+    levels: u8,
+) -> Result<SegmentPlan> {
+    if img_w < 2 || strip_h < 2 {
+        return Err(IcerError::Unsupported(format!(
+            "compressed segment requires width >= 2 and height >= 2; got {img_w}x{strip_h}"
+        )));
+    }
+    let mut coeffs: Vec<i32> = Vec::with_capacity(img_w * strip_h);
+    for y in 0..strip_h {
+        let src_y = y_start + y;
+        let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
+        for &px in row {
+            coeffs.push(px as i32 - 128);
+        }
+    }
+    wavelet_int::forward_2d_dyadic(&mut coeffs, img_w, strip_h, levels, opts.filter);
+    let needed = select_bit_plane_count(&coeffs);
+    let q = needed.max(opts.bit_plane_count.min(31)).min(31);
+    let bp_input = BitPlaneInput {
+        coeffs: &coeffs,
+        width: img_w,
+        height: strip_h,
+        q,
+        levels,
+    };
+    let planned = if opts.priority_interleaving {
+        let packets = crate::bitplane::encode_bitplanes_prioritized(
+            &bp_input,
+            opts.entropy_kind(),
+            &ScanFilter::ALL,
+            opts.min_loss,
+        )?;
+        plan_packets_priority(&packets, levels, q, opts.min_loss)?
+    } else {
+        let skip_map: Option<Vec<u8>> = (opts.min_loss > 0)
+            .then(|| crate::priority::min_loss_skip_map(img_w, strip_h, levels, opts.min_loss));
+        let scan_filter = ScanFilter {
+            segment: None,
+            skip: skip_map.as_deref(),
+            window: None,
+        };
+        let packets = crate::bitplane::encode_bitplanes_filtered(
+            &bp_input,
+            opts.entropy_kind(),
+            &scan_filter,
+        )?;
+        plan_packets_msb_down(
+            &packets,
+            q,
+            opts.min_loss,
+            min_visited_skip(&scan_filter, img_w * strip_h),
+        )?
+    };
+    Ok(SegmentPlan {
+        header: SegmentHeader {
+            sync_prefix: opts.sync_prefix,
+            filter: opts.filter,
+            decomp_levels: levels.clamp(1, 6),
+            uncompressed: false,
+            width: img_w as u16,
+            height: strip_h as u16,
+            bit_plane_count: q,
+            interleaved_entropy: opts.interleaved_entropy,
+            transform_segmented: false,
+            total_segments: 0,
+            priority_interleaved: opts.priority_interleaving,
+            segment_length: 0,
+            segment_index,
+        },
+        packets: planned,
+    })
+}
+
+/// Serialise a set of [`SegmentPlan`]s under the §VI.B cross-segment
+/// progressive byte quota. Every segment's 12-byte header is always
+/// framed (the geometry-preserving invariant every budget path keeps);
+/// packets are then admitted by walking the global §VI.B interleaved
+/// order — key descending, ties to the lower segment index, then the
+/// segment-local sequence — and cutting the walk when the hard cap
+/// would be exceeded (the quota truncates the *interleaved* stream, so
+/// the cut is a global prefix, §VI.B). The soft target finishes the
+/// in-progress key step (every remaining same-key packet, hard cap
+/// permitting), then stops. Surviving packets are emitted rearranged
+/// per segment in ascending `segment_index` order (§VI.B Fig. 23(b)).
+fn emit_planned_interleaved(
+    mut plans: Vec<SegmentPlan>,
+    byte_budget: Option<u64>,
+    target_bytes: Option<u64>,
+) -> Result<Vec<u8>> {
+    let n_segs = plans.len();
+    // Global §VI.B order over (segment, local packet index).
+    let mut order: Vec<(usize, usize)> = Vec::new();
+    for (seg, plan) in plans.iter().enumerate() {
+        debug_assert!(
+            plan.packets.windows(2).all(|w| w[0].key >= w[1].key),
+            "segment-local packet keys must be non-increasing"
+        );
+        for local in 0..plan.packets.len() {
+            order.push((seg, local));
+        }
+    }
+    order.sort_by_key(|&(seg, local)| (-plans[seg].packets[local].key, seg, local));
+
+    let fixed = (n_segs * SegmentHeader::ENCODED_BYTES) as u64;
+    let mut total = fixed;
+    let mut kept = vec![0usize; n_segs];
+    let mut soft_stop_key: Option<i64> = None;
+    for &(seg, local) in &order {
+        let pkt = &plans[seg].packets[local];
+        if let Some(stop_key) = soft_stop_key {
+            if pkt.key < stop_key {
+                break;
+            }
+        }
+        if let Some(budget) = byte_budget {
+            if total + pkt.wire_len() > budget {
+                // §VI.B: the quota truncates the interleaved stream —
+                // a strict global prefix, no skip-and-continue.
+                break;
+            }
+        }
+        total += pkt.wire_len();
+        debug_assert_eq!(kept[seg], local, "kept set must stay a per-segment prefix");
+        kept[seg] = local + 1;
+        if let Some(target) = target_bytes {
+            if total >= target && soft_stop_key.is_none() {
+                // Finish the current §VI.B step (same-key packets),
+                // then stop.
+                soft_stop_key = Some(pkt.key);
+            }
+        }
+    }
+
+    // Rearranged emission: per segment, its surviving packet prefix.
+    let mut out = Vec::with_capacity(total as usize);
+    for (seg, plan) in plans.iter_mut().enumerate() {
+        let mut body = Vec::new();
+        for pkt in &plan.packets[..kept[seg]] {
+            body.extend_from_slice(&pkt.header.encode());
+            body.extend_from_slice(&pkt.body);
+        }
+        if body.len() > u16::MAX as usize {
+            return Err(IcerError::Unsupported(format!(
+                "compressed segment body {} exceeds u16 limit",
+                body.len()
+            )));
+        }
+        plan.header.segment_length = body.len() as u16;
+        out.extend_from_slice(&plan.header.encode());
+        out.extend_from_slice(&body);
     }
     Ok(out)
 }
@@ -1196,6 +1556,87 @@ fn encode_one_transform_segment(
     out.extend_from_slice(&segment.encode());
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Plan one §V.B transform-domain segment: the same bit-plane encode
+/// as [`encode_one_transform_segment`], returning the unbudgeted
+/// packet sequence for the §VI.B cross-segment quota instead of
+/// quota-cut wire bytes.
+#[allow(clippy::too_many_arguments)]
+fn plan_one_transform_segment(
+    coeffs: &[i32],
+    seg_map: &[u16],
+    skip_map: Option<&[u8]>,
+    window: (usize, usize, usize, usize),
+    w: usize,
+    h: usize,
+    seg_idx: u16,
+    total_segments: u8,
+    opts: &EncodeOptions,
+    levels: u8,
+) -> Result<SegmentPlan> {
+    let filter = ScanFilter {
+        segment: Some((seg_map, seg_idx)),
+        skip: skip_map,
+        window: Some(window),
+    };
+    let (wx0, wx1, wy0, wy1) = window;
+    let max_abs = (wy0..wy1)
+        .flat_map(|y| (wx0..wx1).map(move |x| y * w + x))
+        .map(|i| coeffs[i].unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let needed = if max_abs == 0 {
+        1
+    } else {
+        (32 - max_abs.leading_zeros()).clamp(1, 31) as u8
+    };
+    let q = needed.max(opts.bit_plane_count.min(31)).min(31);
+
+    let bp_input = BitPlaneInput {
+        coeffs,
+        width: w,
+        height: h,
+        q,
+        levels,
+    };
+    let planned = if opts.priority_interleaving {
+        let priority_filter = ScanFilter {
+            segment: Some((seg_map, seg_idx)),
+            skip: None,
+            window: Some(window),
+        };
+        let packets = crate::bitplane::encode_bitplanes_prioritized(
+            &bp_input,
+            opts.entropy_kind(),
+            &priority_filter,
+            opts.min_loss,
+        )?;
+        plan_packets_priority(&packets, levels, q, opts.min_loss)?
+    } else {
+        let packets =
+            crate::bitplane::encode_bitplanes_filtered(&bp_input, opts.entropy_kind(), &filter)?;
+        plan_packets_msb_down(&packets, q, opts.min_loss, min_visited_skip(&filter, w * h))?
+    };
+
+    Ok(SegmentPlan {
+        header: SegmentHeader {
+            sync_prefix: opts.sync_prefix,
+            filter: opts.filter,
+            decomp_levels: levels,
+            uncompressed: false,
+            width: w as u16,
+            height: h as u16,
+            bit_plane_count: q,
+            interleaved_entropy: opts.interleaved_entropy,
+            transform_segmented: true,
+            total_segments,
+            priority_interleaved: opts.priority_interleaving,
+            segment_length: 0,
+            segment_index: seg_idx,
+        },
+        packets: planned,
+    })
 }
 
 /// The smallest §VI.A skip value over the coefficients this filter

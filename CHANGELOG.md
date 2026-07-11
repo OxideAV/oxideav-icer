@@ -38,6 +38,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **IPN 42-155 §VI.B cross-segment progressive byte quota.** A byte
+  quota (or soft target) on a multi-segment encode now truncates the
+  *global interleaved* packet stream — "ICER compresses each
+  error-containment segment of a subband bit plane before moving on to
+  another subband bit plane, [so] the output bitstream ... represents
+  progressive compression across all of the segments" (§VI.B) — and
+  the surviving packets are rearranged per segment for transmission
+  (Fig. 23(b)). Previously the quota was allocated
+  sequential-greedily: each segment consumed as much of the remaining
+  budget as it could before the next was considered, so mid-range
+  budgets deep-refined the first segment while later segments starved
+  at zero packets (quality could even *decrease* as the budget grew).
+  Measured on the textured 64x64 filter-Q fixture, 4 segments, equal
+  budgets: row strips 500 B 13.4 -> 22.2 dB, 1000 B 14.2 -> 27.4 dB,
+  1500 B 14.4 -> 30.7 dB, 2000 B 20.9 -> 36.0 dB; §V.B
+  transform-domain 500 B MSE 2960 -> 402 (both paths now monotone in
+  budget). Packets align across segments by absolute magnitude bit
+  (default mode) or §III.A group priority (priority-interleaved mode),
+  so segments with different bit-plane counts interleave correctly; an
+  ample budget is proven byte-identical to the unbudgeted encode. ROI
+  `segment_priorities` / `with_center_roi` keep the sequential
+  whole-segment scheduling (starving the periphery is that mode's
+  documented intent), as do `rd_pruning`, the §III.D fallback, and
+  forced-uncompressed. Composes with both entropy backends, §III.A
+  priority interleaving, §VI.A `min_loss`, row strips, and §V.B
+  transform-domain segments; wire format unchanged (only packet
+  selection moves). New `tests/quota_interleave.rs` suite.
+
 - **IPN 42-155 §III.A subband-priority interleaving, end to end**
   (`EncodeOptions::with_priority_interleaving()`). The packet schedule
   becomes the spec's progressive order: subband bit planes walked in
