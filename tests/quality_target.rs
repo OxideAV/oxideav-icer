@@ -85,7 +85,7 @@ fn quality_target_returns_target_meeting_psnr() {
     let img = ramp_image(32, 32);
     let target = 25.0f32;
     let opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -110,7 +110,7 @@ fn quality_target_monotone_in_target_db() {
     let lo_target = 20.0f32;
     let hi_target = 35.0f32;
     let lo_opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -118,7 +118,7 @@ fn quality_target_monotone_in_target_db() {
     }
     .with_quality_target(lo_target);
     let hi_opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -154,7 +154,7 @@ fn quality_target_above_filter_ceiling_returns_best_effort() {
     // encode as the best effort rather than erroring or looping.
     let img = ramp_image(16, 16);
     let opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,

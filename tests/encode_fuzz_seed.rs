@@ -27,8 +27,8 @@ const MAX_LEVELS: u8 = 4;
 
 fn pick_filter(b: u8) -> WaveletFilter {
     match b & 0x07 {
-        0 => WaveletFilter::Reversible53,
-        1 => WaveletFilter::NineSevenA,
+        0 => WaveletFilter::FilterQ,
+        1 => WaveletFilter::FilterA,
         2 => WaveletFilter::FilterB,
         3 => WaveletFilter::FilterC,
         4 => WaveletFilter::FilterD,

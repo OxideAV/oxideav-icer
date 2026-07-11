@@ -1303,7 +1303,7 @@ decode hot paths so future entropy-coder, wavelet, or filter-selection
 work has a stable baseline to compare against. Three input shapes
 (diagonal-ramp 16x16, mid-grey 16x16, diagonal-ramp 64x64) are
 exercised on the reversible 5/3 wavelet path
-(`WaveletFilter::Reversible53`, `wavelet_levels = 2`,
+(`WaveletFilter::FilterQ`, `wavelet_levels = 2`,
 `bit_plane_count = 8`) plus a fourth group covering the IPN 42-155
 §III.D uncompressed path on the 64x64 ramp as a near-`memcpy`
 contrast against the compressed pipeline. Each subgroup records

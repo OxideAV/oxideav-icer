@@ -338,8 +338,8 @@ mod tests {
     use super::*;
 
     const ALL: [WaveletFilter; 7] = [
-        WaveletFilter::Reversible53,
-        WaveletFilter::NineSevenA,
+        WaveletFilter::FilterQ,
+        WaveletFilter::FilterA,
         WaveletFilter::FilterB,
         WaveletFilter::FilterC,
         WaveletFilter::FilterD,
@@ -396,7 +396,7 @@ mod tests {
             (2, 2, 16, 3), // spatially too small: spectral-only
             (1, 1, 9, 2),
         ];
-        for f in [WaveletFilter::Reversible53, WaveletFilter::FilterC] {
+        for f in [WaveletFilter::FilterQ, WaveletFilter::FilterC] {
             for &(w, h, bands, levels) in &cases {
                 let original = test_cube(w, h, bands);
                 let mut buf = original.clone();
@@ -413,8 +413,8 @@ mod tests {
         let original = test_cube(w, h, bands);
         for levels in 1..=6u8 {
             let mut buf = original.clone();
-            forward_3d(&mut buf, w, h, bands, levels, WaveletFilter::Reversible53);
-            inverse_3d(&mut buf, w, h, bands, levels, WaveletFilter::Reversible53);
+            forward_3d(&mut buf, w, h, bands, levels, WaveletFilter::FilterQ);
+            inverse_3d(&mut buf, w, h, bands, levels, WaveletFilter::FilterQ);
             assert_eq!(buf, original, "level {levels} mismatch");
         }
     }
@@ -426,7 +426,7 @@ mod tests {
         // bias in the stage plumbing would surface here.
         let (w, h, bands, levels) = (16usize, 16usize, 8usize, 3u8);
         let mut buf = vec![55i32; w * h * bands];
-        forward_3d(&mut buf, w, h, bands, levels, WaveletFilter::Reversible53);
+        forward_3d(&mut buf, w, h, bands, levels, WaveletFilter::FilterQ);
         let ts = spatial_stage_count(w, h, levels) as usize;
         let tl = spectral_stage_count(bands, levels) as usize;
         for b in 0..bands {
@@ -484,7 +484,7 @@ mod tests {
                 }
             }
         }
-        forward_3d(&mut cube, w, h, bands, levels, WaveletFilter::Reversible53);
+        forward_3d(&mut cube, w, h, bands, levels, WaveletFilter::FilterQ);
         let at = |x: usize, y: usize, b: usize| cube[b * w * h + y * w + x];
 
         // (1, 0) is level-1 spatial detail: exactly one spectral stage

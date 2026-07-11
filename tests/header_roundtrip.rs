@@ -5,8 +5,8 @@ use oxideav_icer::{walk_segment, BitPlanePass, PacketHeader, SegmentHeader, Wave
 #[test]
 fn segment_header_roundtrip_all_filters() {
     for filter in [
-        WaveletFilter::Reversible53,
-        WaveletFilter::NineSevenA,
+        WaveletFilter::FilterQ,
+        WaveletFilter::FilterA,
         WaveletFilter::FilterB,
         WaveletFilter::FilterC,
         WaveletFilter::FilterD,
@@ -51,7 +51,7 @@ fn segment_header_transform_segmented_roundtrip() {
     for (total, index) in [(1u8, 0u16), (2, 1), (17, 16), (255, 254)] {
         let h = SegmentHeader {
             sync_prefix: 0xACED,
-            filter: WaveletFilter::Reversible53,
+            filter: WaveletFilter::FilterQ,
             decomp_levels: 3,
             uncompressed: false,
             width: 64,
@@ -74,7 +74,7 @@ fn segment_header_transform_segmented_roundtrip() {
 fn segment_header_transform_segmented_rejects_bad_counts() {
     let h = SegmentHeader {
         sync_prefix: 0xACED,
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         decomp_levels: 3,
         uncompressed: false,
         width: 64,
@@ -189,7 +189,7 @@ fn walk_segment_with_two_packets() {
 
     let h = SegmentHeader {
         sync_prefix: 0xACED,
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         decomp_levels: 3,
         uncompressed: false,
         width: 32,

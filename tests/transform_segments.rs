@@ -325,7 +325,7 @@ fn metadata_reports_transform_parameters() {
 fn filter_a_bit_exact() {
     let img = textured(64, 64, 0xF17A);
     let mut opts = opts_transform(4);
-    opts.filter = WaveletFilter::NineSevenA;
+    opts.filter = WaveletFilter::FilterA;
     let bytes = encode_icer(&img, &opts).unwrap();
     let dec = parse_icer(&bytes).unwrap();
     assert_eq!(

@@ -276,7 +276,7 @@ fn weight_map_reflects_non_unitary_subband_structure() {
     let w = 32usize;
     let h = 32usize;
     let levels = 3u8;
-    let map = subband_weight_map(w, h, levels, WaveletFilter::Reversible53);
+    let map = subband_weight_map(w, h, levels, WaveletFilter::FilterQ);
     assert_eq!(map.len(), w * h);
 
     // Level-1 HH lives at an odd/odd interior position, e.g. (5, 5).

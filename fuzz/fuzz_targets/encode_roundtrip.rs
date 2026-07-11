@@ -51,11 +51,11 @@ const MAX_SEGMENTS: u16 = 16;
 const MAX_LEVELS: u8 = 4;
 
 /// Build a wavelet filter from a fuzz byte. The encoder accepts any of
-/// the 8 enum values (`Reversible53` + `NineSevenA` + `FilterB..G`).
+/// the 8 enum values (`FilterQ` + `FilterA` + `FilterB..G`).
 fn pick_filter(b: u8) -> WaveletFilter {
     match b & 0x07 {
-        0 => WaveletFilter::Reversible53,
-        1 => WaveletFilter::NineSevenA,
+        0 => WaveletFilter::FilterQ,
+        1 => WaveletFilter::FilterA,
         2 => WaveletFilter::FilterB,
         3 => WaveletFilter::FilterC,
         4 => WaveletFilter::FilterD,

@@ -69,7 +69,7 @@ fn filter_q_full_quality_bit_exact_matrix() {
         for levels in 1u8..=5 {
             let img = ramp(w, h);
             let mut opts = EncodeOptions::compressed();
-            opts.filter = WaveletFilter::Reversible53;
+            opts.filter = WaveletFilter::FilterQ;
             opts.wavelet_levels = levels;
             let bytes = encode_icer(&img, &opts)
                 .unwrap_or_else(|e| panic!("encode {w}x{h} L{levels}: {e:?}"));
@@ -97,7 +97,7 @@ fn filter_q_progressive_monotone_matrix() {
             let mut prev = -1.0f64;
             for budget in [128u64, 256, 512, 1024, 2048, 4096] {
                 let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
-                opts.filter = WaveletFilter::Reversible53;
+                opts.filter = WaveletFilter::FilterQ;
                 opts.wavelet_levels = levels;
                 let bytes = encode_icer(&img, &opts).expect("encode");
                 assert!(
@@ -128,7 +128,7 @@ fn filter_a_decode_bit_exact_matrix() {
         for levels in [1u8, 2, 3] {
             let img = ramp(w, h);
             let mut opts = EncodeOptions::compressed();
-            opts.filter = WaveletFilter::NineSevenA;
+            opts.filter = WaveletFilter::FilterA;
             opts.wavelet_levels = levels;
             let bytes = encode_icer(&img, &opts)
                 .unwrap_or_else(|e| panic!("encode A {w}x{h} L{levels}: {e:?}"));
@@ -153,7 +153,7 @@ fn oversized_bit_plane_count_decodes_bit_exact() {
     let img = ramp(64, 64);
     for q in [8u8, 12, 16] {
         let mut opts = EncodeOptions::compressed();
-        opts.filter = WaveletFilter::Reversible53;
+        opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
         opts.bit_plane_count = q;
         let bytes = encode_icer(&img, &opts).expect("encode");

@@ -60,7 +60,7 @@ fn psnr(a: &IcerImage, b: &IcerImage) -> f64 {
 
 fn encode_at(img: &IcerImage, budget: u64) -> Vec<u8> {
     let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
-    opts.filter = WaveletFilter::Reversible53;
+    opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
     encode_icer(img, &opts).expect("encode failed")
 }
@@ -208,7 +208,7 @@ fn same_subband_walk_shrinks_lossless_output() {
         }
     }
     let mut opts = EncodeOptions::compressed();
-    opts.filter = WaveletFilter::Reversible53;
+    opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
     for (name, img, ceiling) in [("ramp", &ramp, 1480usize), ("checker", &checker, 1680)] {
         let bytes = encode_icer(img, &opts).expect("encode failed");
@@ -237,7 +237,7 @@ fn same_subband_walk_shrinks_lossless_output() {
 fn untruncated_filter_q_is_bit_exact() {
     let img = texture_64x64();
     let mut opts = EncodeOptions::compressed();
-    opts.filter = WaveletFilter::Reversible53;
+    opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
     let bytes = encode_icer(&img, &opts).expect("encode failed");
     let dec = parse_icer(&bytes).expect("decode failed");

@@ -79,7 +79,7 @@ fn budget_sweep_always_preserves_geometry() {
     let seg_count = 12u16;
     for budget in [16u64, 50, 120, 300, 800, 4096] {
         let mut opts = base_opts();
-        opts.filter = WaveletFilter::Reversible53;
+        opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 2;
         opts.bit_plane_count = 8;
         opts.segment_count = seg_count;
@@ -113,7 +113,7 @@ fn unbudgeted_multi_segment_unchanged() {
         *p = (i & 0xff) as u8;
     }
     let mut opts = base_opts();
-    opts.filter = WaveletFilter::Reversible53;
+    opts.filter = WaveletFilter::FilterQ;
     opts.bit_plane_count = 8;
     opts.segment_count = 8;
 

@@ -184,7 +184,7 @@ pub struct CubeEncodeOptions {
 impl Default for CubeEncodeOptions {
     fn default() -> Self {
         Self {
-            filter: WaveletFilter::Reversible53,
+            filter: WaveletFilter::FilterQ,
             wavelet_levels: 3,
             segment_count: 1,
             byte_quota: None,
@@ -615,8 +615,8 @@ mod tests {
     fn lossless_roundtrip_all_integer_filters() {
         let cube = hyperspectral_fixture(12, 10, 6);
         for filter in [
-            WaveletFilter::Reversible53,
-            WaveletFilter::NineSevenA,
+            WaveletFilter::FilterQ,
+            WaveletFilter::FilterA,
             WaveletFilter::FilterB,
             WaveletFilter::FilterC,
             WaveletFilter::FilterD,

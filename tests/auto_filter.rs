@@ -108,7 +108,7 @@ fn auto_filter_picks_filter_a_on_checkerboard() {
     let (stats, recommended) = analyze(&img);
     assert_eq!(
         recommended,
-        WaveletFilter::NineSevenA,
+        WaveletFilter::FilterA,
         "heuristic should pick filter A for checkerboard (stats={stats:?})"
     );
 
@@ -175,14 +175,14 @@ fn auto_filter_rd_picks_smallest_output() {
 
     // Measure each candidate individually.
     let q_opts = EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         uncompressed: false,
         ..EncodeOptions::default()
     };
     let q_bytes = encode_icer(&img, &q_opts).expect("Q encode failed");
 
     let a_opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         uncompressed: false,
         ..EncodeOptions::default()
     };

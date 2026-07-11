@@ -169,15 +169,15 @@ impl ImageStats {
 ///     doesn't fit either extreme.
 pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
     if stats.dynamic_range == 0 || stats.variance < 1.0 {
-        return WaveletFilter::Reversible53;
+        return WaveletFilter::FilterQ;
     }
     if stats.edge_energy < 4.0 {
-        return WaveletFilter::Reversible53;
+        return WaveletFilter::FilterQ;
     }
     if stats.edge_energy >= 16.0 && stats.variance >= 200.0 {
-        return WaveletFilter::NineSevenA;
+        return WaveletFilter::FilterA;
     }
-    WaveletFilter::Reversible53
+    WaveletFilter::FilterQ
 }
 
 /// The default candidate-filter set explored by
@@ -186,7 +186,7 @@ pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
 /// differ only in `beta` (IPN 42-155 §II.A Table 1). Callers needing
 /// the wider A-F set can pass their own candidate slice.
 pub const DEFAULT_RD_CANDIDATES: &[WaveletFilter] =
-    &[WaveletFilter::Reversible53, WaveletFilter::NineSevenA];
+    &[WaveletFilter::FilterQ, WaveletFilter::FilterA];
 
 /// Try each filter in `candidates` against `image` (using `opts` with
 /// the candidate substituted into `opts.filter`) and return the filter
@@ -833,7 +833,7 @@ mod tests {
     fn recommend_flat_picks_q() {
         let img = flat_image(16, 16, 128);
         let s = ImageStats::from_image(&img);
-        assert_eq!(recommend_filter(&s), WaveletFilter::Reversible53);
+        assert_eq!(recommend_filter(&s), WaveletFilter::FilterQ);
     }
 
     #[test]
@@ -842,7 +842,7 @@ mod tests {
         // into the low-frequency bucket -> filter Q.
         let img = ramp_image(16, 16);
         let s = ImageStats::from_image(&img);
-        assert_eq!(recommend_filter(&s), WaveletFilter::Reversible53);
+        assert_eq!(recommend_filter(&s), WaveletFilter::FilterQ);
     }
 
     #[test]
@@ -851,7 +851,7 @@ mod tests {
         // (~16256) -> heuristic picks filter A for high-frequency content.
         let img = checkerboard_image(16, 16);
         let s = ImageStats::from_image(&img);
-        assert_eq!(recommend_filter(&s), WaveletFilter::NineSevenA);
+        assert_eq!(recommend_filter(&s), WaveletFilter::FilterA);
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
         let (s, f) = analyze(&img);
         // Diagonal 1-step ramp: variance > 0 + low edge -> filter Q.
         assert!(s.variance > 0.0);
-        assert_eq!(f, WaveletFilter::Reversible53);
+        assert_eq!(f, WaveletFilter::FilterQ);
     }
 
     #[test]

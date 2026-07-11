@@ -82,7 +82,7 @@ fn high_range_64x64() -> IcerImage {
 fn full_quality_filter_q_bit_exact_through_category3() {
     for img in [texture_64x64(), high_range_64x64()] {
         let mut opts = EncodeOptions::compressed();
-        opts.filter = WaveletFilter::Reversible53;
+        opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
         let bytes = encode_icer(&img, &opts).expect("encode");
         let dec = parse_icer(&bytes).expect("decode");
@@ -102,7 +102,7 @@ fn progressive_truncation_monotone_under_category_model() {
     let mut prev = 0.0f64;
     for budget in [256u64, 512, 1024, 2048, 4096, 8192] {
         let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
-        opts.filter = WaveletFilter::Reversible53;
+        opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
         let bytes = encode_icer(&img, &opts).expect("encode");
         assert!(bytes.len() as u64 <= budget);
@@ -146,7 +146,7 @@ fn colour_filter_q_bit_exact_under_category_model() {
         }
     }
     let mut opts = EncodeOptions::compressed();
-    opts.filter = WaveletFilter::Reversible53;
+    opts.filter = WaveletFilter::FilterQ;
     let bytes = encode_icer(&img, &opts).expect("encode");
     let dec = parse_icer(&bytes).expect("decode");
     assert_eq!(dec.pixel_format, IcerPixelFormat::Yuv444P);

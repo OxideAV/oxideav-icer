@@ -121,7 +121,7 @@ fn lenient_drops_middle_segment_to_flat_128() {
     }
 
     // Received strips (segments 0, 1, 3) should round-trip close to
-    // the original ramp -- filter Q on Reversible53 is lossless on
+    // the original ramp -- filter Q on FilterQ is lossless on
     // smooth integer-rounded ramp coefficients.
     for y in 0..8 {
         for x in 0..16 {
@@ -300,7 +300,7 @@ fn lenient_filter_a_round_trip() {
     // Filter-A path: drop a middle segment from a filter-A encoding.
     let img = ramp_image(16, 12);
     let opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         segment_count: 3,
         ..EncodeOptions::compressed()
     };

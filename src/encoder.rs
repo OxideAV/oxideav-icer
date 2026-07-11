@@ -345,7 +345,7 @@ impl Default for EncodeOptions {
             // IPN 42-155 §IV does not pin the sync prefix value; pick
             // a non-zero default the round-trip tests can verify.
             sync_prefix: 0xACED,
-            filter: WaveletFilter::Reversible53,
+            filter: WaveletFilter::FilterQ,
             wavelet_levels: 3,
             bit_plane_count: 8,
             // Default to uncompressed so the round-1 self-roundtrip

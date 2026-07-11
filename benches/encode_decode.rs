@@ -9,7 +9,7 @@
 //! integration tests already cover:
 //!
 //! * `ramp_16x16` -- diagonal-gradient input over the integer 5/3
-//!   reversible filter (`WaveletFilter::Reversible53`), the bit-exact
+//!   reversible filter (`WaveletFilter::FilterQ`), the bit-exact
 //!   round-trip path. Stresses the bit-plane scanner + arithmetic
 //!   coder on a non-trivial coefficient distribution.
 //! * `smooth_16x16` -- flat mid-grey input on the same filter. Almost
@@ -58,7 +58,7 @@ fn smooth_image(w: u32, h: u32) -> IcerImage {
 
 fn compressed_filter_q_opts() -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -190,7 +190,7 @@ fn bench_uncompressed_path(c: &mut Criterion) {
 /// shared eq (3) recurrence.
 fn compressed_filter_a_opts() -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -276,7 +276,7 @@ fn bench_filter_a_path(c: &mut Criterion) {
 }
 
 /// Round 210 -- wavelet-decomposition-depth sweep on the integer 5/3
-/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// (`FilterQ`) path. The filter-Q encode/decode groups above pin
 /// the default `wavelet_levels = 2` configuration; this group sweeps
 /// `wavelet_levels` over `[1, 2, 3, 4]` on the 64x64 ramp so a
 /// regression (or, eventually, a wavelet-vectorisation win) on the
@@ -293,7 +293,7 @@ fn bench_filter_a_path(c: &mut Criterion) {
 /// stripe coverage).
 fn compressed_filter_q_opts_levels(levels: u8) -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: levels,
         bit_plane_count: 8,
         uncompressed: false,
@@ -335,7 +335,7 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
 }
 
 /// Round 225 -- segment-count sweep on the integer 5/3
-/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// (`FilterQ`) path. The filter-Q encode/decode groups above pin
 /// `segment_count = 1` (the `EncodeOptions::default` value); this group
 /// sweeps `segment_count` over `[1, 2, 4, 8]` on the 64x64 ramp so the
 /// per-strip overhead of the IPN 42-155 §III.E independent-segment
@@ -356,7 +356,7 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
 /// well above the floor.
 fn compressed_filter_q_opts_segments(segments: u16) -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -399,7 +399,7 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
 }
 
 /// Round 230 -- bit-plane-count sweep on the integer 5/3
-/// (`Reversible53`) path. The filter-Q encode/decode groups above pin
+/// (`FilterQ`) path. The filter-Q encode/decode groups above pin
 /// `bit_plane_count = 8` (the round-181 baseline); this group sweeps
 /// `bit_plane_count` over `[4, 8, 12, 16]` on the 64x64 ramp so the
 /// per-packet overhead of the IPN 42-155 §IV multi-packet ordering is
@@ -428,7 +428,7 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
 /// no-floor split is exactly the interesting dynamic.
 fn compressed_filter_q_opts_bit_planes(bit_planes: u8) -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: 2,
         bit_plane_count: bit_planes,
         uncompressed: false,
@@ -493,7 +493,7 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
 /// 4 is 4x4 = 16 coefficients) -- matches the round-210 ceiling.
 fn compressed_filter_a_opts_levels(levels: u8) -> EncodeOptions {
     EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: levels,
         bit_plane_count: 8,
         uncompressed: false,

@@ -22,7 +22,7 @@ use oxideav_icer::{
 fn synth_header(width: u16, height: u16, uncompressed: bool) -> Vec<u8> {
     let header = SegmentHeader {
         sync_prefix: 0xACED,
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         decomp_levels: 3,
         uncompressed,
         width,

@@ -177,7 +177,7 @@ fn ssim_lossless_roundtrip_is_perfect() {
     // decoded image is identical to the original and SSIM is 1.0.
     let img = ramp_image(48, 48);
     let opts = EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         ..EncodeOptions::compressed()
     };
     let bytes = encode_icer(&img, &opts).unwrap();

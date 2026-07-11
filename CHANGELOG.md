@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`WaveletFilter` variants renamed to the IPN 42-155 §II.A spec
+  names**: `Reversible53` -> `FilterQ` and `NineSevenA` -> `FilterA`
+  (the old names described the pre-spec stand-in transforms — a
+  "textbook 5/3" and a "9/7 float" — that r411 retired; filter A is
+  *not* a 9/7 filter in the spec, it is the Table 1
+  `alpha = (0, 1/4, 1/4)`, `beta = 0` reversible integer transform).
+  Wire ids are unchanged (`FilterQ = 0`, `FilterA = 1`); this is a
+  source-level API rename only. No sibling crate references the old
+  names.
+
 - **The encode/decode pipeline now runs the spec-exact IPN 42-155
   §II.A reversible integer wavelet transform for every filter**
   (`wavelet_int`), retiring the pre-spec stand-ins: the "textbook" 5/3

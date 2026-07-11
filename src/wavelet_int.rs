@@ -468,8 +468,8 @@ mod tests {
     use super::*;
 
     const ALL: [WaveletFilter; 7] = [
-        WaveletFilter::Reversible53,
-        WaveletFilter::NineSevenA,
+        WaveletFilter::FilterQ,
+        WaveletFilter::FilterA,
         WaveletFilter::FilterB,
         WaveletFilter::FilterC,
         WaveletFilter::FilterD,
@@ -609,8 +609,8 @@ mod tests {
         let original: Vec<i32> = (0..w * h).map(|i| ((i * 7) % 256) as i32 - 128).collect();
         for levels in 1..=5u8 {
             let mut buf = original.clone();
-            forward_2d_dyadic(&mut buf, w, h, levels, WaveletFilter::NineSevenA);
-            inverse_2d_dyadic(&mut buf, w, h, levels, WaveletFilter::NineSevenA);
+            forward_2d_dyadic(&mut buf, w, h, levels, WaveletFilter::FilterA);
+            inverse_2d_dyadic(&mut buf, w, h, levels, WaveletFilter::FilterA);
             assert_eq!(buf, original, "filter A {levels}-level 2-D mismatch");
         }
     }
@@ -626,7 +626,7 @@ mod tests {
         // inputs the textbook path is tested with, so a future migration
         // of the pipeline onto the spec-exact path has a known-good
         // baseline.
-        let p = WaveletFilter::Reversible53.int_params();
+        let p = WaveletFilter::FilterQ.int_params();
         for n in [4usize, 8, 16, 17] {
             let original: Vec<i32> = (0..n).map(|i| (i as i32) - (n as i32) / 2).collect();
             let mut buf = original.clone();
@@ -640,8 +640,8 @@ mod tests {
     fn filter_q_and_a_share_alpha_differ_in_beta() {
         // Table 1 cross-check: Q and A have the same alpha triple; only
         // beta differs (Q = 1/4 -> 8/32, A = 0).
-        let q = WaveletFilter::Reversible53.int_params();
-        let a = WaveletFilter::NineSevenA.int_params();
+        let q = WaveletFilter::FilterQ.int_params();
+        let a = WaveletFilter::FilterA.int_params();
         assert_eq!((q.a_m1, q.a_0, q.a_1), (a.a_m1, a.a_0, a.a_1));
         assert_eq!(q.b, 8);
         assert_eq!(a.b, 0);

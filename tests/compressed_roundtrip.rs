@@ -47,7 +47,7 @@ fn compressed_roundtrip_ramp_image_filter_q_is_bit_exact() {
     // bit-exact even for a non-trivial image.
     let original = ramp_image(8, 8);
     let opts = EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: 2,
         bit_plane_count: 8,
         uncompressed: false,
@@ -78,7 +78,7 @@ fn compressed_roundtrip_filter_a_is_bit_exact() {
     // like filter Q.
     let original = ramp_image(16, 16);
     let opts = EncodeOptions {
-        filter: WaveletFilter::NineSevenA,
+        filter: WaveletFilter::FilterA,
         wavelet_levels: 2,
         bit_plane_count: 12,
         uncompressed: false,
@@ -164,7 +164,7 @@ fn compressed_roundtrip_filter_q_multi_packet_metadata() {
     // per segment when using filter Q (one pair per bit-plane).
     let original = ramp_image(16, 16);
     let opts = EncodeOptions {
-        filter: WaveletFilter::Reversible53,
+        filter: WaveletFilter::FilterQ,
         wavelet_levels: 2,
         bit_plane_count: 4,
         uncompressed: false,
@@ -190,8 +190,8 @@ fn compressed_roundtrip_all_filters_bit_exact() {
     // and a textured ramp.
     for original in [smooth_image(16, 16), ramp_image(16, 16)] {
         for filter in [
-            WaveletFilter::Reversible53,
-            WaveletFilter::NineSevenA,
+            WaveletFilter::FilterQ,
+            WaveletFilter::FilterA,
             WaveletFilter::FilterB,
             WaveletFilter::FilterC,
             WaveletFilter::FilterD,
@@ -219,7 +219,7 @@ fn compressed_roundtrip_all_filters_bit_exact() {
 fn multi_segment_compressed_all_filters() {
     // Multi-segment encode/decode is bit-exact under every §II.A
     // filter; Q and F bracket the Table 1 parameter range.
-    for filter in [WaveletFilter::Reversible53, WaveletFilter::FilterF] {
+    for filter in [WaveletFilter::FilterQ, WaveletFilter::FilterF] {
         let original = ramp_image(16, 16);
         let opts = EncodeOptions {
             filter,

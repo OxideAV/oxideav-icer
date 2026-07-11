@@ -64,10 +64,10 @@ pub enum WaveletFilter {
     /// Filter `Q` (IPN 42-155 §II.A Table 1) -- `alpha = (0, 1/4,
     /// 1/4)`, `beta = 1/4`. Devised for ICER; the deployed lossless
     /// choice.
-    Reversible53 = 0,
+    FilterQ = 0,
     /// Filter `A` (IPN 42-155 §II.A Table 1) -- `alpha = (0, 1/4,
     /// 1/4)`, `beta = 0`. Shares filter Q's `alpha` triple.
-    NineSevenA = 1,
+    FilterA = 1,
     /// Filter `B` (Table 1) -- `alpha = (0, 2/8, 3/8)`, `beta = 2/8`.
     FilterB = 2,
     /// Filter `C` (Table 1) -- `alpha = (-1/16, 4/16, 8/16)`,
@@ -87,8 +87,8 @@ impl WaveletFilter {
     /// corruption rather than silently aliasing.
     pub fn from_bits(v: u8) -> Result<Self> {
         match v {
-            0 => Ok(WaveletFilter::Reversible53),
-            1 => Ok(WaveletFilter::NineSevenA),
+            0 => Ok(WaveletFilter::FilterQ),
+            1 => Ok(WaveletFilter::FilterA),
             2 => Ok(WaveletFilter::FilterB),
             3 => Ok(WaveletFilter::FilterC),
             4 => Ok(WaveletFilter::FilterD),

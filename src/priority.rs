@@ -1096,7 +1096,7 @@ mod tests {
     fn weight_map_is_positive_and_non_flat() {
         let w = 32usize;
         let h = 32usize;
-        let map = subband_weight_map(w, h, 3, crate::header::WaveletFilter::Reversible53);
+        let map = subband_weight_map(w, h, 3, crate::header::WaveletFilter::FilterQ);
         assert_eq!(map.len(), w * h);
         assert!(map.iter().all(|&v| v > 0.0), "all weights positive");
         let ll = map[8 * w + 8];

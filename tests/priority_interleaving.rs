@@ -124,7 +124,7 @@ fn wire_flag_and_legacy_byte_identity() {
     assert!(walked.header.priority_interleaved);
     assert_eq!(prio[2] & 0x80, 0x80);
     // Same filter / levels / geometry parse out of the shared fields.
-    assert_eq!(walked.header.filter, WaveletFilter::Reversible53);
+    assert_eq!(walked.header.filter, WaveletFilter::FilterQ);
     assert_eq!(walked.header.width, 48);
 
     // Both decode bit-exact.

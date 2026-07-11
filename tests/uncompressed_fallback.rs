@@ -196,7 +196,7 @@ fn fallback_composes_with_filter_choice() {
     // orthogonal to the filter choice on the compressed candidate.
     let img = noise_image(16, 16, 0xF00D);
     let mut opts = EncodeOptions::compressed();
-    opts.filter = WaveletFilter::NineSevenA;
+    opts.filter = WaveletFilter::FilterA;
     let opts = opts.with_uncompressed_fallback();
     let bytes = encode_icer(&img, &opts).unwrap();
     let meta = parse_icer_metadata(&bytes).unwrap();
