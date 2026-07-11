@@ -24,9 +24,8 @@ paraphrased, or cross-checked.
 | Segment header parser    | full (12-byte fixed-width framing, both directions) |
 | Packet header parser     | full (4-byte fixed-width framing, both directions) |
 | Segment walker           | full (enumerates every packet body in a buffer) |
-| Integer 5/3 wavelet      | full (forward + inverse, 1-D, 2-D one-level, dyadic D-level) |
-| Spec-exact reversible integer filters A-F + Q | full (IPN 42-155 §II.A eqs (1)-(3) + Table 1; all seven filters bit-exact reversible, 1-D + interleaved + dyadic 2-D -- see `wavelet_int`) |
-| Float wavelet filters A-G | full (1-D + 2-D + dyadic; round-trip to IEEE-754 tolerance) |
+| Integer 5/3 wavelet (legacy) | retained (pre-spec "textbook" lifting, kept as the interleaved-layout contract reference + lattice helpers; the pipeline no longer runs it -- see `wavelet_int`) |
+| Spec-exact reversible integer filters A-F + Q | full (IPN 42-155 §II.A eqs (1)-(3) + Table 1; all seven filters bit-exact reversible, 1-D + interleaved + dyadic 2-D -- see `wavelet_int`). **The encode/decode pipeline runs on it for every filter (r411)**: all seven filters are lossless end to end; lossy operation is progressive truncation only |
 | Subband de-interleave    | full (4-quadrant LL / HL / LH / HH layout) |
 | Binary arithmetic coder  | full (16-bit registers, follow-bit carry, both directions) |
 | §IV interleaved entropy coder | full (IPN 42-155 §IV.B Golomb codes G_m + §IV.D shorthand-tree component codes + **Table 10** 17-bin design + §IV.C 2048-word circular-buffer interleaving with flush bits; a selectable encode/decode backend via `EncodeOptions::with_interleaved_entropy()`, recorded in a previously-reserved segment-header bit so old streams parse unchanged -- see "Interleaved entropy coder" below) |
@@ -36,12 +35,13 @@ paraphrased, or cross-checked.
 | Bit-plane scanner        | full (stripe-ordered significance + sign + refinement passes, MSB-down) |
 | Multi-packet ordering    | full (one significance + one refinement packet per bit-plane per IPN 42-155 §IV) |
 | Subband priority model   | full (IPN 42-155 §III.A Fig. 7 per-subband priority weights + cross-subband bit-plane encode order with the LL/HL/LH/HH tie-breaks -- see `priority`) |
-| §III.A subband-priority interleaving | full (`EncodeOptions::with_priority_interleaving()` -- the spec's progressive packet schedule: subband bit planes in decreasing §III.A priority, each coded in one combined raster pass over its subband lattice with the sign immediately after the first nonzero magnitude bit (§III), persistent per-segment context model (§III.C), one packet per priority group with fat subband bit planes split out; wire flag in previously-reserved header space, pre-existing streams decode unchanged; **+4.3/+5.6 dB at deep truncation, mean +1.9 dB** vs the whole-strip MSB-down order at equal budgets -- see "Subband-priority interleaving" below) |
-| §II.B pyramid recursion (r405 fix) | full (each further dyadic stage decomposes the **LL lattice** (stride `2^j` even/even), not the top-left rectangle; all seven §II.A filters + the float path pinned by stage-invariance + linear-ramp-annihilation tests; wire-affecting fix for `levels >= 2` -- see CHANGELOG) |
+| §III.A subband-priority interleaving | full (`EncodeOptions::with_priority_interleaving()` -- the spec's progressive packet schedule: subband bit planes in decreasing §III.A priority, each coded in one combined raster pass over its subband lattice with the sign immediately after the first nonzero magnitude bit (§III), persistent per-segment context model (§III.C), one packet per priority group with fat subband bit planes split out; wire flag in previously-reserved header space, pre-existing streams decode unchanged; **+10.4 dB at deep truncation, mean +5.4 dB, every budget point positive** vs the whole-strip MSB-down order at equal budgets (re-measured r411 on the §II.A transform) -- see "Subband-priority interleaving" below) |
+| §II.B pyramid recursion (r405 fix) | full (each further dyadic stage decomposes the **LL lattice** (stride `2^j` even/even), not the top-left rectangle; all seven §II.A filters pinned by stage-invariance + linear-ramp-annihilation tests; wire-affecting fix for `levels >= 2` -- see CHANGELOG) |
 | Compressed-segment encode | full (level-shift + DWT + stripe scan + multi-packet arith) |
 | Compressed-segment decode | full (multi-packet arith + stripe scan + inverse DWT + clamp) |
 | Deadzone reconstruction point | full (IPN 42-155 §III.A; truncated streams reconstruct significant coefficients at the mid-bin `±((i+1/2)∆-1)` point biased toward the origin, ∆=2^b; the deadzone exponent `b` is tracked **per coefficient** so a budget cut that lands between a plane's significance and refinement packets reconstructs newly-significant and already-significant coefficients at their own bin widths; insignificant coefficients at the deadzone centre. +0.5..+3.8 dB on bit-plane-boundary truncation, a further +1.4..+3.0 dB on mid-plane (refinement-dropped) cuts; untruncated filter-Q stays bit-exact -- see "Deadzone reconstruction" below) |
-| Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target; budget-truncated multi-segment encodes emit a zero-body placeholder header for every dropped strip so the decoded image always frames the full geometry -- a tiny budget no longer shrinks the image height, IPN 42-155 §V.B) |
+| Quota-controlled encoding | full (`with_byte_budget` hard cap + `with_target_bytes` soft target; every budget path frames the full image geometry, IPN 42-155 §V.B) |
+| §VI.B cross-segment progressive quota | full (a quota on a multi-segment encode truncates the **global interleaved** packet stream -- each segment of a bit plane before the next bit plane -- then rearranges the survivors per segment, IPN 42-155 §VI.B Fig. 23; replaces the sequential-greedy allocation that deep-refined segment 0 while later segments starved: row strips at equal budgets gain +8.8..+16.3 dB, transform-domain 500 B MSE 2960 -> 402, both monotone in budget; ample budgets proven byte-identical to the unbudgeted encode; ROI priorities / rd_pruning / §III.D fallback keep their per-segment scheduling -- see `tests/quota_interleave.rs`) |
 | Multi-segment images     | full (row-strip split on encode, stitch by `segment_index` on decode) |
 | Uncompressed-segment decode | full (IPN 42-155 §III.D; placeholder-segment tolerant) |
 | Uncompressed-segment encode | full (IPN 42-155 §III.D) |
@@ -57,23 +57,22 @@ paraphrased, or cross-checked.
 | Encode-side fuzz harness | full (`fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
 | Quality-target rate-control | full (`EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget`. Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op; above-ceiling targets return the unbudgeted encode as best-effort) |
 | Post-decode quality metrics | full (`DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae` + `ssim` -- mean structural-similarity index over a sliding 8x8 window; all spec-neutral) |
-| Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on both the integer 5/3 (filter Q) and float 9/7 (filter A) paths -- see Benchmarks below) |
+| Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on the §II.A filter-Q and filter-A paths -- see Benchmarks below) |
 | Colour (YUV 4:4:4) encode + decode | full (IPN 42-155 §III independent-per-component scheme; each plane is its own single-plane ICER bitstream behind a `plane_container` header; filter-Q + uncompressed round-trips bit-exact across all three planes; Gray8 wire form byte-for-byte unchanged -- see "Colour images" below) |
 | ICER-3D 3-D wavelet decomposition | full (IPN 42-164 §III.A staged decomposition -- spatially-low-pass / spectrally-high-pass subbands keep decomposing spatially; bit-exact reversible for all seven §II.A integer filters across degenerate geometries -- see `wavelet3d`) |
 | ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
 | ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
 | ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip segments, `DecodeLimits` caps -- see "ICER-3D" below) |
 | §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; `partition` + the §V.B maps `ll_segment_map` / `coefficient_segment_map`) |
-| §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment is pixel-exact-contained outside a small wavelet-support bleed -- see "Transform-domain segmentation" below) |
+| §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment's loss decays to bit-exact outside a bounded wavelet-support bleed -- see "Transform-domain segmentation" below) |
 | §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
 
 End-to-end round-trips:
 
 * Uncompressed Gray8 -- bit-identical.
-* Compressed Gray8 with filter `Q` (lossless integer 5/3) -- bit-identical
-  via stripe-ordered bit-plane scanner + multi-packet arithmetic coder.
-* Compressed Gray8 with float filters A-G -- bounded mean-abs error
-  (lossy, as expected from float lifting + integer rounding).
+* Compressed Gray8 with **any of the seven §II.A filters (A-F + Q)** --
+  bit-identical via the spec-exact reversible integer transform +
+  stripe-ordered bit-plane scanner + multi-packet arithmetic coder.
 * Multi-segment row-strip split -- bit-identical for the uncompressed path,
   bit-identical for compressed filter `Q`.
 * Multi-packet metadata: segment with q=4 bit-planes produces >= 8 packets
@@ -82,8 +81,8 @@ End-to-end round-trips:
   filter-Q full-quality decode is bit-exact across geometries
   17×13 / 31×31 / 64×64 / 5×200 / 200×5 and decomposition levels 1..=5
   (including odd / thin strips and over-deep pyramids); progressive
-  truncation is monotone in budget in every cell; the float 9/7 (filter
-  A) path stays within a bounded error; and an oversized `bit_plane_count`
+  truncation is monotone in budget in every cell; the filter-A path is
+  bit-exact across the same geometries; and an oversized `bit_plane_count`
   (8 / 12 / 16) still decodes bit-exact.
 
 ## Spec-exact reversible integer filters (IPN 42-155 §II.A)
@@ -110,28 +109,29 @@ tests). `WaveletFilter::int_params()` exposes the Table 1 parameters scaled to
 a common denominator of 32 so the equation-(3) predictor evaluates with a
 single floor-division.
 
-> **Errata note.** The older "float wavelet filters A-G" framing below predates
-> the staged spec. IPN 42-155 §II.A defines **seven** filters (A-F + Q), all
-> integer-reversible; there is no "filter G", and filters A-F are *not* lossy
-> float filters. The float path remains in the crate for backward-compatible
-> round-trip tests, but `wavelet_int` is the spec-conformant transform.
+> **Errata note (resolved r411).** The crate's early rounds carried a
+> pre-spec "float wavelet filters A-G" framing (lossy float lifting for
+> A-F plus an invented "filter G"). IPN 42-155 §II.A defines **seven**
+> filters (A-F + Q), all integer-reversible, and no filter G. The
+> pipeline has been migrated onto `wavelet_int` for every filter, the
+> float module is deleted, and wire filter id 7 is reserved-invalid
+> again. Streams encoded by earlier revisions decode to different
+> pixels (self-defined pre-1.0 wire; no external interop existed).
 
 ## Wavelet filter coverage
 
-The pre-spec framing below describes the legacy float lifting path; see the
-section above for the spec-exact integer transform. IPN 42-155 §III.A
-enumerates eight candidate wavelet filters: A through G
-(float lifting variants) plus Q (integer 5/3). All eight are implemented:
+All seven §II.A filters drive the full pipeline and are lossless end
+to end. Measured lossless byte counts on the textured 64x64 fixture
+(3-level DWT, arithmetic backend) show the per-filter spread the
+paper's §II.D lossless comparison describes:
 
-* Filter `Q` (the integer 5/3 reversible lifting filter) -- bit-exact integer
-  round-trip.
-* Filters `A` through `F` (float CDF-style + Daubechies + Haar lifting
-  variants) -- float-precision round-trip to IEEE-754 tolerance, lossy through
-  the integer coefficient quantisation step.
-* Filter `G` (Le Gall 5/3 float variant, IPN 42-155 §III.A) -- same
-  predict/update shape as filter Q (alpha=-0.5, beta=0.25) applied in
-  floating point with an orthonormal post-scale (zeta = sqrt(2)/2). Lossy
-  like filters A-F. Completes the full A-G filter set.
+| filter | Q | A | D | B | E | C | F |
+|--------|--:|--:|--:|--:|--:|--:|--:|
+| bytes  | 3149 | 3148 | 3148 | 3160 | 3205 | 3213 | 3241 |
+
+The ranking is image-dependent (§II.D publishes a different ranking on
+12-bit Mars imagery than its lossy comparison); `with_auto_filter_rd()`
+finds the empirical winner per image.
 
 ## Context model (IPN 42-155 §III.B)
 
@@ -294,11 +294,12 @@ strip-global behaviour; the gain is on the common mid-plane cut.
 
 **Empirical PSNR gain on mid-plane cuts** (textured 64×64 image, filter Q,
 3-level DWT, `with_byte_budget`; per-coefficient deadzone vs. the strip-global
-single-`b` reconstruction; measured pre-r405 — the §II.B pyramid fix moved
-the packet boundaries, so `tests/truncation_fidelity.rs` carries the
-recalibrated floors). Boundary budgets (output 841 / 1477 / 2096 / 3791
-bytes) are unchanged; the rows below are the budgets whose cut drops a
-refinement packet:
+single-`b` reconstruction; measured pre-r405 — both the r405 §II.B
+pyramid fix and the r411 §II.A transform migration moved the packet
+boundaries since, so treat the table as the historical demonstration of
+the per-coefficient mechanism; `tests/truncation_fidelity.rs` carries
+the current recalibrated floors. The rows below are the budgets whose
+cut dropped a refinement packet at measurement time:
 
 | output bytes | strip-global | per-coefficient |     Δ |
 |-------------:|-------------:|----------------:|------:|
@@ -471,26 +472,27 @@ subband bit planes drop out of the schedule on both sides);
 already places every packet at its distortion-priority position).
 
 **Measured** (textured 64×64, filter Q, 3 levels, equal `byte_budget`,
-PSNR of the truncated decode vs the whole-strip MSB-down order):
+PSNR of the truncated decode vs the whole-strip MSB-down order;
+re-measured r411 on the §II.A transform):
 
 | budget (B) | MSB-down | §III.A interleaved | gain |
 |-----------:|---------:|-------------------:|-----:|
-| 250  | 17.77 dB | 22.11 dB | **+4.34** |
-| 500  | 17.77 dB | 23.32 dB | **+5.55** |
-| 750  | 22.86 dB | 24.45 dB | +1.59 |
-| 1000 | 22.86 dB | 26.03 dB | +3.17 |
-| 1500 | 28.97 dB | 30.55 dB | +1.58 |
-| 2000 | 35.67 dB | 37.26 dB | +1.59 |
-| 2500 | 42.30 dB | 39.65 dB | -2.65 |
-| 3000 | 45.40 dB | 45.78 dB | +0.38 |
+| 250  | 16.07 dB | 26.50 dB | **+10.43** |
+| 500  | 22.09 dB | 28.75 dB | **+6.66** |
+| 750  | 27.54 dB | 30.63 dB | +3.09 |
+| 1000 | 27.54 dB | 31.49 dB | +3.95 |
+| 1500 | 33.24 dB | 36.97 dB | +3.73 |
+| 2000 | 39.71 dB | 40.54 dB | +0.83 |
+| 2500 | 41.31 dB | 46.74 dB | +5.43 |
+| 3000 | 44.40 dB | 53.20 dB | +8.80 |
 
-Mean +1.9 dB; the single negative point is the "scalloping" effect the
-paper itself documents for priority-boundary quantisation (§VI.B
-discussion). Deep truncation — the deep-space downlink case §III.A
-exists for — wins decisively. Cost: ~+3% on the *lossless* byte count
-(3650 vs 3537 B on the same fixture) from the finer packetisation
-(more headers + entropy flushes); pure-lossless archival should keep
-the default order.
+Mean +5.4 dB, every point positive (the pre-r411 sweep had one
+"scalloping" outlier; under the §II.A transform the schedule wins
+everywhere on this fixture). Deep truncation — the deep-space
+downlink case §III.A exists for — wins decisively. Cost: ~+2.2% on
+the *lossless* byte count (3218 vs 3149 B on the same fixture) from
+the finer packetisation (more headers + entropy flushes);
+pure-lossless archival should keep the default order.
 
 ## Transform-domain segmentation (IPN 42-155 §V.B + §V.D)
 
@@ -527,19 +529,23 @@ Properties (all pinned by `tests/transform_segments.rs`):
 
 * Filter-Q full-quality decode is **bit-exact** across geometries,
   segment counts, both entropy backends, and colour 4:4:4.
-* Whole-image decorrelation beats the row-strip convention at equal
+* Whole-image decorrelation edges the row-strip convention at equal
   segment count: textured 128×128, filter Q lossless, 8 segments emits
-  **14576 B vs 14656 B** (re-measured after the r405 §II.B pyramid
-  fix; the fixed pyramid decorrelates row strips much better too, so
-  the gap narrowed); and §V.B's strip-boundary artifact
+  **13014 B vs 13016 B** (re-measured r411 on the §II.A transform;
+  the spec-exact pyramid decorrelates row strips nearly as well, so
+  the gap is small); and §V.B's strip-boundary artifact
   ("Fig. 15(a)") cannot occur because there is only one transform.
-* **Error containment**: dropping any one segment from the stream
-  leaves every pixel outside a `3·2^D` dilation of that segment's
-  image-domain rectangle **bit-identical** to the full decode; the
-  lost region degrades to a smooth low-detail patch (zero coefficients
-  through the shared inverse transform), not a flat-128 strip. The
-  lenient decoder no longer needs segment 0 — *any* surviving segment
-  pins the full geometry.
+* **Error containment**: dropping any one segment leaves the loss
+  confined to the segment plus a *decaying* wavelet-support bleed —
+  the §II.A inverse eq (3) recursion (`d[n] = h[n] + predictor(...,
+  d[n+1])`) propagates a floor-truncated, geometrically-decaying tail
+  rather than a hard support cutoff. Pinned profile: residual at most
+  ±4 grey levels beyond a `3·2^D` dilation of the segment's
+  image-domain rectangle, **bit-identical** beyond `8·2^D`; the lost
+  region itself degrades to a smooth low-detail patch (zero
+  coefficients through the shared inverse transform), not a flat-128
+  strip. The lenient decoder no longer needs segment 0 — *any*
+  surviving segment pins the full geometry.
 * Byte budgets compose: whole segments are scheduled in ROI-priority
   order, each internally truncated MSB-down, dropped segments leave
   placeholder headers, and the full image geometry is always framed.
@@ -588,11 +594,12 @@ let opts = oxideav_icer::EncodeOptions::compressed()
 loss-tolerant decoder learns it from any surviving packet; 0 is the
 historical value, so every pre-existing stream decodes unchanged, and
 `with_min_loss(0)` is proven byte-identical to the plain encode.
-Measured byte curve (textured 128×128, filter Q, 3 levels):
+Measured byte curve (textured 128×128, filter Q, 3 levels;
+re-measured r411 on the §II.A transform):
 
 | M | 0 | 1 | 2 | 3 | 4 | 6 | 8 |
 |---|--:|--:|--:|--:|--:|--:|--:|
-| bytes | 13822 | 13298 | 11569 | 9469 | 7170 | 2126 | 316 |
+| bytes | 12246 | 11718 | 9935 | 7707 | 5205 | 994 | 274 |
 
 Composes with row strips, §V.B transform-domain segments, both entropy
 backends, and the byte quota; monotone in bytes and MSE by test.
@@ -621,11 +628,6 @@ min-loss since r383; this is the 2-D §VI.A realisation.
   (The earlier §III.B same-subband-neighbour approximation is **resolved** --
   see "Per-subband context tables" above; the scanner now walks the
   spec-exact same-subband neighbourhood.)
-* **Per-filter lifting coefficients** -- *resolved by the staged spec.* The
-  IPN 42-155 §II.A Table 1 parameters for all seven filters (A-F + Q) are now
-  transcribed in `wavelet_int`; the legacy float path's CDF 9/7 + Daubechies +
-  Haar parameters were a pre-spec stand-in. The spec-exact integer transform is
-  the one to migrate the encode/decode pipeline onto.
 * **Chroma subsampling**. Colour support (`IcerPixelFormat::Yuv444P`) is
   implemented for co-sited 4:4:4 (see "Colour images" below). Subsampled
   layouts (4:2:2 / 4:2:0) and the RGB↔YCbCr colour-transform stage are
@@ -665,21 +667,26 @@ to "the implementation":
   neighbours at the subband stride `2^level`, with off-strip neighbours
   treated as not-significant per §III.B; the spatial-raster approximation
   is retired.
-* **Per-filter lifting coefficients** for `A` through `G` (see above).
+* **Per-filter lifting coefficients** -- *resolved.* IPN 42-155 §II.A
+  Table 1 publishes the parameters for all seven filters; `wavelet_int`
+  transcribes them and (since r411) the whole pipeline runs on it.
 
 ## Automatic filter selection
 
-ICER's eight wavelet filters (A-G plus Q) have different rate-distortion
-profiles depending on image content. IPN 42-155 §I notes that the choice
-is image-dependent but does not prescribe a fixed mapping. Two ways let
-the encoder pick the filter:
+ICER's seven wavelet filters (A-F plus Q) have different
+rate-distortion and lossless-rate profiles depending on image content
+(IPN 42-155 §II.D "Quantitative Filter Comparison" shows the two
+rankings even differ from each other). Every filter is losslessly
+reversible, so the choice only moves the byte count and the truncated
+progressive quality. Two ways let the encoder pick the filter:
 
 * **Heuristic** (`EncodeOptions::with_auto_filter()`): a one-pass scan
   computes image statistics (mean, variance, horizontal + vertical
   gradient energy, dynamic range) via `analyze::ImageStats::from_image`,
   then `analyze::recommend_filter` runs a transparent decision tree:
-  flat / low-frequency content gets filter `Q` (reversible 5/3);
-  high-frequency, high-variance content gets filter `A` (CDF 9/7).
+  flat / low-frequency content gets filter `Q`; high-frequency,
+  high-variance content gets filter `A` (same `alpha` triple as Q,
+  `beta = 0`, §II.A Table 1).
   Cost: `O(width*height)`, single encode pass.
 * **Rate-distortion** (`EncodeOptions::with_auto_filter_rd()`):
   trial-encodes the image once per candidate filter and returns the
@@ -737,12 +744,12 @@ let decoded = parse_icer(&bytes)?;
 ```
 
 **Empirical measurement** (128-row image, 4 segments, 900-byte budget
-— re-measured after the r405 §II.B pyramid fix moved the per-segment
-byte counts; centre + periphery mean-absolute error vs. original):
+— re-measured r411 on the §II.A transform; centre + periphery
+mean-absolute error vs. original):
 
 | metric          | value |
 |-----------------|------:|
-| centre band MAE | 33.72 |
+| centre band MAE | 34.13 |
 | periphery MAE   | 84.00 |
 
 The centre band's MAE is ~60% lower than the periphery's; under
@@ -754,21 +761,23 @@ The priority vector is validated at encode-time (length match,
 permutation property); a malformed vector returns
 `IcerError::Unsupported`.
 
-**Empirical byte counts** (32x32 test inputs, default 3-level DWT, q=8):
+**Empirical byte counts** (32x32 test inputs, default DWT depth, q=8;
+re-measured r411 on the §II.A transform — every cell is lossless):
 
-| image          | filter Q | filter A | heuristic pick    | RD pick |
-|----------------|---------:|---------:|-------------------|--------:|
-| flat           |     124  |     124  | 124 (=Q)          |    124  |
-| diagonal ramp  |     516  |     538  | 516 (=Q)          |    516  |
-| checkerboard   |     283  |     413  | 413 (=A, lossy)   |    283  |
+| image          | filter Q | filter A | heuristic pick | RD pick |
+|----------------|---------:|---------:|----------------|--------:|
+| flat           |     108  |     108  | 108 (=Q)       |    108  |
+| diagonal ramp  |     149  |     145  | 149 (=Q)       |    145  |
+| checkerboard   |     393  |     325  | 325 (=A)       |    325  |
 
-The checkerboard row illustrates the trade-off: the heuristic follows
-wavelet-theory intuition (high edge energy -> biorthogonal 9/7) and
-picks filter `A` (which is also lossy on this input); the
-rate-distortion mode empirically determines that filter `Q` (lossless
-integer 5/3) actually produces fewer bytes on this implementation's
-arithmetic coder. Use the heuristic when you want zero per-image
-overhead; use RD-mode when you want the true minimum.
+On the checkerboard the heuristic's high-edge-energy pick (filter A)
+is now also the byte winner — under the spec-exact integer transforms
+filter A's `beta = 0` predictor genuinely codes the all-HH content in
+fewer bytes, and there is no lossless-vs-lossy trade left to weigh.
+The ramp shows the residual gap the heuristic accepts: it stays on Q
+(149 B) where RD finds A 4 bytes smaller. Use the heuristic when you
+want zero per-image overhead; use RD-mode when you want the true
+minimum.
 
 ## Rate-distortion budget pruning
 
@@ -805,17 +814,14 @@ order -- only the *set* of included packets changes vs. the strict
 mode, not the ordering of those kept.
 
 **Empirical win** (single-segment compressed encode, filter Q,
-64×64 sparse-impulse fixture, re-measured after the r405 §II.B
-pyramid fix — the fixed pyramid moved every packet boundary, so the
-demonstration fixture moved from the checkerboard, whose content now
-lands cleanly in the level-1 HH planes where strict order is already
-R-D-optimal):
+64×64 sparse-impulse fixture, re-measured r411 on the §II.A
+transform):
 
-| fixture        | budget | strict-MSB       | R-D              |
-|----------------|-------:|------------------|------------------|
-| sparse impulse | 250 B  | 227 B / 44.87 dB | 247 B / **51.87 dB** |
+| fixture        | budget | strict-MSB | R-D              |
+|----------------|-------:|------------|------------------|
+| sparse impulse | 250 B  | 46.01 dB   | **50.49 dB**     |
 
-The +7.0 dB win comes from the selector recognising that the strict
+The +4.5 dB win comes from the selector recognising that the strict
 cut's tail bytes go to a wide low-value significance packet while the
 high-value refinement packets that fit individually are skipped; R-D
 reallocates the residual budget to them. The greedy plan is validated
@@ -914,7 +920,9 @@ Algorithm:
      above this ceiling).
 2. Upper-bracket trial: if the unbudgeted encode misses `target_db`,
    return it as the best effort (no smaller encode can meet the
-   target).
+   target). Since r411 the unbudgeted compressed encode is lossless
+   under every filter (PSNR `+inf`), so this branch fires only in
+   principle; every finite target is reachable.
 3. Lower-bracket trial: if the floor encode already meets the target
    (lossless filter Q on a flat or near-flat input lands here),
    return it.
@@ -949,6 +957,20 @@ exhausted** — is fully implemented. Anything not yet emitted simply
 isn't transmitted; the decoder reconstructs at whatever quality the
 truncation point allows. This is exactly how the Mars rovers compress
 every image.
+
+On a multi-segment encode (row strips or §V.B transform-domain) the
+quota is applied per IPN 42-155 §VI.B: the packet stream is the
+*global interleave* across segments (each segment of a bit plane
+before the next bit plane), the quota truncates that interleaved
+stream, and the surviving packets are rearranged per segment for
+transmission (Fig. 23(b)) — so every segment receives its
+most-significant packets and quality is monotone in the budget.
+Measured on the textured 64×64 4-strip fixture the §VI.B interleave
+gains +8.8..+16.3 dB over the earlier sequential-greedy allocation at
+equal mid-range budgets (see `tests/quota_interleave.rs`). ROI
+`segment_priorities` / `with_center_roi` keep the sequential
+whole-segment scheduling — starving the periphery is that mode's
+point.
 
 ```rust
 let opts = EncodeOptions::compressed()
@@ -1020,24 +1042,23 @@ OOM:
 * `parse_icer` -- full decode (arith coder + inverse DWT + stitch).
 
 The seed corpus under `fuzz/corpus/decode_segment/` is generated
-from icer's own encoder: an
-uncompressed ramp, compressed filter-Q ramps + flat, a two-segment
-split, and a byte-budget-truncated input covering the partial-
-packet path.
+from icer's own encoder: an uncompressed ramp, compressed filter-Q
+ramps + flat, filter-A and filter-F §II.A streams, a two-segment
+split, byte-budget-truncated inputs covering the partial-packet path,
+§V.B transform-domain + §VI.A minimum-loss + §III.A
+priority-interleaved wire modes, §VI.B budget-truncated multi-segment
+streams (row-strip and transform-domain), and ICER-3D cubes.
 
 ```bash
 cd fuzz
 cargo +nightly fuzz run decode_segment -- -max_total_time=60
 ```
 
-Local 60-second run: 11612 iterations, 0 crashes. One slow-unit
-documented: a 69-byte input with width=223, height=65312 allocates
-~14.5 MB and runs `parse_icer` in ~800 ms (release). This is a
-pre-existing DoS surface: the wire format admits any (width,
-height) in `u16 * u16`, so a malicious 12-byte segment header
-can request up to ~4 GB of decoder-side allocation per plane.
-Not a fuzz crash; documented for a future header-validation pass
-(application-supplied max-geometry cap).
+Local bounded runs on the r411 pipeline (§II.A transform + §VI.B
+quota): `decode_segment` 45132 iterations / 120 s and
+`encode_roundtrip` 7231 iterations / 180 s, 0 crashes. (The
+historical geometry-DoS surface — a 12-byte header requesting ~4 GB
+of decode allocation — is closed by the `DecodeLimits` caps below.)
 
 A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
 budget; OxideAV reusable workflow).
@@ -1301,24 +1322,24 @@ opt-level, `--quick` smoke):
 
 | Group                                  | Time   | Throughput |
 |----------------------------------------|--------|------------|
-| `encode_compressed_filter_q/ramp_64x64`| ~326 µs| ~12.0 MiB/s|
-| `decode_compressed_filter_q/ramp_64x64`| ~345 µs| ~11.3 MiB/s|
-| `encode_compressed_filter_a/ramp_64x64`| ~334 µs| ~11.7 MiB/s|
-| `decode_compressed_filter_a/ramp_64x64`| ~350 µs| ~11.3 MiB/s|
-| `uncompressed_path_64x64/encode`       | ~207 ns| ~18.4 GiB/s|
-| `uncompressed_path_64x64/decode`       | ~326 ns| ~11.7 GiB/s|
-| `cube3d_filter_q_32x32x16/encode`      | ~2.4 ms| ~12.9 MiB/s|
-| `cube3d_filter_q_32x32x16/decode`      | ~2.4 ms| ~13.0 MiB/s|
+| `encode_compressed_filter_q/ramp_64x64`| ~322 µs| ~12.1 MiB/s|
+| `decode_compressed_filter_q/ramp_64x64`| ~364 µs| ~10.7 MiB/s|
+| `encode_compressed_filter_a/ramp_64x64`| ~345 µs| ~11.3 MiB/s|
+| `decode_compressed_filter_a/ramp_64x64`| ~372 µs| ~10.5 MiB/s|
+| `uncompressed_path_64x64/encode`       | ~198 ns| ~19.3 GiB/s|
+| `uncompressed_path_64x64/decode`       | ~327 ns| ~11.7 GiB/s|
+| `cube3d_filter_q_32x32x16/encode`      | ~2.7 ms| ~11.7 MiB/s|
+| `cube3d_filter_q_32x32x16/decode`      | ~2.5 ms| ~12.6 MiB/s|
 
-(2-D numbers refreshed after the r405 §II.B pyramid fix: the true
-pyramid produces different coefficient statistics, so the entropy
-stage does more real work per image — the fixed transform codes more
-genuinely-significant coefficients on the ramp fixtures.)
+(2-D numbers refreshed r411 after the pipeline migration onto the
+§II.A integer transform.)
 
-The filter-A groups cover the lossy float 9/7 CDF lifting path on
-the same input shapes; the Q-vs-A delta on the 64×64 ramp is ~5% on
-encode and ~1% on decode (the inverse-DWT cost is dominated by the
-entropy coder). The two-order-of-magnitude gap between the compressed
+The filter-A groups run the same §II.A integer recurrence as filter Q
+with the Table 1 filter-A parameters (`beta = 0` skips the `d[n+1]`
+predictor term); the Q-vs-A delta on the 64×64 ramp is ~7% on encode
+and ~2% on decode — dominated by the entropy stage coding the two
+filters' different coefficient statistics, not the transform
+arithmetic. The two-order-of-magnitude gap between the compressed
 and uncompressed paths sets the dynamic range available to future
 entropy-coder and wavelet vectorisation work. CI's
 `cargo build --all-targets` step exercises the bench file as a
@@ -1329,11 +1350,12 @@ each one's cost is readable in isolation rather than averaged into a
 single default:
 
 * **`wavelet_levels` over `[1, 2, 3, 4]`** (both filter Q and filter
-  A): encode rises with depth (each level adds a forward-lifting pass
-  + bit-plane scan); decode flattens past depth 3 as the entropy stage
-  dominates and the LL subband shrinks to 16 coefficients. Filter A is
-  consistently ~40% slower on encode than filter Q, quantifying the
-  float-vs-integer lifting overhead.
+  A): encode rises with depth (each level adds a forward pass over the
+  shrinking LL lattice + bit-plane scan); decode flattens past depth 3
+  as the entropy stage dominates and the LL subband shrinks to 16
+  coefficients. Since r411 both filters run the same §II.A integer
+  recurrence, so the per-depth Q-vs-A slopes track each other; the
+  sweep is retained to catch a divergence.
 * **`segment_count` over `[1, 2, 4, 8]`** (filter Q): each segment
   carries its own header + arithmetic-coder context + stripe scan, so
   fixed per-segment cost accumulates as strip payloads shrink. Encode
