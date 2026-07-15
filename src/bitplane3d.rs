@@ -45,13 +45,15 @@ use crate::subband3d::{cube_schedule, enumerate_subbands, stage_counts, Subband3
 /// = 1/2, no model adaptation.
 const UNCODED_P1: (u32, u32) = (1, 2);
 
-/// Geometry of one coded cube (an error-containment segment's strip):
-/// dimensions, effective stage counts, and the subband set in Appendix
-/// index order with per-subband member lattices.
+/// Geometry of one coded cube region — either a whole cube / row strip
+/// (the full spatial extent) or one §V.D error-containment segment's
+/// spatial window of a shared whole-cube transform: dimensions,
+/// effective stage counts, and the subband set in Appendix index order
+/// with per-subband member lattices.
 pub struct CubeGeometry {
-    /// Spatial width in samples.
+    /// Spatial width of the coefficient buffer, in samples.
     pub width: usize,
-    /// Spatial height in samples (of this segment's strip).
+    /// Spatial height of the coefficient buffer, in samples.
     pub height: usize,
     /// Spectral band count.
     pub bands: usize,
@@ -68,6 +70,17 @@ pub struct CubeGeometry {
     members: Vec<SubbandMembers>,
 }
 
+/// First lattice position `>= lo` on the lattice `{offset, offset + s,
+/// offset + 2s, ...}`.
+#[inline]
+fn lattice_start(offset: usize, stride: usize, lo: usize) -> usize {
+    if lo <= offset {
+        offset
+    } else {
+        offset + (lo - offset).div_ceil(stride) * stride
+    }
+}
+
 struct SubbandMembers {
     /// Spatial positions in raster order (y-major).
     xy: Vec<(usize, usize)>,
@@ -81,6 +94,26 @@ impl CubeGeometry {
     /// Resolve the geometry for a `width x height x bands` cube at the
     /// requested decomposition depth.
     pub fn new(width: usize, height: usize, bands: usize, levels: u8) -> Self {
+        Self::with_window(width, height, bands, levels, (0, width, 0, height))
+    }
+
+    /// Resolve the geometry of one §V.D error-containment segment of a
+    /// whole-cube transform: the coefficient buffer spans the full
+    /// `width x height x bands` cube (stage counts are the whole-cube
+    /// counts — one shared transform), but the coded members are
+    /// restricted to the segment's spatial window
+    /// `(x0, x1, y0, y1)` (half-open), across **all** spectral bands
+    /// (IPN 42-164 §II.B: "in ICER-3D the segments extend through all
+    /// spectral bands").
+    pub fn with_window(
+        width: usize,
+        height: usize,
+        bands: usize,
+        levels: u8,
+        window: (usize, usize, usize, usize),
+    ) -> Self {
+        let (x0, x1, y0, y1) = window;
+        let (x1, y1) = (x1.min(width), y1.min(height));
         let (ts, tl) = stage_counts(width, height, bands, levels);
         let subbands = enumerate_subbands(ts, tl);
         let members = subbands
@@ -88,10 +121,10 @@ impl CubeGeometry {
             .map(|sb| {
                 let (xo, yo, sstride) = sb.spatial_lattice();
                 let mut xy = Vec::new();
-                let mut y = yo;
-                while y < height {
-                    let mut x = xo;
-                    while x < width {
+                let mut y = lattice_start(yo, sstride, y0);
+                while y < y1 {
+                    let mut x = lattice_start(xo, sstride, x0);
+                    while x < x1 {
                         xy.push((x, y));
                         x += sstride;
                     }
@@ -122,7 +155,9 @@ impl CubeGeometry {
         }
     }
 
-    /// Number of samples in the cube.
+    /// Number of samples in the cube (the coefficient *buffer* volume —
+    /// for a windowed segment geometry this is the whole cube, not the
+    /// member count).
     pub fn volume(&self) -> usize {
         self.width * self.height * self.bands
     }
@@ -131,6 +166,24 @@ impl CubeGeometry {
     /// the largest magnitude, capped at 30). Zero for an all-zero cube.
     pub fn bit_planes_needed(coeffs: &[i32]) -> u8 {
         let max_mag = coeffs.iter().map(|&c| c.unsigned_abs()).max().unwrap_or(0);
+        (32 - max_mag.leading_zeros()).min(30) as u8
+    }
+
+    /// Number of magnitude bit planes needed to code this geometry's
+    /// **members** of `coeffs` (the windowed counterpart of
+    /// [`Self::bit_planes_needed`]: a §V.D segment's `q` depends only on
+    /// its own coefficients, IPN 42-155 §V.B independence).
+    pub fn member_bit_planes_needed(&self, coeffs: &[i32]) -> u8 {
+        let plane = self.width * self.height;
+        let mut max_mag = 0u32;
+        for m in &self.members {
+            for &lambda in &m.lambdas {
+                let base = lambda * plane;
+                for &(x, y) in &m.xy {
+                    max_mag = max_mag.max(coeffs[base + y * self.width + x].unsigned_abs());
+                }
+            }
+        }
         (32 - max_mag.leading_zeros()).min(30) as u8
     }
 }
@@ -397,6 +450,24 @@ pub fn decode_cube_bitplanes(
     q: u8,
     kind: EntropyKind,
 ) -> Result<Vec<i32>> {
+    let mut coeffs = vec![0i32; geom.volume()];
+    decode_cube_bitplanes_into(geom, packets, q, kind, &mut coeffs)?;
+    Ok(coeffs)
+}
+
+/// [`decode_cube_bitplanes`] into a caller-provided whole-cube
+/// coefficient buffer: only this geometry's **member** positions are
+/// written, so §V.D segment geometries sharing one transform can each
+/// decode into the same buffer (IPN 42-164 §II.B — segments are
+/// independently coded regions of a single wavelet-transformed cube).
+pub fn decode_cube_bitplanes_into(
+    geom: &CubeGeometry,
+    packets: &[(u8, &[u8])],
+    q: u8,
+    kind: EntropyKind,
+    coeffs: &mut [i32],
+) -> Result<()> {
+    debug_assert_eq!(coeffs.len(), geom.volume());
     let plan = cube_schedule(&geom.subbands, q);
     let mut state = CoderState::new(geom.volume());
     let mut model = new_model();
@@ -430,7 +501,6 @@ pub fn decode_cube_bitplanes(
     }
 
     // Reconstruct with the per-subband deadzone offset.
-    let mut coeffs = vec![0i32; geom.volume()];
     let plane = geom.width * geom.height;
     for (sb_idx, m) in geom.members.iter().enumerate() {
         let bm = b_min[sb_idx];
@@ -439,15 +509,18 @@ pub fn decode_cube_bitplanes(
             for &(x, y) in &m.xy {
                 let idx = lambda * plane + y * geom.width + x;
                 let mag = state.mag[idx];
-                if mag == 0 {
-                    continue;
-                }
-                let v = (mag + offset) as i32;
-                coeffs[idx] = if state.neg[idx] { -v } else { v };
+                let v = if mag == 0 {
+                    0
+                } else if state.neg[idx] {
+                    -((mag + offset) as i32)
+                } else {
+                    (mag + offset) as i32
+                };
+                coeffs[idx] = v;
             }
         }
     }
-    Ok(coeffs)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -598,6 +671,85 @@ mod tests {
         assert!(packets.is_empty());
         let decoded = decode_cube_bitplanes(&geom, &[], q, EntropyKind::Arithmetic).unwrap();
         assert_eq!(decoded, coeffs);
+    }
+
+    #[test]
+    fn windows_tile_the_member_set() {
+        // A disjoint cover of the spatial extent by windows must give
+        // per-subband member lists whose union is exactly the full
+        // geometry's member list (every coefficient coded exactly once
+        // across §V.D segments).
+        let (w, h, bands, levels) = (17usize, 13usize, 6usize, 3u8);
+        let full = CubeGeometry::new(w, h, bands, levels);
+        let windows = [
+            (0usize, 8usize, 0usize, 8usize),
+            (8, w, 0, 8),
+            (0, 8, 8, h),
+            (8, w, 8, h),
+        ];
+        let parts: Vec<CubeGeometry> = windows
+            .iter()
+            .map(|&win| CubeGeometry::with_window(w, h, bands, levels, win))
+            .collect();
+        for sb_idx in 0..full.subbands.len() {
+            let mut union: Vec<(usize, usize)> = parts
+                .iter()
+                .flat_map(|g| g.members[sb_idx].xy.iter().copied())
+                .collect();
+            union.sort_unstable_by_key(|&(x, y)| (y, x));
+            let mut expect = full.members[sb_idx].xy.clone();
+            expect.sort_unstable_by_key(|&(x, y)| (y, x));
+            assert_eq!(union, expect, "subband {sb_idx} member cover");
+            // λ planes are never windowed: segments extend through all
+            // spectral bands (IPN 42-164 §II.B).
+            for p in &parts {
+                assert_eq!(
+                    p.members[sb_idx].lambdas, full.members[sb_idx].lambdas,
+                    "subband {sb_idx} spectral extent"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windowed_segments_roundtrip_into_shared_buffer() {
+        // Encode each window with its own coder state / model (§V.B
+        // per-segment independence), decode all of them into one shared
+        // buffer, and require exact reconstruction everywhere.
+        let (w, h, bands, levels) = (16usize, 12usize, 8usize, 3u8);
+        let full = CubeGeometry::new(w, h, bands, levels);
+        let coeffs = test_coeffs(&full);
+        let windows = [(0usize, 8usize, 0usize, h), (8, w, 0, h)];
+        let mut decoded = vec![i32::MIN; full.volume()]; // poison
+        for &win in &windows {
+            let geom = CubeGeometry::with_window(w, h, bands, levels, win);
+            let q = geom.member_bit_planes_needed(&coeffs);
+            let packets = encode_cube_bitplanes(&geom, &coeffs, q, 0, EntropyKind::Arithmetic);
+            let borrowed: Vec<(u8, &[u8])> = packets
+                .iter()
+                .map(|p| (p.priority, p.body.as_slice()))
+                .collect();
+            decode_cube_bitplanes_into(&geom, &borrowed, q, EntropyKind::Arithmetic, &mut decoded)
+                .unwrap();
+        }
+        assert_eq!(decoded, coeffs, "windowed shared-buffer roundtrip");
+    }
+
+    #[test]
+    fn member_bit_planes_are_window_local() {
+        // A huge coefficient in one window must not raise the other
+        // window's q (§V.B: a segment's parameters depend only on its
+        // own data).
+        let (w, h, bands, levels) = (8usize, 8usize, 4usize, 2u8);
+        let full = CubeGeometry::new(w, h, bands, levels);
+        let mut coeffs = vec![0i32; full.volume()];
+        coeffs[0] = 1 << 20; // in the left window
+        coeffs[6] = 3; // in the right window
+        let left = CubeGeometry::with_window(w, h, bands, levels, (0, 4, 0, h));
+        let right = CubeGeometry::with_window(w, h, bands, levels, (4, w, 0, h));
+        assert_eq!(left.member_bit_planes_needed(&coeffs), 21);
+        assert_eq!(right.member_bit_planes_needed(&coeffs), 2);
+        assert_eq!(CubeGeometry::bit_planes_needed(&coeffs), 21);
     }
 
     #[test]
