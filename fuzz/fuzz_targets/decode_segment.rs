@@ -82,4 +82,5 @@ fuzz_target!(|data: &[u8]| {
     // the cube framing parser + 3-D inverse DWT + spectral-context
     // bit-plane decoder full corpus coverage.
     let _ = parse_icer3d_with_limits(data, &FUZZ_LIMITS);
+    let _ = oxideav_icer::parse_icer3d_lenient_with_limits(data, &FUZZ_LIMITS);
 });

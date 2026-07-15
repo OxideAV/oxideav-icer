@@ -88,6 +88,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proves the crate's i32 coefficient storage covers the widest case the
   wire admits (16-bit samples through filter F: 22-bit words).
 
+- **ICER-3D loss-tolerant decode** (`parse_icer3d_lenient` /
+  `parse_icer3d_lenient_with_limits`, returning `LenientCubeDecode`).
+  IPN 42-164 §I: "because compression is progressive within each
+  segment, when data loss does occur, any received data for the
+  affected segment that precedes the lost portion will allow a lower
+  fidelity reconstruction of that segment" — but the strict parser
+  refuses a truncated stream outright. The lenient entry point salvages
+  every complete packet in wire order: a cut mid-packet keeps the
+  segment's delivered packet prefix (deadzone reconstruction), a cut
+  before the packets keeps the segment's §III.A means (mean-anchored
+  patch), a fully missing segment reconstructs as zero coefficients,
+  and a corrupt packet body degrades that one segment instead of
+  failing the decode. The report carries per-segment packet counts,
+  the intact-segment count, and a truncation flag. Pinned: every
+  truncation point of a valid stream (both segmentation modes) decodes
+  leniently where strict errors, quality is monotone at segment
+  boundaries with the full stream exact, and mid-packet salvage beats
+  the nothing-arrived decode. Both smoke harnesses and the fuzz target
+  drive the new entry point.
+
 - **ICER-3D cross-segment progressive byte quota.** The cube path's
   §IV.B byte quota now truncates the **global** progressive order —
   every segment's packets of one §IV.A priority value before any packet

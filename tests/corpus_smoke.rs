@@ -32,6 +32,7 @@ fn decode_segment_corpus_is_panic_free() {
         let _ = parse_icer_with_limits(&data, &FUZZ_LIMITS);
         let _ = parse_icer_lenient_with_limits(&data, &FUZZ_LIMITS);
         let _ = parse_icer3d_with_limits(&data, &FUZZ_LIMITS);
+        let _ = oxideav_icer::parse_icer3d_lenient_with_limits(&data, &FUZZ_LIMITS);
         driven += 1;
     }
     // The corpus ships with the crate; a checkout that lost it should

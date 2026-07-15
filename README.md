@@ -66,6 +66,7 @@ paraphrased, or cross-checked.
 | ICER-3D §II.B transform-domain segmentation | full (`CubeEncodeOptions::with_transform_domain_segments()` -- the spec form: one whole-cube transform, error-containment segments as IPN 42-155 §V.D rectangles of the spatially-low-pass lattice "extend[ing] through all spectral bands", per-segment context modeler / entropy coder / §III.A means; decoder recomputes the partition from header fields; segment-loss containment pinned (residual ≤ 4 beyond a `3·2^ts` dilation, bit-exact beyond `8·2^ts`, lost windows reconstruct mean-anchored at 2x+ better MAE than a flat fill) -- see "ICER-3D" below) |
 | ICER-3D cross-segment progressive quota | full (the §IV.B byte quota cuts the **global** priority-interleaved packet order -- all segments' packets of a priority before the next lower priority, the IPN 42-155 §VI.B Fig. 23 arrangement carried to cubes -- so no segment starves; budgeted wire pinned packet-for-packet against a simulated global-order prefix; ample quota byte-identical) |
 | ICER-3D §III.B dynamic-range analysis | full (Table 1 γ factors as exact rationals + the word-size rule, `high_pass_gamma` / `dynamic_range_expansion` / `coefficient_word_bits`; all 21 table cells + the filter-A 12-bit → 16-bit-word worked example pinned; the live transform verified within the published word sizes on full-range extremes) |
+| ICER-3D loss-tolerant decode | full (`parse_icer3d_lenient` -- salvages every complete packet of a truncated / partially corrupt cube stream per the §I progressive-within-segment promise: packet-prefix deadzone reconstruction, mean-anchored patches when only a segment's fixed part arrived, zero-coefficient fill for missing segments; `LenientCubeDecode` reports per-segment recovery; every truncation point of a valid stream pinned decodable with quality monotone at segment boundaries) |
 | §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; `partition` + the §V.B maps `ll_segment_map` / `coefficient_segment_map`) |
 | §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment's loss decays to bit-exact outside a bounded wavelet-support bleed -- see "Transform-domain segmentation" below) |
 | §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
@@ -1336,6 +1337,26 @@ at one segment and spends ~3.6% more lossless bytes than row strips at
 the paper's 4-segment operating point (13299 vs 12833 B) -- the price
 of the finer per-segment packetisation -- while removing the row-strip
 transform seams and keeping loss soft-bounded per the profile above.
+
+### Loss-tolerant decode (§I)
+
+"Because compression is progressive within each segment, when data
+loss does occur, any received data for the affected segment that
+precedes the lost portion will allow a lower fidelity reconstruction
+of that segment" (IPN 42-164 §I). `parse_icer3d_lenient` (and its
+`_with_limits` variant) realises that promise for a truncated or
+partially corrupt downlink where the strict `parse_icer3d` refuses the
+stream: every complete packet is salvaged in wire order — a cut
+mid-packet keeps the segment's delivered packet prefix (§III.A
+deadzone reconstruction), a cut before the packet stream still keeps
+the segment's §III.A means (a mean-anchored smooth patch preserving
+the band's spectral signature), a fully missing segment reconstructs
+as zero coefficients (mid-range), and a corrupt packet body degrades
+only its own segment. The returned [`LenientCubeDecode`] reports
+per-segment recovered packet counts, the intact-segment count, and a
+truncation flag. Every truncation point of a valid stream is pinned
+decodable (both segmentation modes), with quality monotone at segment
+boundaries and the full stream exact.
 
 **Measured** (32x32x16 correlated-band 8-bit scene, lossless filter Q,
 3 levels): the cube stream is **4.12 bits/sample** vs **7.00

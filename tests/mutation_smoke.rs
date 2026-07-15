@@ -47,6 +47,7 @@ fn drive(bytes: &[u8]) {
     let _ = parse_icer_with_limits(bytes, &LIMITS);
     let _ = parse_icer_lenient_with_limits(bytes, &LIMITS);
     let _ = parse_icer3d_with_limits(bytes, &LIMITS);
+    let _ = oxideav_icer::parse_icer3d_lenient_with_limits(bytes, &LIMITS);
 }
 
 fn seeds() -> Vec<Vec<u8>> {

@@ -584,6 +584,61 @@ pub fn parse_icer3d(bytes: &[u8]) -> Result<IcerCube> {
 
 /// Decode an ICER-3D cube stream under an explicit resource-cap policy.
 pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerCube> {
+    Ok(parse_cube(bytes, limits, false)?.cube)
+}
+
+/// Report of a loss-tolerant ICER-3D decode (see
+/// [`parse_icer3d_lenient`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LenientCubeDecode {
+    /// The reconstructed cube. Regions whose data never arrived
+    /// reconstruct from whatever did: a segment whose packets were cut
+    /// short reconstructs from its delivered packet prefix at the
+    /// §III.A deadzone points; a segment whose fixed part (index, q,
+    /// means) arrived but whose packets did not still anchors to its
+    /// §III.A means; a fully missing segment contributes zero
+    /// coefficients (mid-range after the level shift).
+    pub cube: IcerCube,
+    /// Complete, successfully decoded packets per segment (a prefix of
+    /// each segment's emission).
+    pub packets_received: Vec<usize>,
+    /// Number of leading segments whose fixed wire part (index +
+    /// bit-plane count + means) arrived intact.
+    pub segments_received: usize,
+    /// `true` when the stream ended (or became unreadable) before the
+    /// last segment's last packet.
+    pub truncated: bool,
+}
+
+/// Loss-tolerant decode of an ICER-3D cube stream (default
+/// [`DecodeLimits`]).
+///
+/// IPN 42-164 §I: "because compression is progressive within each
+/// segment, when data loss does occur, any received data for the
+/// affected segment that precedes the lost portion will allow a lower
+/// fidelity reconstruction of that segment." The strict
+/// [`parse_icer3d`] refuses a truncated stream outright; this entry
+/// point salvages every complete packet that arrived, in wire order,
+/// and reports what was recovered. Only the 17-byte fixed header (and
+/// the [`DecodeLimits`] policy) can still fail the decode — the
+/// geometry, filter, and segment layout are unrecoverable without it.
+pub fn parse_icer3d_lenient(bytes: &[u8]) -> Result<LenientCubeDecode> {
+    parse_cube(bytes, &DecodeLimits::default(), true)
+}
+
+/// [`parse_icer3d_lenient`] under an explicit resource-cap policy.
+pub fn parse_icer3d_lenient_with_limits(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<LenientCubeDecode> {
+    parse_cube(bytes, limits, true)
+}
+
+/// Shared strict / lenient decode core. In strict mode every wire
+/// shortfall is an error; in lenient mode segment-level shortfalls
+/// degrade to partial reconstruction and only header-level problems
+/// error.
+fn parse_cube(bytes: &[u8], limits: &DecodeLimits, lenient: bool) -> Result<LenientCubeDecode> {
     let mut r = Reader { buf: bytes, pos: 0 };
     if r.take(CUBE_MAGIC.len())? != CUBE_MAGIC {
         return Err(IcerError::invalid("not an ICER-3D cube stream"));
@@ -673,34 +728,92 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
 
     /// One segment's wire fields: q, per-band means, packets.
     type SegmentFields<'a> = (u8, Vec<i32>, Vec<(u8, &'a [u8])>);
+
+    /// A lenient segment read: how much of the segment arrived.
+    enum SegRead<'a> {
+        /// Everything, including all framed packets.
+        Full(SegmentFields<'a>),
+        /// The fixed part (index + q + means) arrived; the packet
+        /// stream was cut — only the complete packets are kept.
+        Partial(SegmentFields<'a>),
+        /// The fixed part itself did not arrive (or was inconsistent).
+        Missing,
+    }
+
     fn read_segment<'a>(
         r: &mut Reader<'a>,
         expect_idx: usize,
         bands: usize,
-    ) -> Result<SegmentFields<'a>> {
-        let seg_idx = r.u8()?;
-        if seg_idx as usize != expect_idx {
-            return Err(IcerError::invalid(format!(
-                "segment index {seg_idx} out of order (expected {expect_idx})"
-            )));
-        }
-        let q = r.u8()?;
-        if q > 30 {
-            return Err(IcerError::invalid(format!("bit-plane count {q} > 30")));
-        }
-        let mut means = Vec::with_capacity(bands);
-        for _ in 0..bands {
-            means.push(r.i32()?);
-        }
-        let packet_count = r.u16()? as usize;
-        let mut packets: Vec<(u8, &[u8])> = Vec::with_capacity(packet_count);
+        lenient: bool,
+    ) -> Result<SegRead<'a>> {
+        let fixed = (|| {
+            let seg_idx = r.u8()?;
+            if seg_idx as usize != expect_idx {
+                return Err(IcerError::invalid(format!(
+                    "segment index {seg_idx} out of order (expected {expect_idx})"
+                )));
+            }
+            let q = r.u8()?;
+            if q > 30 {
+                return Err(IcerError::invalid(format!("bit-plane count {q} > 30")));
+            }
+            let mut means = Vec::with_capacity(bands);
+            for _ in 0..bands {
+                means.push(r.i32()?);
+            }
+            Ok((q, means))
+        })();
+        let (q, means) = match fixed {
+            Ok(v) => v,
+            Err(_) if lenient => return Ok(SegRead::Missing),
+            Err(e) => return Err(e),
+        };
+        let packet_count = match r.u16() {
+            Ok(c) => c as usize,
+            Err(_) if lenient => return Ok(SegRead::Partial((q, means, Vec::new()))),
+            Err(e) => return Err(e),
+        };
+        let mut packets: Vec<(u8, &[u8])> = Vec::new();
         for _ in 0..packet_count {
-            let priority = r.u8()?;
-            let len = r.u32()? as usize;
-            packets.push((priority, r.take(len)?));
+            let one = (|| {
+                let priority = r.u8()?;
+                let len = r.u32()? as usize;
+                Ok((priority, r.take(len)?))
+            })();
+            match one {
+                Ok(p) => packets.push(p),
+                Err(_) if lenient => return Ok(SegRead::Partial((q, means, packets))),
+                Err(e) => return Err(e),
+            }
         }
-        Ok((q, means, packets))
+        Ok(SegRead::Full((q, means, packets)))
     }
+
+    let mut packets_received = vec![0usize; seg_count];
+    let mut segments_received = 0usize;
+    let mut truncated = false;
+    let mut stopped = false;
+    // Per-segment salvage: `None` = nothing arrived (zero coefficients,
+    // zero means). Once the wire falls short, every later segment is
+    // missing — the sequential framing cannot resynchronise.
+    let mut read_one = |seg: usize| -> Result<Option<SegmentFields<'_>>> {
+        if stopped {
+            return Ok(None);
+        }
+        match read_segment(&mut r, seg, bands, lenient)? {
+            SegRead::Full(f) => Ok(Some(f)),
+            SegRead::Partial(f) => {
+                truncated = true;
+                stopped = true;
+                Ok(Some(f))
+            }
+            SegRead::Missing => {
+                truncated = true;
+                stopped = true;
+                Ok(None)
+            }
+        }
+    };
 
     if transform_domain {
         // Recompute the §V.D partition "from the image dimensions, the
@@ -711,10 +824,20 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
             .map_err(|e| IcerError::invalid(format!("cube partition: {e}")))?;
         let mut coeffs = vec![0i32; width * height * bands];
         for (seg, rect) in rects.iter().enumerate() {
-            let (q, means, packets) = read_segment(&mut r, seg, bands)?;
+            let Some((q, means, packets)) = read_one(seg)? else {
+                continue;
+            };
+            segments_received += 1;
             let window = rect.image_window(ts, width, height);
             let geom = CubeGeometry::with_window(width, height, bands, levels, window);
-            decode_cube_bitplanes_into(&geom, &packets, q, kind, &mut coeffs)?;
+            match decode_cube_bitplanes_into(&geom, &packets, q, kind, &mut coeffs) {
+                Ok(()) => packets_received[seg] = packets.len(),
+                // A corrupt body: the coefficient buffer is untouched
+                // (reconstruction only runs after a clean decode), so
+                // the segment degrades to its means alone.
+                Err(_) if lenient => packets_received[seg] = 0,
+                Err(e) => return Err(e),
+            }
             add_plane_means(&mut coeffs, &geom, &means, window);
         }
         inverse_3d(&mut coeffs, width, height, bands, levels, filter);
@@ -725,11 +848,20 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
         for seg in 0..seg_count {
             let y0 = seg * strip_h;
             let sh = strip_h.min(height - y0);
-            let (q, means, packets) = read_segment(&mut r, seg, bands)?;
-
             let geom = CubeGeometry::new(width, sh, bands, levels);
-            let mut coeffs = decode_cube_bitplanes(&geom, &packets, q, kind)?;
-            add_plane_means(&mut coeffs, &geom, &means, (0, width, 0, sh));
+            let mut coeffs = vec![0i32; width * sh * bands];
+            if let Some((q, means, packets)) = read_one(seg)? {
+                segments_received += 1;
+                match decode_cube_bitplanes(&geom, &packets, q, kind) {
+                    Ok(c) => {
+                        coeffs = c;
+                        packets_received[seg] = packets.len();
+                    }
+                    Err(_) if lenient => {}
+                    Err(e) => return Err(e),
+                }
+                add_plane_means(&mut coeffs, &geom, &means, (0, width, 0, sh));
+            }
             inverse_3d(&mut coeffs, width, sh, bands, levels, filter);
 
             // Undo the level shift, clamp to the sample range, and place
@@ -748,7 +880,12 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
             }
         }
     }
-    Ok(cube)
+    Ok(LenientCubeDecode {
+        cube,
+        packets_received,
+        segments_received,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1216,6 +1353,149 @@ mod tests {
             let mut corrupt = bytes.clone();
             corrupt[i] ^= 0x80;
             let _ = parse_icer3d(&corrupt);
+        }
+    }
+
+    /// Byte offsets of each segment's end within a cube wire stream.
+    fn segment_end_offsets(bytes: &[u8]) -> Vec<usize> {
+        let bands = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+        let segs = bytes[13] as usize;
+        let mut pos = CUBE_MAGIC.len() + HEADER_BODY_BYTES;
+        let mut out = Vec::with_capacity(segs);
+        for _ in 0..segs {
+            let count_off = pos + 2 + 4 * bands;
+            let count = u16::from_be_bytes([bytes[count_off], bytes[count_off + 1]]) as usize;
+            pos = count_off + 2;
+            for _ in 0..count {
+                let len = u32::from_be_bytes([
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                    bytes[pos + 4],
+                ]) as usize;
+                pos += PACKET_OVERHEAD + len;
+            }
+            out.push(pos);
+        }
+        assert_eq!(pos, bytes.len());
+        out
+    }
+
+    fn cube_mse(a: &IcerCube, b: &IcerCube) -> f64 {
+        a.samples
+            .iter()
+            .zip(&b.samples)
+            .map(|(&x, &y)| ((x as f64) - (y as f64)).powi(2))
+            .sum::<f64>()
+            / a.samples.len() as f64
+    }
+
+    #[test]
+    fn lenient_matches_strict_on_intact_streams() {
+        let cube = hyperspectral_fixture(16, 18, 6);
+        for opts in [
+            CubeEncodeOptions::default().with_segment_count(3),
+            CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(4),
+        ] {
+            let bytes = encode_icer3d(&cube, &opts).unwrap();
+            let strict = parse_icer3d(&bytes).unwrap();
+            let lenient = parse_icer3d_lenient(&bytes).unwrap();
+            assert_eq!(lenient.cube, strict);
+            assert!(!lenient.truncated);
+            assert_eq!(lenient.segments_received, lenient.packets_received.len());
+            assert!(lenient.packets_received.iter().all(|&n| n > 0));
+        }
+    }
+
+    #[test]
+    fn lenient_salvages_every_truncation_point() {
+        // §I: "any received data for the affected segment that precedes
+        // the lost portion will allow a lower fidelity reconstruction
+        // of that segment." Every prefix past the fixed header must
+        // decode leniently (the strict parser refuses them all), and
+        // quality must improve monotonically as whole segments arrive.
+        let cube = hyperspectral_fixture(16, 16, 6);
+        for opts in [
+            CubeEncodeOptions::default().with_segment_count(4),
+            CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(4),
+        ] {
+            let bytes = encode_icer3d(&cube, &opts).unwrap();
+            let header_end = CUBE_MAGIC.len() + HEADER_BODY_BYTES;
+            for n in header_end..bytes.len() {
+                let l = parse_icer3d_lenient(&bytes[..n]).unwrap();
+                assert!(l.truncated, "prefix {n} must report truncation");
+                assert!(matches!(
+                    parse_icer3d(&bytes[..n]),
+                    Err(IcerError::Truncated)
+                ));
+            }
+            // Monotone at segment boundaries; exact at the full length.
+            let mut last = f64::INFINITY;
+            for &end in &segment_end_offsets(&bytes) {
+                let l = parse_icer3d_lenient(&bytes[..end]).unwrap();
+                let e = cube_mse(&l.cube, &cube);
+                assert!(e <= last + 1e-9, "quality fell at boundary {end}");
+                last = e;
+            }
+            assert_eq!(last, 0.0, "all segments received must be exact");
+        }
+    }
+
+    #[test]
+    fn lenient_reports_what_arrived() {
+        let cube = hyperspectral_fixture(16, 16, 6);
+        let opts = CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(4);
+        let bytes = encode_icer3d(&cube, &opts).unwrap();
+        let full = parse_icer3d_lenient(&bytes).unwrap();
+        let ends = segment_end_offsets(&bytes);
+
+        // Cut just before segment 2's fixed part completes: segments 0
+        // and 1 fully decoded, segment 2 missing, segment 3 missing.
+        let cut = ends[1] + 3;
+        let l = parse_icer3d_lenient(&bytes[..cut]).unwrap();
+        assert!(l.truncated);
+        assert_eq!(l.segments_received, 2);
+        assert_eq!(l.packets_received[0], full.packets_received[0]);
+        assert_eq!(l.packets_received[1], full.packets_received[1]);
+        assert_eq!(&l.packets_received[2..], &[0, 0]);
+
+        // Cut mid-way through segment 0's packets: the fixed part (and
+        // its §III.A means) arrived, a strict prefix of the packets is
+        // salvaged, later segments are missing.
+        let cut = (CUBE_MAGIC.len() + HEADER_BODY_BYTES + ends[0]) / 2;
+        let l = parse_icer3d_lenient(&bytes[..cut]).unwrap();
+        assert!(l.truncated);
+        assert_eq!(l.segments_received, 1);
+        assert!(l.packets_received[0] > 0);
+        assert!(l.packets_received[0] < full.packets_received[0]);
+        // The salvaged prefix must beat the nothing-at-all decode.
+        let nothing = parse_icer3d_lenient(&bytes[..CUBE_MAGIC.len() + HEADER_BODY_BYTES]).unwrap();
+        assert!(cube_mse(&l.cube, &cube) < cube_mse(&nothing.cube, &cube));
+    }
+
+    #[test]
+    fn lenient_survives_corrupt_bodies() {
+        // A corrupted packet body must never fail the lenient decode —
+        // the affected segment degrades (at worst to its means), the
+        // rest decode normally.
+        let cube = hyperspectral_fixture(12, 12, 4);
+        let opts = CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(2);
+        let bytes = encode_icer3d(&cube, &opts).unwrap();
+        for i in 0..bytes.len() {
+            let mut corrupt = bytes.clone();
+            corrupt[i] ^= 0xFF;
+            let _ = parse_icer3d_lenient(&corrupt);
+        }
+        for n in 0..bytes.len() {
+            let _ = parse_icer3d_lenient(&bytes[..n]);
         }
     }
 
