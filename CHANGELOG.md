@@ -48,6 +48,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ICER-3D §II.B transform-domain error-containment segmentation**
+  (`CubeEncodeOptions::with_transform_domain_segments()`). The spec
+  form of IPN 42-164 segmentation: segments are "defined spatially (in
+  the wavelet transform domain)" using "the same rectangle partitioning
+  algorithm" as 2-D ICER (IPN 42-155 §V.D), "except that in ICER-3D the
+  segments extend through all spectral bands". One whole-cube 3-D
+  transform; the §V.D partition of the deepest spatially-low-pass
+  lattice maps every coefficient `(x, y, λ)` to the segment of low-pass
+  pixel `(x >> ts, y >> ts)`; each segment carries its own context
+  modeler, entropy coder, and §III.A per-spatial-plane means (computed
+  per error-containment segment after all decomposition stages, as
+  §III.A requires). The decoder recomputes the partition from the
+  header fields alone — segment boundaries never ride the wire. Wire
+  form: previously-reserved cube flags bit 1, strip-height field pinned
+  to 0 (non-canonical values refused); every pre-existing row-strip
+  cube stream parses and decodes unchanged. Lossless at min-loss 0
+  across segment counts, filters, both entropy backends, and degenerate
+  geometries; §IV.B quota / min-loss compose; §V.D eq (9) segment-count
+  ceiling enforced on both sides. This replaces the row-strip
+  *approximation* for spec-form use (the row-strip mode remains the
+  wire default) — a strip boundary was a hard transform edge, while the
+  §V.D mode shares one transform so a lost segment's damage decays
+  smoothly instead of leaving a stitched seam.
+
 - **IPN 42-155 §VI.B cross-segment progressive byte quota.** A byte
   quota (or soft target) on a multi-segment encode now truncates the
   *global interleaved* packet stream — "ICER compresses each

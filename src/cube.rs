@@ -34,11 +34,27 @@
 //! thus compression is lossless when the byte quota is sufficiently
 //! large."
 //!
-//! Segments are horizontal row strips extending through all spectral
-//! bands (IPN 42-164 §II.B: segments correspond to rectangular spatial
-//! regions and "extend through all spectral bands"), each transformed
-//! and coded independently so data loss is contained — the same strip
-//! convention the crate's 2-D multi-segment path uses.
+//! # Error-containment segmentation
+//!
+//! The spec form (IPN 42-164 §II.B) defines segments **in the wavelet
+//! transform domain**: "The wavelet-transformed data are partitioned in
+//! much the same way as in ICER, except that in ICER-3D the segments
+//! extend through all spectral bands. Error-containment segments in
+//! ICER and ICER-3D are defined using the same rectangle partitioning
+//! algorithm; it is described in \[IPN 42-155\] Section V.D."
+//! `CubeEncodeOptions::with_transform_domain_segments()` selects it:
+//! one whole-cube 3-D transform, the §V.D partition of the deepest
+//! spatially-low-pass lattice mapped to every subband (each coefficient
+//! `(x, y, λ)` belongs to the segment of low-pass pixel
+//! `(x >> ts, y >> ts)`, for every λ), each segment coded with its own
+//! context modeler + entropy coder and its own §III.A per-plane means.
+//! The decoder recomputes the partition from the header parameters, so
+//! segment boundaries never ride the wire.
+//!
+//! The historical default keeps the crate's row-strip convention:
+//! horizontal strips extending through all spectral bands, each
+//! independently *transformed* and coded (data loss is still contained,
+//! but a strip boundary is a hard transform edge).
 //!
 //! # Wire format (implementation-defined framing)
 //!
@@ -57,18 +73,25 @@
 //! | 1         | wavelet filter id (integer filters A-F, Q)        |
 //! | 1         | decomposition levels (1..=6)                      |
 //! | 1         | segment count N (>= 1)                            |
-//! | 2         | strip height (BE)                                 |
-//! | 1         | flags: bit 0 = interleaved entropy backend        |
+//! | 2         | strip height (BE; 0 in the transform-domain mode, |
+//! |           | whose partition is recomputed per §V.D)           |
+//! | 1         | flags: bit 0 = interleaved entropy backend,       |
+//! |           | bit 1 = §V.D transform-domain segmentation        |
 //! | per seg   | u8 segment index; u8 q (bit-plane count);         |
 //! |           | bands x i32 BE plane means; u16 packet count;     |
 //! |           | packets of [u8 priority, u32 BE length, body]     |
 //! ```
 
-use crate::bitplane3d::{decode_cube_bitplanes, encode_cube_bitplanes, CubeGeometry, CubePacket};
+use crate::bitplane3d::{
+    decode_cube_bitplanes, decode_cube_bitplanes_into, encode_cube_bitplanes, CubeGeometry,
+    CubePacket,
+};
 use crate::decoder::DecodeLimits;
 use crate::entropy::EntropyKind;
 use crate::error::{IcerError, Result};
 use crate::header::WaveletFilter;
+use crate::partition::{ll_dimensions, partition, SegmentRect};
+use crate::subband3d::stage_counts;
 use crate::wavelet3d::{forward_3d, inverse_3d};
 
 /// Leading bytes of a cube stream: the 0x0000 sentinel (which no 2-D
@@ -167,8 +190,14 @@ pub struct CubeEncodeOptions {
     /// Requested decomposition stages, clamped to 1..=6 (the 42-164
     /// examples use three).
     pub wavelet_levels: u8,
-    /// Number of row-strip error-containment segments (>= 1).
+    /// Number of error-containment segments (>= 1): §V.D rectangles in
+    /// the transform-domain mode, row strips otherwise.
     pub segment_count: u8,
+    /// §II.B spec-form segmentation: one whole-cube transform, segments
+    /// as IPN 42-155 §V.D rectangles of the spatially-low-pass lattice
+    /// extended through all spectral bands. Default `false` (row
+    /// strips, the historical wire form).
+    pub transform_domain: bool,
     /// §IV.B byte quota: rough hard cap on the output size. The framing
     /// floor (header + per-segment fixed parts) must fit.
     pub byte_quota: Option<u64>,
@@ -187,6 +216,7 @@ impl Default for CubeEncodeOptions {
             filter: WaveletFilter::FilterQ,
             wavelet_levels: 3,
             segment_count: 1,
+            transform_domain: false,
             byte_quota: None,
             min_loss: 0,
             interleaved_entropy: false,
@@ -207,9 +237,19 @@ impl CubeEncodeOptions {
         self
     }
 
-    /// Split the cube into `n` row-strip error-containment segments.
+    /// Split the cube into `n` error-containment segments (row strips
+    /// by default; §V.D rectangles under
+    /// [`Self::with_transform_domain_segments`]).
     pub fn with_segment_count(mut self, n: u8) -> Self {
         self.segment_count = n;
+        self
+    }
+
+    /// Use the IPN 42-164 §II.B spec-form segmentation: one whole-cube
+    /// 3-D transform, segments as IPN 42-155 §V.D rectangles of the
+    /// spatially-low-pass lattice, extended through all spectral bands.
+    pub fn with_transform_domain_segments(mut self) -> Self {
+        self.transform_domain = true;
         self
     }
 
@@ -247,36 +287,58 @@ fn rounded_mean(sum: i64, count: i64) -> i32 {
     (2 * sum + count).div_euclid(2 * count) as i32
 }
 
-/// Compute and subtract the §III.A per-spatial-plane means over the
-/// spatially low-pass lattice (stride `2^ts`) of every band; returns
-/// one mean per band.
-fn subtract_plane_means(coeffs: &mut [i32], geom: &CubeGeometry) -> Vec<i32> {
+/// The spatially-low-pass lattice positions (stride `2^ts`, origin
+/// `(0, 0)`) that fall inside the half-open window `(x0, x1, y0, y1)`
+/// of one band's spatial plane. §V.D windows are lattice-aligned
+/// (`x0 = rect.x << ts`), but the walk realigns defensively.
+fn low_pass_window_positions(
+    geom: &CubeGeometry,
+    window: (usize, usize, usize, usize),
+    mut f: impl FnMut(usize),
+) {
     let stride = 1usize << geom.ts;
+    let (x0, x1, y0, y1) = window;
+    let (x1, y1) = (x1.min(geom.width), y1.min(geom.height));
+    let xs = x0.div_ceil(stride) * stride;
+    let mut y = y0.div_ceil(stride) * stride;
+    while y < y1 {
+        let mut x = xs;
+        while x < x1 {
+            f(y * geom.width + x);
+            x += stride;
+        }
+        y += stride;
+    }
+}
+
+/// Compute and subtract the §III.A per-spatial-plane means over the
+/// spatially low-pass lattice (stride `2^ts`) of every band, restricted
+/// to one error-containment segment's spatial window ("mean values are
+/// computed for and subtracted from each spatial plane **of each
+/// error-containment segment** of each spatially low-pass subband",
+/// §III.A); returns one mean per band.
+fn subtract_plane_means(
+    coeffs: &mut [i32],
+    geom: &CubeGeometry,
+    window: (usize, usize, usize, usize),
+) -> Vec<i32> {
     let plane = geom.width * geom.height;
     let mut means = Vec::with_capacity(geom.bands);
     for lambda in 0..geom.bands {
         let base = lambda * plane;
         let (mut sum, mut count) = (0i64, 0i64);
-        let mut y = 0usize;
-        while y < geom.height {
-            let mut x = 0usize;
-            while x < geom.width {
-                sum += coeffs[base + y * geom.width + x] as i64;
-                count += 1;
-                x += stride;
-            }
-            y += stride;
-        }
-        let mean = rounded_mean(sum, count);
-        let mut y = 0usize;
-        while y < geom.height {
-            let mut x = 0usize;
-            while x < geom.width {
-                coeffs[base + y * geom.width + x] -= mean;
-                x += stride;
-            }
-            y += stride;
-        }
+        low_pass_window_positions(geom, window, |pos| {
+            sum += coeffs[base + pos] as i64;
+            count += 1;
+        });
+        let mean = if count == 0 {
+            0
+        } else {
+            rounded_mean(sum, count)
+        };
+        low_pass_window_positions(geom, window, |pos| {
+            coeffs[base + pos] -= mean;
+        });
         means.push(mean);
     }
     means
@@ -286,21 +348,19 @@ fn subtract_plane_means(coeffs: &mut [i32], geom: &CubeGeometry) -> Vec<i32> {
 /// Saturating: a corrupt stream can carry arbitrary means against
 /// arbitrary decoded coefficients, and the decoder clamps to the sample
 /// range afterwards anyway.
-fn add_plane_means(coeffs: &mut [i32], geom: &CubeGeometry, means: &[i32]) {
-    let stride = 1usize << geom.ts;
+fn add_plane_means(
+    coeffs: &mut [i32],
+    geom: &CubeGeometry,
+    means: &[i32],
+    window: (usize, usize, usize, usize),
+) {
     let plane = geom.width * geom.height;
     for (lambda, &mean) in means.iter().enumerate() {
         let base = lambda * plane;
-        let mut y = 0usize;
-        while y < geom.height {
-            let mut x = 0usize;
-            while x < geom.width {
-                let c = &mut coeffs[base + y * geom.width + x];
-                *c = c.saturating_add(mean);
-                x += stride;
-            }
-            y += stride;
-        }
+        low_pass_window_positions(geom, window, |pos| {
+            let c = &mut coeffs[base + pos];
+            *c = c.saturating_add(mean);
+        });
     }
 }
 
@@ -334,6 +394,22 @@ fn segment_fixed_bytes(bands: usize) -> usize {
     1 + 1 + 4 * bands + 2
 }
 
+/// Compute the §V.D transform-domain partition of a cube's deepest
+/// spatially-low-pass lattice: the effective spatial stage count plus
+/// the segment rectangles (in LL-lattice coordinates).
+fn cube_partition(
+    w: usize,
+    h: usize,
+    bands: usize,
+    levels: u8,
+    seg_count: usize,
+) -> Result<(u8, Vec<SegmentRect>)> {
+    let (ts, _) = stage_counts(w, h, bands, levels);
+    let (llw, llh) = ll_dimensions(w, h, ts);
+    let rects = partition(llw, llh, seg_count)?;
+    Ok((ts, rects))
+}
+
 /// Encode a hyperspectral cube into the ICER-3D wire form.
 pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8>> {
     cube.validate()?;
@@ -346,22 +422,51 @@ pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8
         cube.height as usize,
         cube.bands as usize,
     );
-    let strip_h = h.div_ceil(opts.segment_count as usize);
-    let seg_count = h.div_ceil(strip_h);
     let kind = opts.entropy_kind();
 
     // Encode every segment's transform + means + packet stream first.
-    let mut segments = Vec::with_capacity(seg_count);
-    for seg in 0..seg_count {
-        let y0 = seg * strip_h;
-        let sh = strip_h.min(h - y0);
-        let mut coeffs = extract_strip(cube, y0, sh);
-        forward_3d(&mut coeffs, w, sh, bands, levels, opts.filter);
-        let geom = CubeGeometry::new(w, sh, bands, levels);
-        let means = subtract_plane_means(&mut coeffs, &geom);
-        let q = CubeGeometry::bit_planes_needed(&coeffs);
-        let packets = encode_cube_bitplanes(&geom, &coeffs, q, opts.min_loss, kind);
-        segments.push(EncodedSegment { q, means, packets });
+    let mut segments;
+    let seg_count;
+    let strip_h_field;
+    if opts.transform_domain {
+        // §II.B spec form: ONE whole-cube transform, then the IPN
+        // 42-155 §V.D rectangle partition of the spatially-low-pass
+        // lattice, each rectangle extended through all spectral bands.
+        seg_count = opts.segment_count as usize;
+        strip_h_field = 0usize;
+        let (ts, rects) = cube_partition(w, h, bands, levels, seg_count)?;
+        let mut coeffs = extract_strip(cube, 0, h);
+        forward_3d(&mut coeffs, w, h, bands, levels, opts.filter);
+        segments = Vec::with_capacity(seg_count);
+        for rect in &rects {
+            let window = rect.image_window(ts, w, h);
+            let geom = CubeGeometry::with_window(w, h, bands, levels, window);
+            // §III.A: means are subtracted per spatial plane per
+            // error-containment segment, AFTER all decomposition
+            // stages (a shared transform makes the order automatic).
+            let means = subtract_plane_means(&mut coeffs, &geom, window);
+            let q = geom.member_bit_planes_needed(&coeffs);
+            let packets = encode_cube_bitplanes(&geom, &coeffs, q, opts.min_loss, kind);
+            segments.push(EncodedSegment { q, means, packets });
+        }
+    } else {
+        // Historical row-strip form: each strip independently
+        // transformed and coded.
+        let strip_h = h.div_ceil(opts.segment_count as usize);
+        seg_count = h.div_ceil(strip_h);
+        strip_h_field = strip_h;
+        segments = Vec::with_capacity(seg_count);
+        for seg in 0..seg_count {
+            let y0 = seg * strip_h;
+            let sh = strip_h.min(h - y0);
+            let mut coeffs = extract_strip(cube, y0, sh);
+            forward_3d(&mut coeffs, w, sh, bands, levels, opts.filter);
+            let geom = CubeGeometry::new(w, sh, bands, levels);
+            let means = subtract_plane_means(&mut coeffs, &geom, (0, w, 0, sh));
+            let q = CubeGeometry::bit_planes_needed(&coeffs);
+            let packets = encode_cube_bitplanes(&geom, &coeffs, q, opts.min_loss, kind);
+            segments.push(EncodedSegment { q, means, packets });
+        }
     }
 
     // §IV.B byte quota: the framing floor (header + every segment's
@@ -403,8 +508,8 @@ pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8
     out.push(opts.filter as u8);
     out.push(levels);
     out.push(seg_count as u8);
-    out.extend_from_slice(&(strip_h as u16).to_be_bytes());
-    out.push(u8::from(opts.interleaved_entropy));
+    out.extend_from_slice(&(strip_h_field as u16).to_be_bytes());
+    out.push(u8::from(opts.interleaved_entropy) | (u8::from(opts.transform_domain) << 1));
     for (seg_idx, seg) in segments.iter().enumerate() {
         out.push(seg_idx as u8);
         out.push(seg.q);
@@ -494,19 +599,34 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
             "cube decomposition levels {levels} outside 1..=6"
         )));
     }
-    if flags & !0b1 != 0 {
+    if flags & !0b11 != 0 {
         return Err(IcerError::invalid("reserved cube flag bits set"));
     }
-    if seg_count == 0 || strip_h == 0 {
+    let transform_domain = flags & 0b10 != 0;
+    if seg_count == 0 {
         return Err(IcerError::invalid("cube segment geometry is zero"));
     }
-    // The strips must tile the height: N-1 full strips plus a final
-    // strip of 1..=strip_h rows.
-    let body = (seg_count - 1) * strip_h;
-    if body >= height || height - body > strip_h {
-        return Err(IcerError::invalid(format!(
-            "strip layout {seg_count} x {strip_h} does not tile height {height}"
-        )));
+    if transform_domain {
+        // The §V.D partition is a pure function of the header fields;
+        // the strip-height field is unused and pinned to 0 so streams
+        // stay canonical.
+        if strip_h != 0 {
+            return Err(IcerError::invalid(
+                "transform-domain cube stream carries a nonzero strip height",
+            ));
+        }
+    } else {
+        if strip_h == 0 {
+            return Err(IcerError::invalid("cube segment geometry is zero"));
+        }
+        // The strips must tile the height: N-1 full strips plus a final
+        // strip of 1..=strip_h rows.
+        let body = (seg_count - 1) * strip_h;
+        if body >= height || height - body > strip_h {
+            return Err(IcerError::invalid(format!(
+                "strip layout {seg_count} x {strip_h} does not tile height {height}"
+            )));
+        }
     }
     let kind = if flags & 1 == 1 {
         EntropyKind::Interleaved
@@ -514,9 +634,17 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
         EntropyKind::Arithmetic
     };
 
-    // Resource caps: samples per segment strip and for the whole cube.
+    // Resource caps: samples per segment and for the whole cube. In the
+    // transform-domain mode the cube is one shared transform (a segment
+    // spans the full cube volume for allocation purposes — the same
+    // policy shape as the 2-D §V.B path, whose segment headers carry
+    // the full image dimensions).
     let total = (width * height * bands) as u64;
-    let per_seg = (width * strip_h * bands) as u64;
+    let per_seg = if transform_domain {
+        total
+    } else {
+        (width * strip_h * bands) as u64
+    };
     if per_seg > limits.max_pixels_per_segment || total > limits.max_total_pixels {
         return Err(IcerError::unsupported(format!(
             "cube geometry {width}x{height}x{bands} exceeds the decode limits"
@@ -530,13 +658,18 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
         (1i32 << bit_depth) - 1
     };
     let mut cube = IcerCube::zeros(width as u32, height as u32, bands as u32, bit_depth);
-    for seg in 0..seg_count {
-        let y0 = seg * strip_h;
-        let sh = strip_h.min(height - y0);
+
+    /// One segment's wire fields: q, per-band means, packets.
+    type SegmentFields<'a> = (u8, Vec<i32>, Vec<(u8, &'a [u8])>);
+    fn read_segment<'a>(
+        r: &mut Reader<'a>,
+        expect_idx: usize,
+        bands: usize,
+    ) -> Result<SegmentFields<'a>> {
         let seg_idx = r.u8()?;
-        if seg_idx as usize != seg {
+        if seg_idx as usize != expect_idx {
             return Err(IcerError::invalid(format!(
-                "segment index {seg_idx} out of order (expected {seg})"
+                "segment index {seg_idx} out of order (expected {expect_idx})"
             )));
         }
         let q = r.u8()?;
@@ -554,23 +687,51 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
             let len = r.u32()? as usize;
             packets.push((priority, r.take(len)?));
         }
+        Ok((q, means, packets))
+    }
 
-        let geom = CubeGeometry::new(width, sh, bands, levels);
-        let mut coeffs = decode_cube_bitplanes(&geom, &packets, q, kind)?;
-        add_plane_means(&mut coeffs, &geom, &means);
-        inverse_3d(&mut coeffs, width, sh, bands, levels, filter);
+    if transform_domain {
+        // Recompute the §V.D partition "from the image dimensions, the
+        // number of stages of wavelet decomposition, and the total
+        // number of segments" (IPN 42-155 §V.D, adopted by 42-164
+        // §II.B); a count the partition cannot realise is corrupt data.
+        let (ts, rects) = cube_partition(width, height, bands, levels, seg_count)
+            .map_err(|e| IcerError::invalid(format!("cube partition: {e}")))?;
+        let mut coeffs = vec![0i32; width * height * bands];
+        for (seg, rect) in rects.iter().enumerate() {
+            let (q, means, packets) = read_segment(&mut r, seg, bands)?;
+            let window = rect.image_window(ts, width, height);
+            let geom = CubeGeometry::with_window(width, height, bands, levels, window);
+            decode_cube_bitplanes_into(&geom, &packets, q, kind, &mut coeffs)?;
+            add_plane_means(&mut coeffs, &geom, &means, window);
+        }
+        inverse_3d(&mut coeffs, width, height, bands, levels, filter);
+        for (dst, &c) in cube.samples.iter_mut().zip(&coeffs) {
+            *dst = c.saturating_add(shift).clamp(0, ceil) as u16;
+        }
+    } else {
+        for seg in 0..seg_count {
+            let y0 = seg * strip_h;
+            let sh = strip_h.min(height - y0);
+            let (q, means, packets) = read_segment(&mut r, seg, bands)?;
 
-        // Undo the level shift, clamp to the sample range, and place the
-        // strip rows into the output cube.
-        for b in 0..bands {
-            let src_plane = b * width * sh;
-            let dst_plane = b * width * height;
-            for y in 0..sh {
-                for x in 0..width {
-                    let v = coeffs[src_plane + y * width + x]
-                        .saturating_add(shift)
-                        .clamp(0, ceil);
-                    cube.samples[dst_plane + (y0 + y) * width + x] = v as u16;
+            let geom = CubeGeometry::new(width, sh, bands, levels);
+            let mut coeffs = decode_cube_bitplanes(&geom, &packets, q, kind)?;
+            add_plane_means(&mut coeffs, &geom, &means, (0, width, 0, sh));
+            inverse_3d(&mut coeffs, width, sh, bands, levels, filter);
+
+            // Undo the level shift, clamp to the sample range, and place
+            // the strip rows into the output cube.
+            for b in 0..bands {
+                let src_plane = b * width * sh;
+                let dst_plane = b * width * height;
+                for y in 0..sh {
+                    for x in 0..width {
+                        let v = coeffs[src_plane + y * width + x]
+                            .saturating_add(shift)
+                            .clamp(0, ceil);
+                        cube.samples[dst_plane + (y0 + y) * width + x] = v as u16;
+                    }
                 }
             }
         }
@@ -755,6 +916,189 @@ mod tests {
             parse_icer3d(&[0x12, 0x34, 0x00, 0x00]),
             Err(IcerError::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn transform_domain_lossless_roundtrip() {
+        // §II.B spec-form segmentation: one shared transform + §V.D
+        // rectangles. Lossless at min-loss 0 across segment counts and
+        // both entropy backends, including the paper's operating point
+        // of four error-containment segments (§V.B).
+        let cube = hyperspectral_fixture(20, 18, 7);
+        for segs in [1u8, 2, 3, 4, 7] {
+            for interleaved in [false, true] {
+                let mut opts = CubeEncodeOptions::default()
+                    .with_transform_domain_segments()
+                    .with_segment_count(segs);
+                if interleaved {
+                    opts = opts.with_interleaved_entropy();
+                }
+                let bytes = encode_icer3d(&cube, &opts).unwrap();
+                let decoded = parse_icer3d(&bytes).unwrap();
+                assert_eq!(decoded, cube, "{segs} segments interleaved={interleaved}");
+            }
+        }
+    }
+
+    #[test]
+    fn transform_domain_all_filters_lossless() {
+        let cube = hyperspectral_fixture(13, 11, 5);
+        for filter in [
+            WaveletFilter::FilterQ,
+            WaveletFilter::FilterA,
+            WaveletFilter::FilterB,
+            WaveletFilter::FilterC,
+            WaveletFilter::FilterD,
+            WaveletFilter::FilterE,
+            WaveletFilter::FilterF,
+        ] {
+            let opts = CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(4)
+                .with_filter(filter);
+            let decoded = parse_icer3d(&encode_icer3d(&cube, &opts).unwrap()).unwrap();
+            assert_eq!(decoded, cube, "{filter:?}");
+        }
+    }
+
+    #[test]
+    fn transform_domain_degenerate_geometries_roundtrip() {
+        // Thin strips, deep pyramids, single-band and tiny cubes: the
+        // §V.D partition + windowed scan must stay exact everywhere the
+        // encoder accepts the segment count.
+        for (w, h, bands, levels, segs) in [
+            (5u32, 40u32, 4u32, 3u8, 3u8),
+            (40, 5, 4, 3, 3),
+            (16, 16, 1, 5, 4),
+            (7, 7, 7, 6, 2),
+            (3, 3, 3, 1, 2),
+        ] {
+            let cube = hyperspectral_fixture(w, h, bands);
+            let opts = CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(segs)
+                .with_levels(levels);
+            let decoded = parse_icer3d(&encode_icer3d(&cube, &opts).unwrap()).unwrap();
+            assert_eq!(decoded, cube, "{w}x{h}x{bands} L{levels} s{segs}");
+        }
+    }
+
+    #[test]
+    fn transform_domain_wire_flag_and_strip_field() {
+        // Bit 1 of the flags byte marks the mode; the strip-height field
+        // is pinned to zero. The row-strip wire form is byte-for-byte
+        // unaffected by the new mode's existence.
+        let cube = hyperspectral_fixture(16, 16, 4);
+        let td = encode_icer3d(
+            &cube,
+            &CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(4),
+        )
+        .unwrap();
+        let flags_off = CUBE_MAGIC.len() + HEADER_BODY_BYTES - 1;
+        let strip_off = flags_off - 2;
+        assert_eq!(td[flags_off] & 0b10, 0b10);
+        assert_eq!(&td[strip_off..strip_off + 2], &[0, 0]);
+
+        let rows = encode_icer3d(&cube, &CubeEncodeOptions::default()).unwrap();
+        assert_eq!(rows[flags_off] & 0b10, 0);
+
+        // A transform-domain stream with a nonzero strip height is
+        // refused as non-canonical.
+        let mut bad = td.clone();
+        bad[strip_off + 1] = 1;
+        assert!(matches!(parse_icer3d(&bad), Err(IcerError::InvalidData(_))));
+    }
+
+    #[test]
+    fn transform_domain_segment_count_beyond_eq9_is_refused() {
+        // §V.D eq (9): s <= LL pixel count. A 16x16 cube at 3 levels has
+        // a 2x2 spatially-low-pass lattice -> at most 4 segments.
+        let cube = hyperspectral_fixture(16, 16, 4);
+        let opts = CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(5);
+        assert!(matches!(
+            encode_icer3d(&cube, &opts),
+            Err(IcerError::Unsupported(_))
+        ));
+        // 4 is fine.
+        let opts = CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(4);
+        assert_eq!(
+            parse_icer3d(&encode_icer3d(&cube, &opts).unwrap()).unwrap(),
+            cube
+        );
+    }
+
+    #[test]
+    fn transform_domain_quota_and_min_loss_compose() {
+        let cube = hyperspectral_fixture(16, 16, 8);
+        let base = CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(4);
+        // Quota: honoured, quality monotone, ample quota lossless.
+        let unbounded = encode_icer3d(&cube, &base).unwrap();
+        let mut last_mse = f64::INFINITY;
+        for quota in [500u64, 1000, 2000, 4000, unbounded.len() as u64 + 16] {
+            let bytes = encode_icer3d(&cube, &base.clone().with_byte_quota(quota)).unwrap();
+            assert!(bytes.len() as u64 <= quota);
+            let decoded = parse_icer3d(&bytes).unwrap();
+            let mse: f64 = decoded
+                .samples
+                .iter()
+                .zip(&cube.samples)
+                .map(|(&d, &o)| ((d as f64) - (o as f64)).powi(2))
+                .sum::<f64>()
+                / cube.samples.len() as f64;
+            assert!(mse <= last_mse + 1e-9, "quality fell at quota {quota}");
+            last_mse = mse;
+        }
+        assert_eq!(last_mse, 0.0);
+        // Min loss: bytes fall / error rises monotonically; 0 lossless.
+        let mut last_len = usize::MAX;
+        let mut last_err = -1.0f64;
+        for q in [0u8, 4, 8, 12] {
+            let bytes = encode_icer3d(&cube, &base.clone().with_min_loss(q)).unwrap();
+            let decoded = parse_icer3d(&bytes).unwrap();
+            let mse: f64 = decoded
+                .samples
+                .iter()
+                .zip(&cube.samples)
+                .map(|(&d, &o)| ((d as f64) - (o as f64)).powi(2))
+                .sum::<f64>()
+                / cube.samples.len() as f64;
+            if q == 0 {
+                assert_eq!(decoded, cube);
+            }
+            assert!(bytes.len() <= last_len, "bytes rose at q = {q}");
+            assert!(mse >= last_err, "error fell at q = {q}");
+            last_len = bytes.len();
+            last_err = mse;
+        }
+        assert!(last_err > 0.0);
+    }
+
+    #[test]
+    fn transform_domain_truncation_and_corruption_never_panic() {
+        let cube = hyperspectral_fixture(12, 12, 5);
+        let bytes = encode_icer3d(
+            &cube,
+            &CubeEncodeOptions::default()
+                .with_transform_domain_segments()
+                .with_segment_count(3),
+        )
+        .unwrap();
+        for n in 0..bytes.len() {
+            let _ = parse_icer3d(&bytes[..n]);
+        }
+        for i in 0..bytes.len() {
+            let mut corrupt = bytes.clone();
+            corrupt[i] ^= 0x80;
+            let _ = parse_icer3d(&corrupt);
+        }
     }
 
     #[test]
