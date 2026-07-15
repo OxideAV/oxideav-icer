@@ -35,6 +35,26 @@ fn correlated_cube(w: u32, h: u32, bands: u32) -> IcerCube {
     cube
 }
 
+/// 12-bit fixture with per-band signal-level drift (the §III.A
+/// "systematic variations in signal level of different spectral bands")
+/// over spatial texture — the scenario the ICER-3D mean subtraction and
+/// error containment exist for.
+fn drifted_cube(w: u32, h: u32, bands: u32) -> IcerCube {
+    let mut cube = IcerCube::zeros(w, h, bands, 12);
+    let (wu, hu) = (w as usize, h as usize);
+    for b in 0..bands as usize {
+        let dc = 800 + ((b * 137) % 1200) as i32;
+        for y in 0..hu {
+            for x in 0..wu {
+                let t = ((x * 13 + y * 29 + b * 7) % 257) as i32 - 128;
+                let ridge = if (x / 4 + y / 4) % 3 == 0 { 200 } else { 0 };
+                cube.samples[b * wu * hu + y * wu + x] = (dc + t + ridge).clamp(0, 4095) as u16;
+            }
+        }
+    }
+    cube
+}
+
 fn mse(a: &IcerCube, b: &IcerCube) -> f64 {
     a.samples
         .iter()
@@ -211,22 +231,199 @@ fn mean_subtraction_pays_on_band_level_drift() {
     );
 }
 
+/// Walk the cube wire and drop segment `kill`'s packets (packet count
+/// forced to 0, packet bytes spliced out) — the "data pertaining to a
+/// segment are lost" scenario of IPN 42-164 §I.
+fn drop_segment_packets(bytes: &[u8], kill: usize) -> Vec<u8> {
+    let bands = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+    let segs = bytes[13] as usize;
+    let mut out = Vec::new();
+    let mut pos = 17usize; // magic (4) + header body (13)
+    out.extend_from_slice(&bytes[..pos]);
+    for seg in 0..segs {
+        let count_off = pos + 2 + 4 * bands; // idx + q + means
+        let count = u16::from_be_bytes([bytes[count_off], bytes[count_off + 1]]) as usize;
+        let mut body_end = count_off + 2;
+        for _ in 0..count {
+            let len = u32::from_be_bytes([
+                bytes[body_end + 1],
+                bytes[body_end + 2],
+                bytes[body_end + 3],
+                bytes[body_end + 4],
+            ]) as usize;
+            body_end += 5 + len;
+        }
+        if seg == kill {
+            out.extend_from_slice(&bytes[pos..count_off]);
+            out.extend_from_slice(&[0, 0]);
+        } else {
+            out.extend_from_slice(&bytes[pos..body_end]);
+        }
+        pos = body_end;
+    }
+    out
+}
+
+#[test]
+fn transform_domain_segment_loss_is_contained() {
+    // IPN 42-164 §I: "Each segment is compressed independently so that
+    // if data pertaining to a segment are lost or corrupted, the other
+    // segments are unaffected." With the §V.D transform-domain
+    // partition the segments share one inverse transform, so "the other
+    // segments are unaffected" holds up to the wavelet-support bleed of
+    // the boundary — pin the measured profile.
+    //
+    // Geometry: 64x64x6 at 2 levels -> ts = 2, 16x16 LL lattice, 16
+    // §V.D segments of 4x4 LL pixels = 16x16-pixel spatial windows.
+    // Segment 0's window is [0,16) x [0,16), extended through all
+    // bands.
+    let (w, h, bands) = (64usize, 64usize, 6usize);
+    let cube = drifted_cube(w as u32, h as u32, bands as u32);
+    let opts = CubeEncodeOptions::default()
+        .with_transform_domain_segments()
+        .with_segment_count(16)
+        .with_levels(2);
+    let bytes = encode_icer3d(&cube, &opts).unwrap();
+    let full = parse_icer3d(&bytes).unwrap();
+    assert_eq!(full, cube, "baseline must be lossless");
+
+    let lost = parse_icer3d(&drop_segment_packets(&bytes, 0)).unwrap();
+    let ts_stride = 4usize; // 2^ts
+    let (wx1, wy1) = (16usize, 16usize); // segment 0 window end
+    let max_err_outside = |dil: usize| -> i32 {
+        let mut max_err = 0i32;
+        for b in 0..bands {
+            for y in 0..h {
+                for x in 0..w {
+                    if x < wx1 + dil && y < wy1 + dil {
+                        continue; // inside the dilated window
+                    }
+                    let i = b * w * h + y * w + x;
+                    let e = (lost.samples[i] as i32 - full.samples[i] as i32).abs();
+                    max_err = max_err.max(e);
+                }
+            }
+        }
+        max_err
+    };
+    // Measured on this fixture: <= 4 beyond one lattice step, bit-exact
+    // beyond two. Pin with headroom: residual <= 8 beyond a 1*2^ts
+    // dilation, bit-identical beyond 3*2^ts.
+    assert!(
+        max_err_outside(ts_stride) <= 8,
+        "bleed beyond one lattice step: {}",
+        max_err_outside(ts_stride)
+    );
+    assert_eq!(
+        max_err_outside(3 * ts_stride),
+        0,
+        "loss must be bit-contained beyond a 3*2^ts dilation"
+    );
+
+    // Inside the lost window, the §III.A per-segment means (which ride
+    // the segment's fixed wire part, not its packets) still anchor the
+    // reconstruction: the region degrades to a smooth mean-level patch,
+    // far better than a flat mid-range fill.
+    let (mut mae_lost, mut mae_flat, mut n) = (0f64, 0f64, 0f64);
+    let flat = 1i32 << (cube.bit_depth - 1);
+    for b in 0..bands {
+        for y in 0..wy1 {
+            for x in 0..wx1 {
+                let i = b * w * h + y * w + x;
+                mae_lost += (lost.samples[i] as f64 - cube.samples[i] as f64).abs();
+                mae_flat += (flat as f64 - cube.samples[i] as f64).abs();
+                n += 1.0;
+            }
+        }
+    }
+    assert!(
+        mae_lost < mae_flat / 2.0,
+        "mean-anchored loss ({:.1}) must beat a flat fill ({:.1}) by 2x+",
+        mae_lost / n,
+        mae_flat / n
+    );
+}
+
+#[test]
+fn transform_domain_every_segment_loss_survives() {
+    // Dropping any single segment must still decode, and each loss must
+    // stay confined to its own dilated window: the §II.A inverse
+    // recursion propagates a floor-truncated, geometrically-decaying
+    // tail (the 2-D §V.B containment profile), so pin residual <= 4
+    // grey levels beyond a 3*2^ts dilation and bit-identity beyond
+    // 8*2^ts, per band.
+    let (w, h, bands) = (48usize, 32usize, 5usize);
+    let cube = drifted_cube(w as u32, h as u32, bands as u32);
+    let opts = CubeEncodeOptions::default()
+        .with_transform_domain_segments()
+        .with_segment_count(6)
+        .with_levels(2);
+    let bytes = encode_icer3d(&cube, &opts).unwrap();
+    let full = parse_icer3d(&bytes).unwrap();
+    let segs = bytes[13] as usize;
+    assert_eq!(segs, 6);
+    // Recompute the partition the way the codec does: ts = 2 on this
+    // geometry, LL lattice 12x8, 6 segments.
+    let (llw, llh, ts) = (12usize, 8usize, 2u8);
+    let rects = oxideav_icer::partition(llw, llh, segs).unwrap();
+    for rect in &rects {
+        let lost = parse_icer3d(&drop_segment_packets(&bytes, rect.index)).unwrap();
+        let (x0, x1) = (rect.x << ts, (rect.x + rect.width) << ts);
+        let (y0, y1) = (rect.y << ts, (rect.y + rect.height) << ts);
+        let mut touched = false;
+        for b in 0..bands {
+            for y in 0..h {
+                for x in 0..w {
+                    let i = b * w * h + y * w + x;
+                    let e = (lost.samples[i] as i32 - full.samples[i] as i32).unsigned_abs();
+                    touched |= e > 0;
+                    let outside = |dil: usize| {
+                        !(x + dil >= x0 && x < x1 + dil && y + dil >= y0 && y < y1 + dil)
+                    };
+                    if outside(3 << ts) {
+                        assert!(
+                            e <= 4,
+                            "segment {} residual {e} at ({x},{y},{b}) beyond 3*2^ts",
+                            rect.index
+                        );
+                    }
+                    if outside(8 << ts) {
+                        assert_eq!(
+                            e, 0,
+                            "segment {} loss leaked to ({x},{y},{b}) beyond 8*2^ts",
+                            rect.index
+                        );
+                    }
+                }
+            }
+        }
+        assert!(touched, "segment {} drop had no effect", rect.index);
+    }
+}
+
 #[test]
 fn corrupted_streams_never_panic() {
     // Every single-byte corruption of a valid stream must decode to
     // Ok(garbage) or Err(_), never panic — the deep-space channel
     // motivates exactly this robustness.
     let cube = correlated_cube(12, 12, 6);
-    let bytes = encode_icer3d(&cube, &CubeEncodeOptions::default().with_segment_count(2)).unwrap();
-    for i in 0..bytes.len() {
-        for flip in [0x01u8, 0x80, 0xFF] {
-            let mut corrupt = bytes.clone();
-            corrupt[i] ^= flip;
-            let _ = parse_icer3d(&corrupt);
+    for opts in [
+        CubeEncodeOptions::default().with_segment_count(2),
+        CubeEncodeOptions::default()
+            .with_transform_domain_segments()
+            .with_segment_count(3),
+    ] {
+        let bytes = encode_icer3d(&cube, &opts).unwrap();
+        for i in 0..bytes.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut corrupt = bytes.clone();
+                corrupt[i] ^= flip;
+                let _ = parse_icer3d(&corrupt);
+            }
         }
-    }
-    // Truncation sweep too (every prefix).
-    for n in 0..bytes.len() {
-        let _ = parse_icer3d(&bytes[..n]);
+        // Truncation sweep too (every prefix).
+        for n in 0..bytes.len() {
+            let _ = parse_icer3d(&bytes[..n]);
+        }
     }
 }

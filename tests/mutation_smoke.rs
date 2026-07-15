@@ -10,8 +10,9 @@
 //! failures.
 
 use oxideav_icer::{
-    encode_icer, parse_icer_lenient_with_limits, parse_icer_metadata, parse_icer_with_limits,
-    walk_segment, DecodeLimits, EncodeOptions, IcerImage, IcerPixelFormat,
+    encode_icer, encode_icer3d, parse_icer3d_with_limits, parse_icer_lenient_with_limits,
+    parse_icer_metadata, parse_icer_with_limits, walk_segment, CubeEncodeOptions, DecodeLimits,
+    EncodeOptions, IcerCube, IcerImage, IcerPixelFormat,
 };
 
 // Tight geometry caps: the seeds are 32x32, so valid decodes always
@@ -45,6 +46,7 @@ fn drive(bytes: &[u8]) {
     let _ = parse_icer_metadata(bytes);
     let _ = parse_icer_with_limits(bytes, &LIMITS);
     let _ = parse_icer_lenient_with_limits(bytes, &LIMITS);
+    let _ = parse_icer3d_with_limits(bytes, &LIMITS);
 }
 
 fn seeds() -> Vec<Vec<u8>> {
@@ -83,6 +85,22 @@ fn seeds() -> Vec<Vec<u8>> {
         .unwrap(),
     );
     out.push(encode_icer(&img, &tf.with_priority_interleaving()).unwrap());
+    // ICER-3D cube wire forms: §V.D transform-domain segments (r414),
+    // plain and quota-truncated — the flags-bit-1 decode paths.
+    let mut cube = IcerCube::zeros(16, 16, 4, 10);
+    let mut s = 0xC0BEu64;
+    for v in cube.samples.iter_mut() {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *v = ((s >> 54) & 0x3FF) as u16;
+    }
+    let td = CubeEncodeOptions::default()
+        .with_transform_domain_segments()
+        .with_segment_count(4)
+        .with_levels(2);
+    out.push(encode_icer3d(&cube, &td).unwrap());
+    out.push(encode_icer3d(&cube, &td.clone().with_byte_quota(400)).unwrap());
     out
 }
 
