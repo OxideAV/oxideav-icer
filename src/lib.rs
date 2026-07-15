@@ -159,6 +159,10 @@ pub use priority::{
     classify_position, encode_order, subband_weight_map, subbands, Subband, SubbandBitPlane,
     SubbandType,
 };
+pub use wavelet3d::{
+    coefficient_word_bits, dynamic_range_expansion, forward_3d, high_pass_gamma, inverse_3d,
+    spatial_stage_count, spectral_stage_count,
+};
 
 // Registry-gated public surface.
 #[cfg(feature = "registry")]

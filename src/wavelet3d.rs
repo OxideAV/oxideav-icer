@@ -59,6 +59,72 @@
 use crate::header::WaveletFilter;
 use crate::wavelet_int::{forward_1d, inverse_1d, IntFilterParams};
 
+/// IPN 42-164 §III.B dynamic-range expansion factor `γ` of one
+/// one-dimensional high-pass filtering operation, as an exact rational
+/// `(numerator, denominator)`.
+///
+/// §III.B: "low-pass filtering does not expand the dynamic range, but
+/// high-pass filtering does. The dynamic range expansion following a
+/// single one-dimensional high-pass filtering operation can be
+/// described by the approximation `h_max − h_min ≈ (x_max − x_min) γ`
+/// ... The constant γ is equal to the sum of the absolute values of the
+/// filter taps for the linear filter that approximates the particular
+/// high-pass filter." The per-filter values are the Table 1 "one
+/// high-pass filter operation" column.
+pub fn high_pass_gamma(filter: WaveletFilter) -> (u32, u32) {
+    match filter {
+        WaveletFilter::FilterA => (5, 2),
+        WaveletFilter::FilterB => (11, 4),
+        WaveletFilter::FilterC => (25, 8),
+        WaveletFilter::FilterD => (41, 16),
+        WaveletFilter::FilterE => (47, 16),
+        WaveletFilter::FilterF => (51, 16),
+        WaveletFilter::FilterQ => (11, 4),
+    }
+}
+
+/// `γ^ops` — the §III.B dynamic-range expansion after `ops`
+/// one-dimensional high-pass filtering operations, as an exact rational
+/// (IPN 42-164 Table 1 tabulates one, two, and three operations).
+///
+/// "Under the decomposition structure used by ICER-3D, each subband is
+/// produced using at most one high-pass filtering operation in each of
+/// the three dimensions (x, y, or λ), so the worst-case dynamic range
+/// expansion comes from three high-pass filtering operations" (§III.B),
+/// i.e. `ops <= 3` covers every ICER-3D subband.
+pub fn dynamic_range_expansion(filter: WaveletFilter, ops: u8) -> (u64, u64) {
+    let (n, d) = high_pass_gamma(filter);
+    let mut num = 1u64;
+    let mut den = 1u64;
+    for _ in 0..ops {
+        num *= n as u64;
+        den *= d as u64;
+    }
+    (num, den)
+}
+
+/// Smallest binary word size (in bits) sufficient to store any DWT
+/// coefficient produced by applying up to `ops` one-dimensional
+/// high-pass filtering operations to `bit_depth`-bit source samples —
+/// the §III.B word-size rule ("The last column of Table 1 can be used
+/// to determine necessary binary word sizes to accommodate dynamic
+/// range expansion for a given source bit depth"): the smallest `w`
+/// with `2^w >= 2^bit_depth * γ^ops`.
+///
+/// Worked §III.B pin: "when using filter A, 16-bit words are sufficient
+/// to store the coefficients produced by applying a 3-D decomposition
+/// to 12-bit data" — `coefficient_word_bits(12, FilterA, 3) == 16` —
+/// "but the other filter choices may produce DWT coefficients that
+/// cannot be stored in 16-bit words".
+pub fn coefficient_word_bits(bit_depth: u8, filter: WaveletFilter, ops: u8) -> u8 {
+    let (num, den) = dynamic_range_expansion(filter, ops);
+    let mut extra = 0u8;
+    while (1u64 << extra) * den < num {
+        extra += 1;
+    }
+    bit_depth + extra
+}
+
 /// Number of lattice positions `{0, s, 2s, ...}` inside `[0, extent)`.
 #[inline]
 fn lattice_len(extent: usize, stride: usize) -> usize {
@@ -520,5 +586,154 @@ mod tests {
             0,
             "deep low-pass missed its 3rd spectral stage"
         );
+    }
+
+    #[test]
+    fn table1_dynamic_range_expansion_pins() {
+        // IPN 42-164 §III.B Table 1, all 21 cells: γ, γ², γ³ as exact
+        // rationals, and the published log2 columns to their printed
+        // 2-decimal precision.
+        type Row = (WaveletFilter, (u32, u32), (u64, u64), (u64, u64), [f64; 3]);
+        let rows: [Row; 7] = [
+            (
+                WaveletFilter::FilterA,
+                (5, 2),
+                (25, 4),
+                (125, 8),
+                [1.32, 2.64, 3.97],
+            ),
+            (
+                WaveletFilter::FilterB,
+                (11, 4),
+                (121, 16),
+                (1331, 64),
+                [1.46, 2.92, 4.38],
+            ),
+            (
+                WaveletFilter::FilterC,
+                (25, 8),
+                (625, 64),
+                (15625, 512),
+                [1.64, 3.29, 4.93],
+            ),
+            (
+                WaveletFilter::FilterD,
+                (41, 16),
+                (1681, 256),
+                (68921, 4096),
+                [1.36, 2.72, 4.07],
+            ),
+            (
+                WaveletFilter::FilterE,
+                (47, 16),
+                (2209, 256),
+                (103823, 4096),
+                [1.55, 3.11, 4.66],
+            ),
+            (
+                WaveletFilter::FilterF,
+                (51, 16),
+                (2601, 256),
+                (132651, 4096),
+                [1.67, 3.34, 5.02],
+            ),
+            (
+                WaveletFilter::FilterQ,
+                (11, 4),
+                (121, 16),
+                (1331, 64),
+                [1.46, 2.92, 4.38],
+            ),
+        ];
+        for (filter, g1, g2, g3, log_bits) in rows {
+            assert_eq!(high_pass_gamma(filter), g1, "{filter:?} γ");
+            assert_eq!(
+                dynamic_range_expansion(filter, 1),
+                (g1.0 as u64, g1.1 as u64),
+                "{filter:?} γ^1"
+            );
+            assert_eq!(dynamic_range_expansion(filter, 2), g2, "{filter:?} γ^2");
+            assert_eq!(dynamic_range_expansion(filter, 3), g3, "{filter:?} γ^3");
+            for (ops, expect) in log_bits.iter().enumerate() {
+                let (n, d) = dynamic_range_expansion(filter, ops as u8 + 1);
+                let bits = (n as f64 / d as f64).log2();
+                assert!(
+                    (bits - expect).abs() < 0.005,
+                    "{filter:?} log2 γ^{}: {bits} vs published {expect}",
+                    ops + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn word_size_rule_matches_the_worked_example() {
+        // §III.B: "when using filter A, 16-bit words are sufficient to
+        // store the coefficients produced by applying a 3-D
+        // decomposition to 12-bit data (such as uncalibrated AVIRIS
+        // data). But the other filter choices may produce DWT
+        // coefficients that cannot be stored in 16-bit words."
+        assert_eq!(coefficient_word_bits(12, WaveletFilter::FilterA, 3), 16);
+        for filter in [
+            WaveletFilter::FilterB,
+            WaveletFilter::FilterC,
+            WaveletFilter::FilterD,
+            WaveletFilter::FilterE,
+            WaveletFilter::FilterF,
+            WaveletFilter::FilterQ,
+        ] {
+            assert!(
+                coefficient_word_bits(12, filter, 3) > 16,
+                "{filter:?} must overflow 16-bit words on 12-bit data"
+            );
+        }
+        // Zero high-pass operations never expand the range (§III.B:
+        // low-pass filtering does not expand the dynamic range).
+        assert_eq!(coefficient_word_bits(12, WaveletFilter::FilterF, 0), 12);
+        // The crate's i32 coefficient storage covers the worst case the
+        // wire admits: 16-bit samples through the widest filter (F).
+        assert!(coefficient_word_bits(16, WaveletFilter::FilterF, 3) <= 31);
+    }
+
+    #[test]
+    fn empirical_range_stays_within_the_word_size_rule() {
+        // Drive the actual 3-D transform with extreme-value cubes and
+        // check no coefficient exceeds the §III.B word size (the γ rule
+        // is an approximation of the linearised filter, but it is the
+        // published storage rule — the transform must live within it
+        // for the adversarial full-range inputs the encoder accepts).
+        let (w, h, bands) = (16usize, 16usize, 8usize);
+        for filter in [
+            WaveletFilter::FilterA,
+            WaveletFilter::FilterF,
+            WaveletFilter::FilterQ,
+        ] {
+            for depth in [8u8, 12, 16] {
+                let hi = (1i32 << depth) - 1;
+                let shift = 1i32 << (depth - 1);
+                // Checkerboard of range extremes (worst case for a
+                // high-pass response), level-shifted like the encoder.
+                let mut buf: Vec<i32> = (0..w * h * bands)
+                    .map(|i| {
+                        let x = i % w;
+                        let y = (i / w) % h;
+                        let l = i / (w * h);
+                        if (x + y + l) % 2 == 0 {
+                            hi - shift
+                        } else {
+                            -shift
+                        }
+                    })
+                    .collect();
+                forward_3d(&mut buf, w, h, bands, 3, filter);
+                let max_mag = buf.iter().map(|&c| c.unsigned_abs()).max().unwrap();
+                let word = coefficient_word_bits(depth, filter, 3);
+                // A w-bit word stores magnitudes < 2^(w-1) (sign bit).
+                assert!(
+                    max_mag < 1u32 << (word - 1),
+                    "{filter:?} depth {depth}: |coeff| {max_mag} exceeds {word}-bit words"
+                );
+            }
+        }
     }
 }

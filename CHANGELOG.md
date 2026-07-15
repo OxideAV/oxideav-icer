@@ -72,6 +72,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §V.D mode shares one transform so a lost segment's damage decays
   smoothly instead of leaving a stitched seam.
 
+- **IPN 42-164 §III.B dynamic-range expansion analysis**
+  (`high_pass_gamma` / `dynamic_range_expansion` /
+  `coefficient_word_bits` in `wavelet3d`, re-exported at the crate
+  root). Table 1's per-filter expansion factor γ (the sum of absolute
+  linearised high-pass filter taps) as exact rationals for one, two,
+  and three high-pass operations — the ICER-3D worst case is three,
+  "at most one high-pass filtering operation in each of the three
+  dimensions" — plus the §III.B word-size rule. All 21 Table 1 cells
+  pinned (rationals + the published log2 columns to printed precision),
+  the worked example pinned (filter A: 12-bit data fits 16-bit words
+  after a 3-D decomposition; every other filter overflows 16-bit
+  words), and the actual 3-D transform verified to stay within the
+  published word sizes on full-range checkerboard extremes — which also
+  proves the crate's i32 coefficient storage covers the widest case the
+  wire admits (16-bit samples through filter F: 22-bit words).
+
 - **ICER-3D cross-segment progressive byte quota.** The cube path's
   §IV.B byte quota now truncates the **global** progressive order —
   every segment's packets of one §IV.A priority value before any packet
