@@ -72,6 +72,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §V.D mode shares one transform so a lost segment's damage decays
   smoothly instead of leaving a stitched seam.
 
+- **ICER-3D cross-segment progressive byte quota.** The cube path's
+  §IV.B byte quota now truncates the **global** progressive order —
+  every segment's packets of one §IV.A priority value before any packet
+  of the next lower priority, segments in index order within a priority
+  (the IPN 42-155 §VI.B Fig. 23 cross-segment arrangement carried to
+  the cube path) — cut at the first packet that does not fit. The
+  previous allocation was sequential-greedy: segment 0 consumed the
+  remaining budget before segment 1 was considered, so mid-range quotas
+  deep-refined early strips while later strips starved. A single cut of
+  the global order still leaves every segment holding a prefix of its
+  own packet sequence, so any existing (prefix-tolerant) decode path is
+  unaffected; an ample quota remains byte-identical to the unbudgeted
+  encode. Wire-affecting for quota-truncated multi-segment cube streams
+  (which packets survive changes); applies to both row-strip and
+  transform-domain segmentation.
+
 - **IPN 42-155 §VI.B cross-segment progressive byte quota.** A byte
   quota (or soft target) on a multi-segment encode now truncates the
   *global interleaved* packet stream — "ICER compresses each

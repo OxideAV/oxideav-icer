@@ -470,8 +470,17 @@ pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8
     }
 
     // §IV.B byte quota: the framing floor (header + every segment's
-    // fixed part) must fit; packets are then kept in emission order
-    // until the quota is exhausted.
+    // fixed part) must fit; packets are then kept along the **global
+    // progressive order** — every segment's packets of one §IV.A
+    // priority value before any packet of the next lower priority,
+    // segments in index order within a priority (the IPN 42-155 §VI.B
+    // Fig. 23 cross-segment arrangement, carried to the cube path) —
+    // and the stream is cut at the first packet that does not fit.
+    // Because each segment's own packets are strictly
+    // priority-descending, a single cut of the global order leaves
+    // every segment holding a prefix of its packet sequence (the
+    // decoder's schedule walk stays valid), and no segment starves
+    // while an earlier one deep-refines.
     let floor = CUBE_MAGIC.len() + HEADER_BODY_BYTES + seg_count * segment_fixed_bytes(bands);
     if let Some(quota) = opts.byte_quota {
         if (floor as u64) > quota {
@@ -479,22 +488,25 @@ pub fn encode_icer3d(cube: &IcerCube, opts: &CubeEncodeOptions) -> Result<Vec<u8
                 "byte quota {quota} below the framing floor {floor}"
             )));
         }
+        let mut order: Vec<(usize, usize)> = segments
+            .iter()
+            .enumerate()
+            .flat_map(|(si, seg)| (0..seg.packets.len()).map(move |pi| (si, pi)))
+            .collect();
+        order.sort_by_key(|&(si, pi)| (core::cmp::Reverse(segments[si].packets[pi].priority), si));
         let mut used = floor as u64;
-        for seg in segments.iter_mut() {
-            // Keep the longest packet prefix that fits — prefix
-            // semantics per segment, so the decoder's schedule walk
-            // stays valid; later (independent) segments may still fit
-            // packets in whatever budget remains.
-            let mut keep = 0usize;
-            for pkt in &seg.packets {
-                let cost = (PACKET_OVERHEAD + pkt.body.len()) as u64;
-                if used + cost > quota {
-                    break;
-                }
-                used += cost;
-                keep += 1;
+        let mut keep = vec![0usize; segments.len()];
+        for &(si, pi) in &order {
+            let cost = (PACKET_OVERHEAD + segments[si].packets[pi].body.len()) as u64;
+            if used + cost > quota {
+                break;
             }
-            seg.packets.truncate(keep);
+            used += cost;
+            debug_assert_eq!(keep[si], pi, "global cut must leave per-segment prefixes");
+            keep[si] = pi + 1;
+        }
+        for (seg, &k) in segments.iter_mut().zip(&keep) {
+            seg.packets.truncate(k);
         }
     }
 
@@ -873,6 +885,112 @@ mod tests {
             last_mse = mse;
         }
         assert_eq!(last_mse, 0.0, "big-enough quota must be lossless");
+    }
+
+    /// Walk a cube wire stream: per-segment `(priority, body_len)`
+    /// packet lists (framing only — no entropy decode).
+    fn walk_cube_packets(bytes: &[u8]) -> Vec<Vec<(u8, usize)>> {
+        let bands = u16::from_be_bytes([bytes[8], bytes[9]]) as usize;
+        let segs = bytes[13] as usize;
+        let mut pos = CUBE_MAGIC.len() + HEADER_BODY_BYTES;
+        let mut out = Vec::with_capacity(segs);
+        for _ in 0..segs {
+            pos += 2 + 4 * bands; // idx + q + means
+            let count = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+            pos += 2;
+            let mut pkts = Vec::with_capacity(count);
+            for _ in 0..count {
+                let prio = bytes[pos];
+                let len = u32::from_be_bytes([
+                    bytes[pos + 1],
+                    bytes[pos + 2],
+                    bytes[pos + 3],
+                    bytes[pos + 4],
+                ]) as usize;
+                pkts.push((prio, len));
+                pos += PACKET_OVERHEAD + len;
+            }
+            out.push(pkts);
+        }
+        assert_eq!(pos, bytes.len(), "wire walk must consume the stream");
+        out
+    }
+
+    #[test]
+    fn quota_interleaves_across_segments() {
+        // The §IV.B quota must truncate the GLOBAL progressive order
+        // (all segments' packets of a priority before the next lower
+        // priority — the §VI.B cross-segment arrangement), not feed
+        // early segments first. Pin: (a) the budgeted stream's kept
+        // packets are exactly the simulated global-order prefix of the
+        // unbudgeted stream, (b) at a quota that one segment's full
+        // packet chain alone would exhaust, every segment still
+        // receives packets, (c) an ample quota is byte-identical to
+        // the unbudgeted encode.
+        let cube = hyperspectral_fixture(16, 24, 6);
+        for transform_domain in [false, true] {
+            let mut base = CubeEncodeOptions::default().with_segment_count(3);
+            if transform_domain {
+                base = base.with_transform_domain_segments();
+            }
+            let full = encode_icer3d(&cube, &base).unwrap();
+            let full_pkts = walk_cube_packets(&full);
+            let floor = CUBE_MAGIC.len()
+                + HEADER_BODY_BYTES
+                + full_pkts.len() * segment_fixed_bytes(cube.bands as usize);
+
+            // A quota that segment 0's own packets would exhaust.
+            let seg0_total: usize = full_pkts[0]
+                .iter()
+                .map(|&(_, len)| PACKET_OVERHEAD + len)
+                .sum();
+            let quota = (floor + seg0_total) as u64;
+            let cut = encode_icer3d(&cube, &base.clone().with_byte_quota(quota)).unwrap();
+            assert!(cut.len() as u64 <= quota);
+            let cut_pkts = walk_cube_packets(&cut);
+
+            // (a) simulate the global-order cut on the unbudgeted lists.
+            let mut order: Vec<(usize, usize)> = full_pkts
+                .iter()
+                .enumerate()
+                .flat_map(|(si, pkts)| (0..pkts.len()).map(move |pi| (si, pi)))
+                .collect();
+            order.sort_by_key(|&(si, pi)| (core::cmp::Reverse(full_pkts[si][pi].0), si));
+            let mut used = floor as u64;
+            let mut expect = vec![0usize; full_pkts.len()];
+            for &(si, pi) in &order {
+                let cost = (PACKET_OVERHEAD + full_pkts[si][pi].1) as u64;
+                if used + cost > quota {
+                    break;
+                }
+                used += cost;
+                expect[si] = pi + 1;
+            }
+            for (si, pkts) in cut_pkts.iter().enumerate() {
+                assert_eq!(
+                    pkts.len(),
+                    expect[si],
+                    "td={transform_domain} segment {si} kept-packet count"
+                );
+                assert_eq!(
+                    pkts.as_slice(),
+                    &full_pkts[si][..pkts.len()],
+                    "td={transform_domain} segment {si} must keep a prefix"
+                );
+            }
+
+            // (b) no segment starves.
+            assert!(
+                cut_pkts.iter().all(|p| !p.is_empty()),
+                "td={transform_domain}: a segment starved under the quota: {:?}",
+                cut_pkts.iter().map(Vec::len).collect::<Vec<_>>()
+            );
+
+            // (c) ample quota is byte-identical.
+            let ample =
+                encode_icer3d(&cube, &base.clone().with_byte_quota(full.len() as u64)).unwrap();
+            assert_eq!(ample, full, "td={transform_domain} ample quota");
+        }
     }
 
     #[test]
