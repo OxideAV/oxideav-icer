@@ -62,7 +62,10 @@ paraphrased, or cross-checked.
 | ICER-3D 3-D wavelet decomposition | full (IPN 42-164 §III.A staged decomposition -- spatially-low-pass / spectrally-high-pass subbands keep decomposing spatially; bit-exact reversible for all seven §II.A integer filters across degenerate geometries -- see `wavelet3d`) |
 | ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
 | ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
-| ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip segments, `DecodeLimits` caps -- see "ICER-3D" below) |
+| ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip **and** §V.D transform-domain segments, `DecodeLimits` caps -- see "ICER-3D" below) |
+| ICER-3D §II.B transform-domain segmentation | full (`CubeEncodeOptions::with_transform_domain_segments()` -- the spec form: one whole-cube transform, error-containment segments as IPN 42-155 §V.D rectangles of the spatially-low-pass lattice "extend[ing] through all spectral bands", per-segment context modeler / entropy coder / §III.A means; decoder recomputes the partition from header fields; segment-loss containment pinned (residual ≤ 4 beyond a `3·2^ts` dilation, bit-exact beyond `8·2^ts`, lost windows reconstruct mean-anchored at 2x+ better MAE than a flat fill) -- see "ICER-3D" below) |
+| ICER-3D cross-segment progressive quota | full (the §IV.B byte quota cuts the **global** priority-interleaved packet order -- all segments' packets of a priority before the next lower priority, the IPN 42-155 §VI.B Fig. 23 arrangement carried to cubes -- so no segment starves; budgeted wire pinned packet-for-packet against a simulated global-order prefix; ample quota byte-identical) |
+| ICER-3D §III.B dynamic-range analysis | full (Table 1 γ factors as exact rationals + the word-size rule, `high_pass_gamma` / `dynamic_range_expansion` / `coefficient_word_bits`; all 21 table cells + the filter-A 12-bit → 16-bit-word worked example pinned; the live transform verified within the published word sizes on full-range extremes) |
 | §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; `partition` + the §V.B maps `ll_segment_map` / `coefficient_segment_map`) |
 | §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment's loss decays to bit-exact outside a bounded wavelet-support bleed -- see "Transform-domain segmentation" below) |
 | §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
@@ -1004,13 +1007,12 @@ Mid-packet truncation is deferred (needs the IPN 42-155 supplemental
 
 ### ICER 3D
 
-**Implemented** (round 383) from the staged IPN Progress Report 42-164
-(2006) -- see the "ICER-3D" section above. Remaining 3-D deltas are the
-same interop unknowns as the 2-D path (the papers leave the byte-level
-container to the implementation) plus the 42-155 §V.D rectangle
-partitioning algorithm, which the 2-D path now implements end-to-end
-(`with_transform_domain_segments`, r389) but the 3-D cube path still
-approximates with row strips.
+**Implemented** (round 383; §V.D transform-domain segmentation, the
+cross-segment progressive quota, and the §III.B dynamic-range analysis
+landed r414) from the staged IPN Progress Report 42-164 (2006) -- see
+the "ICER-3D" section above. The remaining 3-D delta is the same
+interop unknown as the 2-D path: the papers leave the byte-level
+container to the implementation.
 
 ## Standalone vs registry build
 
@@ -1047,7 +1049,9 @@ ramps + flat, filter-A and filter-F §II.A streams, a two-segment
 split, byte-budget-truncated inputs covering the partial-packet path,
 §V.B transform-domain + §VI.A minimum-loss + §III.A
 priority-interleaved wire modes, §VI.B budget-truncated multi-segment
-streams (row-strip and transform-domain), and ICER-3D cubes.
+streams (row-strip and transform-domain), and ICER-3D cubes (row-strip
+plus the r414 §V.D transform-domain mode: plain, quota-truncated, and
+interleaved-entropy + min-loss).
 
 ```bash
 cd fuzz
@@ -1257,7 +1261,8 @@ use oxideav_icer::{encode_icer3d, parse_icer3d, CubeEncodeOptions, IcerCube};
 
 let cube = IcerCube::zeros(64, 64, 224, 12);      // AVIRIS-shaped
 let opts = CubeEncodeOptions::default()           // filter Q, 3 levels
-    .with_segment_count(4)                        // §II.B row strips
+    .with_transform_domain_segments()             // §II.B spec form (§V.D)
+    .with_segment_count(4)                        // the paper's operating point
     .with_byte_quota(200_000)                     // §IV.B byte quota
     .with_min_loss(0);                            // 0 = lossless if quota allows
 let bytes = encode_icer3d(&cube, &opts)?;
@@ -1267,10 +1272,70 @@ let decoded = parse_icer3d(&bytes)?;
 Rate control is §IV.B verbatim: compression stops when the *minimum
 loss* parameter's priority boundary or the *byte quota* is reached,
 whichever comes first. Packets are cut per priority value, so the
-min-loss stop lands exactly on its defining boundary and quota
-truncation keeps a per-segment packet prefix (later strips still frame
--- geometry is always preserved). Truncated subbands reconstruct at the
-deadzone mid-bin point inherited from the 2-D path.
+min-loss stop lands exactly on its defining boundary. A byte quota
+truncates the **global** priority-interleaved packet order -- every
+segment's packets of one §IV.A priority value before any packet of the
+next lower priority (the IPN 42-155 §VI.B Fig. 23 cross-segment
+arrangement carried to the cube path) -- so mid-range quotas degrade
+all segments together instead of deep-refining segment 0 while later
+segments starve; a single cut of that order still leaves each segment
+a prefix of its own packet sequence, geometry is always preserved, and
+an ample quota is byte-identical to the unbudgeted encode
+(packet-for-packet pinned against a simulated global-order prefix).
+Truncated subbands reconstruct at the deadzone mid-bin point inherited
+from the 2-D path.
+
+### Transform-domain error-containment segments (§II.B + IPN 42-155 §V.D)
+
+IPN 42-164 §II.B defines the spec form of ICER-3D segmentation: the
+segments are "defined spatially (in the wavelet transform domain)",
+partitioned "in much the same way as in ICER, except that in ICER-3D
+the segments extend through all spectral bands", "using the same
+rectangle partitioning algorithm ... described in [IPN 42-155,
+Section V.D]". `with_transform_domain_segments()` implements it end to
+end:
+
+* **one** whole-cube 3-D transform (no per-strip transform seams);
+* the §V.D partition of the deepest spatially-low-pass lattice, mapped
+  to every coefficient by `(x >> ts, y >> ts)` and extended through
+  all λ -- the 3-D analogue of the 2-D §V.B "same spatial location,
+  same segment" rule. Both sides compute it from the header fields
+  (width, height, levels, segment count); boundaries never ride the
+  wire. §V.D eq (9) (`s <=` low-pass pixel count) is enforced on both
+  sides;
+* per-segment §III.A means: "mean values are computed for and
+  subtracted from each spatial plane **of each error-containment
+  segment** of each spatially low-pass subband", after all
+  decomposition stages (§III.A pins the order -- one shared transform
+  makes it automatic);
+* each segment coded with its own context modeler + entropy coder; the
+  §IV.C spectral context model composes cleanly because a segment's
+  spectral neighbours are always in the same segment.
+
+Wire form: previously-reserved cube-flags bit 1, strip-height field
+pinned to 0 (non-canonical values refused); every pre-existing
+row-strip cube stream parses and decodes unchanged, and the row-strip
+mode remains the default. A single-segment encode differs from the
+row-strip wire only in the flag bits (byte-count parity pinned).
+
+**Error containment, measured** (64×64×6 12-bit band-drifted cube,
+2 levels, 16 §V.D segments; drop one segment's packets): residual
+≤ 4 grey levels one `2^ts` lattice step beyond the segment's window,
+**bit-identical beyond a `3·2^ts` dilation**; across every segment of
+a 6-segment cube the 2-D-style profile holds (≤ 4 beyond `3·2^ts`,
+bit-exact beyond `8·2^ts`). The lost window itself reconstructs from
+its §III.A means -- which ride the segment's fixed wire part, not its
+packets -- as a smooth mean-anchored patch at **2x+ better MAE than a
+flat mid-range fill** (measured 89 vs 829 on the drifted fixture), so
+a lost deep-space packet burst costs detail, not the scene's spectral
+signature. Corruption / truncation sweeps and the fuzz corpus cover
+the new wire mode.
+
+Cost: on the 32×32×16 headline cube the §V.D mode is byte-identical
+at one segment and spends ~3.6% more lossless bytes than row strips at
+the paper's 4-segment operating point (13299 vs 12833 B) -- the price
+of the finer per-segment packetisation -- while removing the row-strip
+transform seams and keeping loss soft-bounded per the profile above.
 
 **Measured** (32x32x16 correlated-band 8-bit scene, lossless filter Q,
 3 levels): the cube stream is **4.12 bits/sample** vs **7.00
@@ -1328,8 +1393,10 @@ opt-level, `--quick` smoke):
 | `decode_compressed_filter_a/ramp_64x64`| ~372 µs| ~10.5 MiB/s|
 | `uncompressed_path_64x64/encode`       | ~198 ns| ~19.3 GiB/s|
 | `uncompressed_path_64x64/decode`       | ~327 ns| ~11.7 GiB/s|
-| `cube3d_filter_q_32x32x16/encode`      | ~2.7 ms| ~11.7 MiB/s|
-| `cube3d_filter_q_32x32x16/decode`      | ~2.5 ms| ~12.6 MiB/s|
+| `cube3d_filter_q_32x32x16/encode`      | ~2.4 ms| ~12.8 MiB/s|
+| `cube3d_filter_q_32x32x16/decode`      | ~2.3 ms| ~13.4 MiB/s|
+| `cube3d_td_filter_q_32x32x16_s4/encode`| ~2.6 ms| ~12.0 MiB/s|
+| `cube3d_td_filter_q_32x32x16_s4/decode`| ~2.5 ms| ~12.3 MiB/s|
 
 (2-D numbers refreshed r411 after the pipeline migration onto the
 §II.A integer transform.)
@@ -1365,7 +1432,12 @@ single default:
   filter-Q encode + decode of a 32x32x16 correlated-band 12-bit cube
   (the integration suite's headline-comparison shape), throughput over
   the 32 KiB of u16 samples — a stable reference for the 3-D DWT +
-  spectral-context bit-plane coder before any vectorisation work.
+  spectral-context bit-plane coder before any vectorisation work. The
+  companion `cube3d_td_filter_q_32x32x16_s4` group runs the same cube
+  through the §V.D transform-domain mode at the paper's 4-segment
+  operating point (lossless decode asserted in the bench setup); the
+  ~7% encode delta vs the baseline is the per-segment model +
+  packetisation cost.
 * **`bit_plane_count` over `[4, 8, 12, 16]`** (filter Q): the field is
   a floor on the per-segment packet count, so raising it past the
   natural `needed` (~7-8 on this ramp) emits extra near-empty bit-plane

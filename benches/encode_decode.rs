@@ -571,6 +571,29 @@ fn bench_cube3d_path(c: &mut Criterion) {
         });
     });
     group.finish();
+
+    // §V.D transform-domain segmentation at the IPN 42-164 §V.B
+    // operating point (four error-containment segments) vs the same
+    // cube single-segment — the r414 mode's perf reference. Wire pin:
+    // the transform-domain stream must stay lossless.
+    let td = CubeEncodeOptions::default()
+        .with_transform_domain_segments()
+        .with_segment_count(4);
+    let td_bytes = encode_icer3d(&cube, &td).unwrap();
+    assert_eq!(
+        parse_icer3d(&td_bytes).unwrap(),
+        cube,
+        "transform-domain cube decode must stay lossless"
+    );
+    let mut group = c.benchmark_group("cube3d_td_filter_q_32x32x16_s4");
+    group.throughput(Throughput::Bytes(sample_bytes));
+    group.bench_function("encode", |b| {
+        b.iter(|| black_box(encode_icer3d(black_box(&cube), &td).unwrap()));
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| black_box(parse_icer3d(black_box(&td_bytes)).unwrap()));
+    });
+    group.finish();
 }
 
 /// §V.B transform-domain segmentation vs the row-strip convention at
