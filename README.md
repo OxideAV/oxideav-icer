@@ -1282,7 +1282,10 @@ for `b`-bit input); `ImageStats` scans deep samples down-shifted to
 the 8-bit domain so the filter-selection thresholds keep their
 calibration. The `registry` conversion maps 10-/12-/16-bit onto the
 matching `oxideav-core` plain-gray deep formats (other depths ride the
-16-bit word LSB-aligned).
+16-bit word LSB-aligned), and the registry encoder selects the deep
+path when `CodecParameters::pixel_format` declares `Gray10Le` /
+`Gray12Le` / `Gray16Le` — without the declaration a 16-bit plane would
+be silently misread as twice-as-wide 8-bit samples.
 
 ## ICER-3D (IPN 42-164)
 

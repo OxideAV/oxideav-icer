@@ -203,18 +203,26 @@ impl Encoder for IcerEncoder {
             _ => return Err(Error::invalid("icer encoder: expected Frame::Video")),
         };
         // Build an IcerImage from the incoming video frame. A
-        // single-plane frame is Gray8; a three-plane frame is the
+        // single-plane frame is Gray8 — or, when the encoder's
+        // `CodecParameters::pixel_format` declares one of the plain-gray
+        // deep-word formats, the matching deep-sample depth (the frame's
+        // plane then carries LSB-aligned little-endian u16 words; without
+        // the declaration a 16-bit plane would be silently misread as
+        // twice-as-wide 8-bit samples). A three-plane frame is the
         // co-sited 4:4:4 colour path (encoded as three independent ICER
         // streams behind the plane container — see `encode_icer`).
         if video.planes.is_empty() {
             return Err(Error::invalid("icer encoder: video frame has no planes"));
         }
-        let pixel_format = match video.planes.len() {
-            1 => IcerPixelFormat::Gray8,
-            3 => IcerPixelFormat::Yuv444P,
-            n => {
+        let pixel_format = match (video.planes.len(), self.output_params.pixel_format) {
+            (1, Some(PixelFormat::Gray10Le)) => IcerPixelFormat::GrayDeep { bits: 10 },
+            (1, Some(PixelFormat::Gray12Le)) => IcerPixelFormat::GrayDeep { bits: 12 },
+            (1, Some(PixelFormat::Gray16Le)) => IcerPixelFormat::GrayDeep { bits: 16 },
+            (1, _) => IcerPixelFormat::Gray8,
+            (3, _) => IcerPixelFormat::Yuv444P,
+            (n, _) => {
                 return Err(Error::unsupported(format!(
-                    "icer encoder: {n}-plane frame (only 1=Gray8 or 3=Yuv444P supported)"
+                    "icer encoder: {n}-plane frame (only 1=Gray8/deep or 3=Yuv444P supported)"
                 )))
             }
         };
@@ -263,6 +271,32 @@ mod tests {
         assert_eq!(reg.container_for_extension("ICER"), Some("icer"));
         assert_eq!(reg.container_for_extension("Icer"), Some("icer"));
         assert_eq!(reg.container_for_extension("png"), None);
+    }
+
+    #[test]
+    fn declared_deep_pixel_format_selects_deep_encode() {
+        // A 1-plane frame whose CodecParameters declare Gray12Le must
+        // encode through the deep-sample path (LSB-aligned LE u16
+        // words), not be misread as twice-as-wide 8-bit samples.
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.width = Some(8);
+        params.height = Some(6);
+        params.pixel_format = Some(PixelFormat::Gray12Le);
+        let mut enc = IcerEncoder::new_from_params(&params);
+        enc.set_options(EncodeOptions::compressed());
+
+        let mut img = IcerImage::zeros(8, 6, IcerPixelFormat::GrayDeep { bits: 12 });
+        for y in 0..6u32 {
+            for x in 0..8u32 {
+                img.set_sample(0, x, y, ((x * 511 + y * 173) % 4096) as u16);
+            }
+        }
+        let frame = Frame::from(img.clone());
+        enc.send_frame(&frame).expect("deep send_frame");
+        let pkt = enc.receive_packet().expect("deep packet");
+        let decoded = parse_icer(&pkt.data).expect("deep registry stream");
+        assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits: 12 });
+        assert_eq!(decoded.planes, img.planes);
     }
 
     #[test]

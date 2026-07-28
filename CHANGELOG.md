@@ -39,7 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pairs. Samples live LSB-aligned in little-endian `u16` words
   (`IcerImage::{sample, set_sample}` accessors added); the `registry`
   conversion maps 10-/12-/16-bit onto the matching `oxideav-core`
-  plain-gray deep formats. **Every existing wire form is unchanged**:
+  plain-gray deep formats, and the registry **encoder** selects the
+  deep path when `CodecParameters::pixel_format` declares `Gray10Le` /
+  `Gray12Le` / `Gray16Le` (without the declaration a 16-bit plane
+  would be silently misread as twice-as-wide 8-bit samples).
+  **Every existing wire form is unchanged**:
   Gray8 streams stay bare byte-for-byte, colour containers keep tag 1.
   Composes with all seven §II.A filters (lossless end to end, pinned
   9..=16), row-strip and §V.B transform-domain segmentation, both
