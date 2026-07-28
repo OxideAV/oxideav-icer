@@ -127,6 +127,55 @@ fn check_segment_pixels(header: &SegmentHeader, limits: &DecodeLimits) -> Result
     Ok(())
 }
 
+/// The single-plane in-memory format for a given sample depth: the
+/// historical [`IcerPixelFormat::Gray8`] at depth 8, the deep-gray
+/// format above (depth is carried by the plane-container framing — the
+/// 12-byte segment header has no depth field).
+fn gray_format(depth: u8) -> IcerPixelFormat {
+    if depth > 8 {
+        IcerPixelFormat::GrayDeep { bits: depth }
+    } else {
+        IcerPixelFormat::Gray8
+    }
+}
+
+/// Bytes per stored sample for a given depth (1, or 2 little-endian).
+fn sample_bytes(depth: u8) -> usize {
+    if depth > 8 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Store one already-clamped pixel value into a plane row.
+#[inline]
+fn store_px(row: &mut [u8], x: usize, sb: usize, v: i32) {
+    if sb == 2 {
+        row[x * 2..x * 2 + 2].copy_from_slice(&(v as u16).to_le_bytes());
+    } else {
+        row[x] = v as u8;
+    }
+}
+
+/// Fill rows `y_offset..y_offset + rows` of `plane` with the §III.A
+/// level-shift midpoint `2^(depth-1)` (the placeholder / missing-strip
+/// reconstruction value; 128 on the historical 8-bit path).
+fn fill_mid_rows(plane: &mut IcerPlane, y_offset: usize, rows: usize, width: usize, depth: u8) {
+    let sb = sample_bytes(depth);
+    let mid = 1i32 << (depth - 1);
+    for y in 0..rows {
+        let row = &mut plane.data[(y_offset + y) * plane.stride..][..width * sb];
+        if sb == 1 {
+            row.fill(mid as u8);
+        } else {
+            for x in 0..width {
+                store_px(row, x, sb, mid);
+            }
+        }
+    }
+}
+
 /// Per-segment metadata returned by [`parse_icer_metadata`].
 #[derive(Debug, Clone)]
 pub struct SegmentMetadata {
@@ -268,7 +317,7 @@ pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<Ice
         return parse_icer_multi_plane(bytes, limits);
     }
 
-    parse_icer_single_plane(bytes, limits)
+    parse_icer_single_plane(bytes, limits, 8)
 }
 
 /// Decode a multi-plane (colour) container: each plane substream is a full
@@ -277,11 +326,12 @@ pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<Ice
 fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
     let parsed = crate::plane_container::parse_container(bytes)?;
     let n = parsed.format.plane_count();
+    let depth = parsed.format.bit_depth();
 
     let mut plane_images: Vec<IcerImage> = Vec::with_capacity(n);
     for i in 0..n {
         let sub = parsed.plane_bytes(bytes, i);
-        plane_images.push(parse_icer_single_plane(sub, limits)?);
+        plane_images.push(parse_icer_single_plane(sub, limits, depth)?);
     }
 
     // Every plane must agree on geometry — the container's planes are
@@ -310,9 +360,11 @@ fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIma
     Ok(out)
 }
 
-/// Decode a single-plane (Gray8) ICER bitstream. This is the historical
-/// `parse_icer_with_limits` body.
-fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+/// Decode a single-plane ICER bitstream at the given sample depth (8
+/// for a bare historical Gray8 stream; deeper when dispatched from the
+/// deep-gray plane container, which owns the depth field). This is the
+/// historical `parse_icer_with_limits` body.
+fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits, depth: u8) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -361,7 +413,7 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
     // §V.B transform-domain streams decode through the shared-transform
     // path (strict: every §V.D segment must be present).
     if walked_all.iter().any(|w| w.header.transform_segmented) {
-        return decode_transform_domain(&walked_all, true).map(|(img, _, _)| img);
+        return decode_transform_domain(&walked_all, true, depth).map(|(img, _, _)| img);
     }
 
     // Verify width agreement + monotonic-by-1 segment indexing.
@@ -391,12 +443,12 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
     let mut img = IcerImage::zeros(
         canonical_width as u32,
         total_height as u32,
-        IcerPixelFormat::Gray8,
+        gray_format(depth),
     );
     let mut y_cursor = 0usize;
     for walked in &walked_all {
         let strip_h = walked.header.height as usize;
-        decode_segment_into(walked, &mut img.planes[0], y_cursor, canonical_width)?;
+        decode_segment_into(walked, &mut img.planes[0], y_cursor, canonical_width, depth)?;
         y_cursor += strip_h;
     }
     Ok(img)
@@ -417,6 +469,7 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIm
 fn decode_transform_domain(
     walked_all: &[WalkedSegment<'_>],
     strict: bool,
+    depth: u8,
 ) -> Result<(IcerImage, Vec<bool>, usize)> {
     let first = &walked_all[0].header;
     if !first.transform_segmented {
@@ -564,13 +617,16 @@ fn decode_transform_domain(
     // One shared inverse transform (§V.B: "the inverse wavelet
     // transform combines data from adjacent segments").
     crate::wavelet_int::inverse_2d_dyadic(&mut coeffs, w, h, levels, first.filter);
-    let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
+    let mut img = IcerImage::zeros(w as u32, h as u32, gray_format(depth));
     let plane = &mut img.planes[0];
+    let sb = sample_bytes(depth);
+    let mid = 1i32 << (depth - 1);
+    let max_v = (1i32 << depth) - 1;
     for y in 0..h {
-        let dst = &mut plane.data[y * plane.stride..y * plane.stride + w];
+        let dst = &mut plane.data[y * plane.stride..][..w * sb];
         for x in 0..w {
-            let v = coeffs[y * w + x].saturating_add(128);
-            dst[x] = v.clamp(0, 255) as u8;
+            let v = coeffs[y * w + x].saturating_add(mid).clamp(0, max_v);
+            store_px(dst, x, sb, v);
         }
     }
     Ok((img, received, missing_count))
@@ -581,40 +637,41 @@ fn decode_segment_into(
     plane: &mut IcerPlane,
     y_offset: usize,
     canonical_width: usize,
+    depth: u8,
 ) -> Result<()> {
     let strip_h = walked.header.height as usize;
+    let sb = sample_bytes(depth);
     if walked.header.uncompressed {
         // A zero-packet (or zero-body) uncompressed segment is a
         // ROI-priority placeholder (round 6): no pixel data shipped,
-        // strip is reconstructed as all-128 (level-shifted zero).
+        // strip is reconstructed as the level-shift midpoint (128 at
+        // depth 8 — level-shifted zero).
         if walked.packets.is_empty() {
-            for y in 0..strip_h {
-                let dst = &mut plane.data[(y_offset + y) * plane.stride
-                    ..(y_offset + y) * plane.stride + canonical_width];
-                dst.fill(128);
-            }
+            fill_mid_rows(plane, y_offset, strip_h, canonical_width, depth);
             return Ok(());
         }
-        // Concatenate every packet body, then copy at most w*h bytes.
-        let mut concat: Vec<u8> = Vec::with_capacity(canonical_width * strip_h);
+        // Concatenate every packet body, then copy at most the strip's
+        // raw sample bytes (width * height * sample_bytes).
+        let row_bytes = canonical_width * sb;
+        let strip_bytes = row_bytes * strip_h;
+        let mut concat: Vec<u8> = Vec::with_capacity(strip_bytes);
         for p in &walked.packets {
             concat.extend_from_slice(p.body);
-            if concat.len() >= canonical_width * strip_h {
+            if concat.len() >= strip_bytes {
                 break;
             }
         }
-        if concat.len() < canonical_width * strip_h {
+        if concat.len() < strip_bytes {
             return Err(IcerError::Truncated);
         }
         for y in 0..strip_h {
-            let dst = &mut plane.data
-                [(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + canonical_width];
-            let src = &concat[y * canonical_width..y * canonical_width + canonical_width];
+            let dst = &mut plane.data[(y_offset + y) * plane.stride..][..row_bytes];
+            let src = &concat[y * row_bytes..(y + 1) * row_bytes];
             dst.copy_from_slice(src);
         }
         Ok(())
     } else {
-        decode_compressed_segment_into(walked, plane, y_offset, canonical_width, strip_h)
+        decode_compressed_segment_into(walked, plane, y_offset, canonical_width, strip_h, depth)
     }
 }
 
@@ -624,6 +681,7 @@ fn decode_compressed_segment_into(
     y_offset: usize,
     width: usize,
     height: usize,
+    depth: u8,
 ) -> Result<()> {
     let q = walked.header.bit_plane_count;
     let levels = walked.header.decomp_levels;
@@ -693,14 +751,17 @@ fn decode_compressed_segment_into(
         }
     };
     wavelet_int::inverse_2d_dyadic(&mut coeffs, width, height, levels, walked.header.filter);
-    // Inverse level-shift + clamp to 0..=255. Saturating: a corrupted
-    // stream can decode coefficients near i32::MAX (mutation smoke).
+    // Inverse level-shift + clamp to the n-bit domain (0..=255 at depth
+    // 8). Saturating: a corrupted stream can decode coefficients near
+    // i32::MAX (mutation smoke).
+    let sb = sample_bytes(depth);
+    let mid = 1i32 << (depth - 1);
+    let max_v = (1i32 << depth) - 1;
     for y in 0..height {
-        let dst =
-            &mut plane.data[(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + width];
+        let dst = &mut plane.data[(y_offset + y) * plane.stride..][..width * sb];
         for x in 0..width {
-            let v = coeffs[y * width + x].saturating_add(128);
-            dst[x] = v.clamp(0, 255) as u8;
+            let v = coeffs[y * width + x].saturating_add(mid).clamp(0, max_v);
+            store_px(dst, x, sb, v);
         }
     }
     Ok(())
@@ -790,10 +851,11 @@ pub fn parse_icer_lenient_with_limits(
     if crate::plane_container::is_container(bytes) {
         let parsed = crate::plane_container::parse_container(bytes)?;
         let n = parsed.format.plane_count();
+        let depth = parsed.format.bit_depth();
         let mut plane_decodes: Vec<LenientDecode> = Vec::with_capacity(n);
         for i in 0..n {
             let sub = parsed.plane_bytes(bytes, i);
-            plane_decodes.push(parse_icer_lenient_single_plane(sub, limits)?);
+            plane_decodes.push(parse_icer_lenient_single_plane(sub, limits, depth)?);
         }
         let w = plane_decodes[0].image.width;
         let h = plane_decodes[0].image.height;
@@ -823,12 +885,17 @@ pub fn parse_icer_lenient_with_limits(
         });
     }
 
-    parse_icer_lenient_single_plane(bytes, limits)
+    parse_icer_lenient_single_plane(bytes, limits, 8)
 }
 
-/// Single-plane (Gray8) lenient decode — the historical
-/// `parse_icer_lenient_with_limits` body.
-fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<LenientDecode> {
+/// Single-plane lenient decode at the given sample depth — the
+/// historical `parse_icer_lenient_with_limits` body (depth 8 for bare
+/// streams; the deep-gray container carries deeper depths).
+fn parse_icer_lenient_single_plane(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+    depth: u8,
+) -> Result<LenientDecode> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -893,7 +960,7 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
     // coefficients stay zero — a smooth low-detail patch through the
     // shared inverse transform rather than a flat-128 strip.
     if walked_all.iter().any(|w| w.header.transform_segmented) {
-        let (image, received, missing_count) = decode_transform_domain(&walked_all, false)?;
+        let (image, received, missing_count) = decode_transform_domain(&walked_all, false, depth)?;
         return Ok(LenientDecode {
             image,
             received,
@@ -951,7 +1018,7 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
     let mut img = IcerImage::zeros(
         canonical_width as u32,
         total_height as u32,
-        IcerPixelFormat::Gray8,
+        gray_format(depth),
     );
     let mut received = vec![false; expected_segment_count];
 
@@ -970,7 +1037,7 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
                 seg_idx, walked.header.height, strip_h
             )));
         }
-        decode_segment_into(walked, &mut img.planes[0], y_offset, canonical_width)?;
+        decode_segment_into(walked, &mut img.planes[0], y_offset, canonical_width, depth)?;
     }
 
     // Fill missing-segment regions with flat 128 (level-shifted zero,
@@ -986,12 +1053,13 @@ fn parse_icer_lenient_single_plane(bytes: &[u8], limits: &DecodeLimits) -> Resul
         // tighter source). Trailing-segment-missing case is handled by
         // the highest-received-index truncation above, so any missing
         // seg here is a *gap*, not a trailing drop.
-        let plane = &mut img.planes[0];
-        for y in 0..strip_h {
-            let dst = &mut plane.data
-                [(y_offset + y) * plane.stride..(y_offset + y) * plane.stride + canonical_width];
-            dst.fill(128);
-        }
+        fill_mid_rows(
+            &mut img.planes[0],
+            y_offset,
+            strip_h,
+            canonical_width,
+            depth,
+        );
     }
 
     Ok(LenientDecode {

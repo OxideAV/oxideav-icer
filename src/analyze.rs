@@ -34,6 +34,32 @@ use crate::error::Result;
 use crate::header::WaveletFilter;
 use crate::image::{IcerImage, IcerPixelFormat};
 
+/// Bytes per stored sample of an image's pixel format (1, or 2
+/// little-endian for [`IcerPixelFormat::GrayDeep`]).
+fn fmt_sample_bytes(image: &IcerImage) -> usize {
+    image.pixel_format.sample_bytes()
+}
+
+/// Read the sample at `(x, y)` of `plane` (stored at `sb` bytes per
+/// sample), widened to `i32`.
+#[inline]
+fn plane_sample(plane: &crate::image::IcerPlane, sb: usize, x: usize, y: usize) -> i32 {
+    let off = y * plane.stride + x * sb;
+    if sb == 2 {
+        u16::from_le_bytes([plane.data[off], plane.data[off + 1]]) as i32
+    } else {
+        plane.data[off] as i32
+    }
+}
+
+/// The PSNR / SSIM peak value `2^b - 1` for an image's sample depth —
+/// IPN 42-155 §VII defines PSNR as `20 log10((2^b - 1) / sqrt(MSE))`
+/// "where b is the number of bits/pixel in the original image" (255 on
+/// the historical 8-bit path, 4095 for the paper's 12-bit test set).
+fn peak_value(image: &IcerImage) -> f64 {
+    ((1u32 << image.pixel_format.bit_depth()) - 1) as f64
+}
+
 /// One-pass image statistics. Captures the metrics the filter-selection
 /// heuristic [`recommend_filter`] consumes.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,6 +84,14 @@ impl ImageStats {
     /// Scan the first plane of `image` and produce its statistics.
     /// Panics on `image.planes.is_empty()` -- callers should validate
     /// before calling.
+    ///
+    /// Deep-sample ([`IcerPixelFormat::GrayDeep`]) images are scanned
+    /// with each sample **down-shifted to the 8-bit domain**
+    /// (`sample >> (bits - 8)`): every statistic keeps its documented
+    /// `0..=255` range and the [`recommend_filter`] decision-tree
+    /// thresholds — calibrated on 8-bit content — keep their meaning
+    /// (the §II.A filter choice only depends on the image's *shape*,
+    /// not its absolute scale).
     pub fn from_image(image: &IcerImage) -> Self {
         let plane = image
             .planes
@@ -77,13 +111,17 @@ impl ImageStats {
             };
         }
 
+        let sb = fmt_sample_bytes(image);
+        let shift = image.pixel_format.bit_depth().saturating_sub(8);
+        let px = |x: usize, y: usize| -> u8 { (plane_sample(plane, sb, x, y) >> shift) as u8 };
+
         let mut sum: f64 = 0.0;
         let mut sum_sq: f64 = 0.0;
         let mut min: u8 = 255;
         let mut max: u8 = 0;
         for y in 0..h {
-            let row = &plane.data[y * plane.stride..y * plane.stride + w];
-            for &p in row {
+            for x in 0..w {
+                let p = px(x, y);
                 sum += p as f64;
                 sum_sq += (p as f64) * (p as f64);
                 if p < min {
@@ -102,19 +140,16 @@ impl ImageStats {
         let mut h_grad: f64 = 0.0;
         let mut h_grad_n: f64 = 0.0;
         for y in 0..h {
-            let row = &plane.data[y * plane.stride..y * plane.stride + w];
             for x in 1..w {
-                h_grad += (row[x] as f64 - row[x - 1] as f64).abs();
+                h_grad += (px(x, y) as f64 - px(x - 1, y) as f64).abs();
                 h_grad_n += 1.0;
             }
         }
         let mut v_grad: f64 = 0.0;
         let mut v_grad_n: f64 = 0.0;
         for y in 1..h {
-            let prev = &plane.data[(y - 1) * plane.stride..(y - 1) * plane.stride + w];
-            let cur = &plane.data[y * plane.stride..y * plane.stride + w];
             for x in 0..w {
-                v_grad += (cur[x] as f64 - prev[x] as f64).abs();
+                v_grad += (px(x, y) as f64 - px(x, y - 1) as f64).abs();
                 v_grad_n += 1.0;
             }
         }
@@ -251,8 +286,10 @@ pub fn analyze(image: &IcerImage) -> (ImageStats, WaveletFilter) {
 /// scan. Returns the canonical pixel format check the encoder uses, so
 /// callers can fail fast.
 pub fn supported_for_analysis(image: &IcerImage) -> bool {
-    image.pixel_format == IcerPixelFormat::Gray8
-        && !image.planes.is_empty()
+    matches!(
+        image.pixel_format,
+        IcerPixelFormat::Gray8 | IcerPixelFormat::GrayDeep { .. }
+    ) && !image.planes.is_empty()
         && image.width > 0
         && image.height > 0
 }
@@ -260,10 +297,12 @@ pub fn supported_for_analysis(image: &IcerImage) -> bool {
 /// Compute PSNR (dB) of the first plane of `decoded` against `original`.
 ///
 /// Returns [`f32::INFINITY`] when the planes are bit-identical (MSE
-/// 0). Returns a finite, non-negative value otherwise (the
-/// `10 * log10(255^2 / MSE)` formula used in every round-trip test in
-/// this crate). Panics on dimension mismatch or empty planes -- callers
-/// are expected to feed a same-shape `(original, decoded)` pair.
+/// 0). Returns a finite, non-negative value otherwise: the IPN 42-155
+/// §VII definition `10 * log10((2^b - 1)^2 / MSE)` with `b` the
+/// original image's sample depth (255^2 on the historical 8-bit path;
+/// the paper's own benchmarks use `b = 12`). Panics on dimension
+/// mismatch or empty planes -- callers are expected to feed a
+/// same-shape `(original, decoded)` pair.
 pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
     assert_eq!(original.width, decoded.width, "psnr_db: width mismatch");
     assert_eq!(original.height, decoded.height, "psnr_db: height mismatch");
@@ -281,12 +320,12 @@ pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
         .planes
         .first()
         .expect("psnr_db: decoded has no planes");
+    let osb = fmt_sample_bytes(original);
+    let dsb = fmt_sample_bytes(decoded);
     let mut mse_sum = 0.0f64;
     for y in 0..h {
-        let orow = &op.data[y * op.stride..y * op.stride + w];
-        let drow = &dp.data[y * dp.stride..y * dp.stride + w];
         for x in 0..w {
-            let diff = orow[x] as f64 - drow[x] as f64;
+            let diff = plane_sample(op, osb, x, y) as f64 - plane_sample(dp, dsb, x, y) as f64;
             mse_sum += diff * diff;
         }
     }
@@ -294,7 +333,8 @@ pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
     if mse == 0.0 {
         f32::INFINITY
     } else {
-        (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+        let peak = peak_value(original);
+        (10.0 * (peak * peak / mse).log10()) as f32
     }
 }
 
@@ -326,8 +366,9 @@ pub struct DistortionReport {
     pub rmse: f64,
     /// Mean absolute error over the first plane, in pixel units.
     pub mae: f64,
-    /// Largest single-pixel absolute error (`0..=255`).
-    pub max_abs_error: u8,
+    /// Largest single-pixel absolute error (`0..=255` at depth 8; up
+    /// to `2^b - 1` for deep-sample images).
+    pub max_abs_error: u16,
     /// Peak signal-to-noise ratio in dB (`f32::INFINITY` if bit-exact).
     pub psnr_db: f32,
 }
@@ -368,14 +409,15 @@ impl DistortionReport {
             });
         }
 
+        let osb = fmt_sample_bytes(original);
+        let dsb = fmt_sample_bytes(decoded);
         let mut sq_sum = 0.0f64;
         let mut abs_sum = 0.0f64;
-        let mut max_abs = 0u8;
+        let mut max_abs = 0u16;
         for y in 0..h {
-            let orow = &op.data[y * op.stride..y * op.stride + w];
-            let drow = &dp.data[y * dp.stride..y * dp.stride + w];
             for x in 0..w {
-                let abs = (orow[x] as i32 - drow[x] as i32).unsigned_abs() as u8;
+                let abs = (plane_sample(op, osb, x, y) - plane_sample(dp, dsb, x, y)).unsigned_abs()
+                    as u16;
                 if abs > max_abs {
                     max_abs = abs;
                 }
@@ -388,7 +430,8 @@ impl DistortionReport {
         let psnr = if mse == 0.0 {
             f32::INFINITY
         } else {
-            (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+            let peak = peak_value(original);
+            (10.0 * (peak * peak / mse).log10()) as f32
         };
         Ok(DistortionReport {
             mse,
@@ -452,12 +495,13 @@ pub fn region_mae(
 
     let x0 = x0 as usize;
     let x_end = x_end as usize;
+    let osb = fmt_sample_bytes(original);
+    let dsb = fmt_sample_bytes(decoded);
     let mut abs_sum = 0.0f64;
     for y in y0 as usize..y_end as usize {
-        let orow = &op.data[y * op.stride + x0..y * op.stride + x_end];
-        let drow = &dp.data[y * dp.stride + x0..y * dp.stride + x_end];
-        for (o, d) in orow.iter().zip(drow.iter()) {
-            abs_sum += (*o as i32 - *d as i32).unsigned_abs() as f64;
+        for x in x0..x_end {
+            abs_sum +=
+                (plane_sample(op, osb, x, y) - plane_sample(dp, dsb, x, y)).unsigned_abs() as f64;
         }
     }
     let n = (region_w as f64) * (region_h as f64);
@@ -525,11 +569,12 @@ pub fn ssim(original: &IcerImage, decoded: &IcerImage) -> Result<f64> {
         return Ok(1.0);
     }
 
-    // Stabilisation constants from the standard SSIM definition for an
-    // 8-bit dynamic range (L = 255): C1 = (0.01 L)^2, C2 = (0.03 L)^2.
-    const L: f64 = 255.0;
-    let c1 = (0.01 * L) * (0.01 * L);
-    let c2 = (0.03 * L) * (0.03 * L);
+    // Stabilisation constants from the standard SSIM definition,
+    // scaled to the image's dynamic range (L = 255 at depth 8, 2^b - 1
+    // deeper): C1 = (0.01 L)^2, C2 = (0.03 L)^2.
+    let l_peak = peak_value(original);
+    let c1 = (0.01 * l_peak) * (0.01 * l_peak);
+    let c2 = (0.03 * l_peak) * (0.03 * l_peak);
 
     // Window edge clamped to the image extent so sub-window images use a
     // single full-image window rather than producing no scores at all.
@@ -552,11 +597,9 @@ pub fn ssim(original: &IcerImage, decoded: &IcerImage) -> Result<f64> {
             let mut sum_yy = 0.0f64;
             let mut sum_xy = 0.0f64;
             for dy in 0..win_h {
-                let orow = &op.data[(wy + dy) * op.stride..];
-                let drow = &dp.data[(wy + dy) * dp.stride..];
                 for dx in 0..win_w {
-                    let x = orow[wx + dx] as f64;
-                    let y = drow[wx + dx] as f64;
+                    let x = plane_sample(op, fmt_sample_bytes(original), wx + dx, wy + dy) as f64;
+                    let y = plane_sample(dp, fmt_sample_bytes(decoded), wx + dx, wy + dy) as f64;
                     sum_x += x;
                     sum_y += y;
                     sum_xx += x * x;

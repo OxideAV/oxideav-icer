@@ -77,12 +77,12 @@ fn distortion_report_constant_offset_metrics_are_exact() {
     let h = original.height as usize;
     let mut sq = 0.0f64;
     let mut ab = 0.0f64;
-    let mut mx = 0u8;
+    let mut mx = 0u16;
     for y in 0..h {
         for x in 0..w {
             let o = original.planes[0].data[y * stride_o + x] as i32;
             let d = decoded.planes[0].data[y * stride_d + x] as i32;
-            let a = (o - d).unsigned_abs() as u8;
+            let a = (o - d).unsigned_abs() as u16;
             if a > mx {
                 mx = a;
             }

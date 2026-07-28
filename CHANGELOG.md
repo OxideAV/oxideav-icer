@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deep-sample (9..=16-bit) 2-D grayscale support**
+  (`IcerPixelFormat::GrayDeep { bits }`) — IPN 42-155 §II.C's own
+  operating point ("On MER, all cameras produce 12-bit pixels and each
+  is stored using a 16-bit word"; every §VII benchmark image is
+  12-bit). A deep image is one single-plane segment stream whose
+  coefficients span the deeper range — the §III bit-plane coder,
+  context model, and packet machinery are depth-agnostic — wrapped in
+  the plane-container framing with new format tag `2` plus one
+  bit-depth byte (the 12-byte segment header has no free field left,
+  and a bare deep stream would be indistinguishable from an 8-bit
+  one). The §III.A level shift generalises to `2^(n-1)`, the decode
+  clamp to `[0, 2^n - 1]`, placeholder / missing-strip fills to the
+  n-bit midpoint, and the §III.D raw path ships little-endian sample
+  pairs. Samples live LSB-aligned in little-endian `u16` words
+  (`IcerImage::{sample, set_sample}` accessors added); the `registry`
+  conversion maps 10-/12-/16-bit onto the matching `oxideav-core`
+  plain-gray deep formats. **Every existing wire form is unchanged**:
+  Gray8 streams stay bare byte-for-byte, colour containers keep tag 1.
+  Composes with all seven §II.A filters (lossless end to end, pinned
+  9..=16), row-strip and §V.B transform-domain segmentation, both
+  entropy backends, §III.A priority interleaving, §VI.A min-loss,
+  §VI.B byte quotas (the container's 9 framing bytes are charged
+  against the budget so the hard cap bounds the total output), ROI
+  priorities, the §III.D fallback, lenient decode (deep midpoint
+  fill), `DecodeLimits`, and quality-target rate-control. Quality
+  metrics follow IPN 42-155 §VII: PSNR / SSIM peaks are now
+  `2^b - 1` per the original image's depth (`DistortionReport::
+  max_abs_error` widened to `u16`); `ImageStats` scans deep samples
+  down-shifted to the 8-bit domain so the filter-selection thresholds
+  keep their calibration.
+
 - **IPN 42-155 §II.C dynamic-range analysis for the 2-D path**
   (`wavelet_int::{abs_tap_sum, approx_max_input_range, max_input_range,
   word_bits_for_input_range}`): the Table 3 `Σ|c_i|` per-filter

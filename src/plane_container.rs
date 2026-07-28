@@ -35,11 +35,28 @@
 //! |   2   | sentinel 0x0000  | container marker (BE)                  |
 //! |   1   | format tag       | IcerPixelFormat discriminant           |
 //! |   1   | plane count N    | redundant with format; cross-checked   |
+//! |  0/1  | bit depth        | GrayDeep (tag 2) only: 9..=16          |
 //! |  4*N  | plane lengths    | byte length of each plane substream, BE|
 //! |  ...  | plane 0 substream| a full single-plane ICER bitstream     |
 //! |  ...  | plane 1 substream|                                        |
 //! |  ...  | ...              |                                        |
 //! ```
+//!
+//! # Deep-sample grayscale (tag 2)
+//!
+//! IPN 42-155 §II.C's operating point is deep imagery ("On MER, all
+//! cameras produce 12-bit pixels and each is stored using a 16-bit
+//! word"; every §VII benchmark image is 12-bit). The 12-byte segment
+//! header has no free field left to carry a sample depth, and a bare
+//! deep stream would be indistinguishable from an 8-bit one — so a
+//! deep ([`IcerPixelFormat::GrayDeep`]) image rides the same container
+//! framing with format tag `2` and one extra header byte carrying the
+//! bit depth (`9..=16`). Inside, the single plane substream is a
+//! normal segment stream whose coefficients simply span the deeper
+//! range (the §III bit-plane coder is depth-agnostic; the §II.C
+//! Table 4 analysis shows 16-bit input can never overflow the crate's
+//! `i32` coefficient words). Every pre-existing single-plane and
+//! colour stream parses unchanged (tags 0/1 have no depth byte).
 //!
 //! Each plane substream is itself a complete, independently-decodable
 //! single-plane ICER bitstream (one or more segments). The container adds
@@ -55,9 +72,16 @@ use crate::image::IcerPixelFormat;
 /// with it (segment sync prefixes are non-zero).
 pub const CONTAINER_SENTINEL: u16 = 0x0000;
 
-/// Fixed size of the container header *before* the per-plane length table:
-/// 2-byte sentinel + 1-byte format tag + 1-byte plane count.
+/// Fixed size of the container header *before* the optional bit-depth
+/// byte and the per-plane length table: 2-byte sentinel + 1-byte format
+/// tag + 1-byte plane count.
 const FIXED_PREFIX_BYTES: usize = 4;
+
+/// Total framing overhead of a deep-gray (tag 2) container around its
+/// single plane substream: the fixed prefix, the bit-depth byte, and
+/// one 4-byte length-table entry. The encoder subtracts this from a
+/// caller's byte budget so the §VI hard cap bounds the *total* output.
+pub(crate) const DEEP_GRAY_OVERHEAD: usize = FIXED_PREFIX_BYTES + 1 + 4;
 
 /// Format-tag discriminant written to the container header. Kept stable
 /// and explicit (not `as u8` on the enum) so the wire encoding does not
@@ -66,18 +90,21 @@ fn format_tag(fmt: IcerPixelFormat) -> u8 {
     match fmt {
         IcerPixelFormat::Gray8 => 0,
         IcerPixelFormat::Yuv444P => 1,
+        IcerPixelFormat::GrayDeep { .. } => 2,
     }
 }
 
-/// Inverse of [`format_tag`].
-fn format_from_tag(tag: u8) -> Result<IcerPixelFormat> {
-    match tag {
-        0 => Ok(IcerPixelFormat::Gray8),
-        1 => Ok(IcerPixelFormat::Yuv444P),
-        other => Err(IcerError::invalid(format!(
-            "unknown plane-container format tag {other}"
-        ))),
+/// Validate a deep-sample bit depth (the [`IcerPixelFormat::GrayDeep`]
+/// contract): `9..=16`. Depth 8 must ride the bare Gray8 wire form
+/// (byte-compatibility invariant), deeper than 16 exceeds the sample
+/// word.
+pub(crate) fn validate_deep_bits(bits: u8) -> Result<()> {
+    if !(9..=16).contains(&bits) {
+        return Err(IcerError::invalid(format!(
+            "deep-sample bit depth {bits} outside 9..=16"
+        )));
     }
+    Ok(())
 }
 
 /// True when `bytes` begins with the multi-plane container sentinel.
@@ -116,11 +143,15 @@ pub fn encode_container(format: IcerPixelFormat, plane_streams: &[Vec<u8>]) -> R
     }
 
     let total: usize =
-        FIXED_PREFIX_BYTES + 4 * n + plane_streams.iter().map(|s| s.len()).sum::<usize>();
+        FIXED_PREFIX_BYTES + 1 + 4 * n + plane_streams.iter().map(|s| s.len()).sum::<usize>();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&CONTAINER_SENTINEL.to_be_bytes());
     out.push(format_tag(format));
     out.push(n as u8);
+    if let IcerPixelFormat::GrayDeep { bits } = format {
+        validate_deep_bits(bits)?;
+        out.push(bits);
+    }
     for s in plane_streams {
         out.extend_from_slice(&(s.len() as u32).to_be_bytes());
     }
@@ -162,8 +193,26 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer> {
             "not a plane-container (sentinel mismatch)",
         ));
     }
-    let format = format_from_tag(bytes[2])?;
+    let tag = bytes[2];
     let declared_n = bytes[3] as usize;
+    // Tag 2 (deep gray) carries one extra header byte: the bit depth.
+    let (format, table_start) = match tag {
+        0 => (IcerPixelFormat::Gray8, FIXED_PREFIX_BYTES),
+        1 => (IcerPixelFormat::Yuv444P, FIXED_PREFIX_BYTES),
+        2 => {
+            if bytes.len() < FIXED_PREFIX_BYTES + 1 {
+                return Err(IcerError::Truncated);
+            }
+            let bits = bytes[FIXED_PREFIX_BYTES];
+            validate_deep_bits(bits)?;
+            (IcerPixelFormat::GrayDeep { bits }, FIXED_PREFIX_BYTES + 1)
+        }
+        other => {
+            return Err(IcerError::invalid(format!(
+                "unknown plane-container format tag {other}"
+            )))
+        }
+    };
     let expected_n = format.plane_count();
     if declared_n != expected_n {
         return Err(IcerError::invalid(format!(
@@ -171,7 +220,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer> {
         )));
     }
 
-    let table_end = FIXED_PREFIX_BYTES
+    let table_end = table_start
         .checked_add(4 * declared_n)
         .ok_or(IcerError::Truncated)?;
     if bytes.len() < table_end {
@@ -180,7 +229,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer> {
 
     let mut lengths = Vec::with_capacity(declared_n);
     for i in 0..declared_n {
-        let off = FIXED_PREFIX_BYTES + 4 * i;
+        let off = table_start + 4 * i;
         let len = u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
             as usize;
         lengths.push(len);
@@ -246,6 +295,36 @@ mod tests {
         framed.truncate(framed.len() - 2);
         assert!(matches!(
             parse_container(&framed),
+            Err(IcerError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn deep_gray_roundtrip_carries_depth() {
+        let inner = vec![vec![0xAAu8, 0xBB, 0xCC]];
+        let framed = encode_container(IcerPixelFormat::GrayDeep { bits: 12 }, &inner).unwrap();
+        assert!(is_container(&framed));
+        assert_eq!(framed[2], 2, "format tag");
+        assert_eq!(framed[3], 1, "plane count");
+        assert_eq!(framed[4], 12, "depth byte");
+        let parsed = parse_container(&framed).unwrap();
+        assert_eq!(parsed.format, IcerPixelFormat::GrayDeep { bits: 12 });
+        assert_eq!(parsed.plane_bytes(&framed, 0), inner[0].as_slice());
+    }
+
+    #[test]
+    fn deep_gray_invalid_depths_rejected() {
+        for bits in [0u8, 8, 17, 255] {
+            let err =
+                encode_container(IcerPixelFormat::GrayDeep { bits }, &[vec![1u8]]).unwrap_err();
+            assert!(matches!(err, IcerError::InvalidData(_)), "bits {bits}");
+            // Parse side: a hand-built container with the bad depth.
+            let framed = vec![0u8, 0, 2, 1, bits, 0, 0, 0, 1, 1];
+            assert!(parse_container(&framed).is_err(), "parse bits {bits}");
+        }
+        // Truncated before the depth byte.
+        assert!(matches!(
+            parse_container(&[0u8, 0, 2, 1]),
             Err(IcerError::Truncated)
         ));
     }

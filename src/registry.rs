@@ -34,6 +34,13 @@ impl From<IcerPixelFormat> for PixelFormat {
         match p {
             IcerPixelFormat::Gray8 => PixelFormat::Gray8,
             IcerPixelFormat::Yuv444P => PixelFormat::Yuv444P,
+            // Deep gray samples are stored LSB-aligned in little-endian
+            // 16-bit words (the plain-gray deep-word convention); the
+            // exact 10-/12-bit rungs map onto their dedicated core
+            // formats, every other depth rides the 16-bit word as-is.
+            IcerPixelFormat::GrayDeep { bits: 10 } => PixelFormat::Gray10Le,
+            IcerPixelFormat::GrayDeep { bits: 12 } => PixelFormat::Gray12Le,
+            IcerPixelFormat::GrayDeep { .. } => PixelFormat::Gray16Le,
         }
     }
 }

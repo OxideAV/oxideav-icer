@@ -26,6 +26,70 @@ use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
 use crate::wavelet_int;
 
+/// A borrowed sample plane paired with its bit depth — the unit every
+/// single-plane encode path reads pixels through. Depth 8 reads one
+/// byte per sample; deeper formats ([`IcerPixelFormat::GrayDeep`])
+/// read little-endian `u16` pairs. The §III.A level shift and the
+/// §III.D raw-pixel body both derive from the depth, so threading the
+/// pair keeps every path (row strips, §V.B transform-domain, quota,
+/// R-D, fallback) depth-agnostic.
+#[derive(Clone, Copy)]
+pub(crate) struct PlaneView<'a> {
+    plane: &'a IcerPlane,
+    depth: u8,
+}
+
+impl<'a> PlaneView<'a> {
+    pub(crate) fn new(plane: &'a IcerPlane, depth: u8) -> Self {
+        debug_assert!((8..=16).contains(&depth));
+        Self { plane, depth }
+    }
+
+    /// The §III.A level-shift midpoint `2^(n-1)` for `n`-bit samples
+    /// (128 for the historical 8-bit path).
+    fn mid(self) -> i32 {
+        1 << (self.depth - 1)
+    }
+
+    /// Bytes per stored sample (1 or 2).
+    fn sample_bytes(self) -> usize {
+        if self.depth > 8 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Sample at `(x, y)`, widened to `i32`.
+    fn sample(self, x: usize, y: usize) -> i32 {
+        let sb = self.sample_bytes();
+        let off = y * self.plane.stride + x * sb;
+        if sb == 2 {
+            u16::from_le_bytes([self.plane.data[off], self.plane.data[off + 1]]) as i32
+        } else {
+            self.plane.data[off] as i32
+        }
+    }
+
+    /// Push one level-shifted row (`sample - 2^(n-1)`, §III.A) onto
+    /// `out`.
+    fn shifted_row_into(self, out: &mut Vec<i32>, y: usize, w: usize) {
+        let mid = self.mid();
+        for x in 0..w {
+            out.push(self.sample(x, y) - mid);
+        }
+    }
+
+    /// Append one row's raw sample bytes (the §III.D uncompressed body
+    /// wire form: the in-memory layout — one byte per sample at depth
+    /// 8, little-endian pairs deeper).
+    fn raw_row_extend(self, out: &mut Vec<u8>, y: usize, w: usize) {
+        let sb = self.sample_bytes();
+        let off = y * self.plane.stride;
+        out.extend_from_slice(&self.plane.data[off..off + w * sb]);
+    }
+}
+
 /// Encoder options.
 ///
 /// Note: this type is `Clone` (not `Copy`) because the
@@ -614,7 +678,109 @@ pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     match image.pixel_format {
         IcerPixelFormat::Gray8 => encode_icer_single_plane(image, opts),
         IcerPixelFormat::Yuv444P => encode_icer_multi_plane(image, opts),
+        IcerPixelFormat::GrayDeep { bits } => encode_icer_deep(image, bits, opts),
     }
+}
+
+/// Encode a deep-sample ([`IcerPixelFormat::GrayDeep`]) grayscale image:
+/// one single-plane segment stream whose coefficients span the deeper
+/// range, wrapped in the [`crate::plane_container`] deep-gray framing
+/// (format tag 2) that carries the bit depth the 12-byte segment header
+/// has no field for. IPN 42-155 §II.C's own operating point is deep
+/// imagery (12-bit MER pixels in 16-bit words; every §VII benchmark
+/// image is 12-bit), and the §II.C Table 4 analysis guarantees 16-bit
+/// input can never overflow the crate's `i32` coefficient words.
+fn encode_icer_deep(image: &IcerImage, bits: u8, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    crate::plane_container::validate_deep_bits(bits)?;
+    if image.planes.len() != 1 {
+        return Err(IcerError::invalid(format!(
+            "deep grayscale image must carry exactly 1 plane, got {}",
+            image.planes.len()
+        )));
+    }
+
+    // Filter auto-selection mirrors the single-plane entry: resolve
+    // once up-front, then thread a concrete filter id everywhere.
+    let resolved_opts = resolve_auto_filter(image, opts)?;
+    let opts = &resolved_opts;
+
+    // Quality-target rate-control runs at THIS level so its trial
+    // encodes/decodes see full container-framed streams (a bare deep
+    // stream would be indistinguishable from an 8-bit one on decode)
+    // and the container wrap happens exactly once: the trials clear
+    // `quality_target_psnr`, so their recursive `encode_icer` calls
+    // fall through to the plain wrap below.
+    if let Some(target_db) = opts.quality_target_psnr {
+        if !opts.uncompressed {
+            reject_quality_target_conflicts(opts)?;
+            return crate::analyze::encode_to_quality_target(image, opts, target_db);
+        }
+    }
+
+    // The container framing (sentinel + tag + count + depth + length
+    // table) is part of the transmitted output, so a byte quota / soft
+    // target must cover it: shrink the inner budget by the fixed
+    // overhead so the §VI hard-cap contract ("output <= byte_budget")
+    // holds on the total stream.
+    let overhead = crate::plane_container::DEEP_GRAY_OVERHEAD as u64;
+    let mut body_opts = opts.clone();
+    if let Some(b) = body_opts.byte_budget {
+        body_opts.byte_budget = Some(b.saturating_sub(overhead));
+    }
+    if let Some(t) = body_opts.target_bytes {
+        body_opts.target_bytes = Some(t.saturating_sub(overhead));
+    }
+    let inner = encode_single_plane_body(image, &body_opts)?;
+    crate::plane_container::encode_container(image.pixel_format, &[inner])
+}
+
+/// Resolve [`EncodeOptions::auto_filter`] /
+/// [`EncodeOptions::auto_filter_rd`] into a concrete filter id (no-op
+/// clone when auto-selection is off or the uncompressed path is
+/// forced). Shared by the Gray8 and deep-sample entries.
+fn resolve_auto_filter(image: &IcerImage, opts: &EncodeOptions) -> Result<EncodeOptions> {
+    if opts.auto_filter && !opts.uncompressed {
+        let chosen = if opts.auto_filter_rd {
+            let (filter, _bytes) = crate::analyze::pick_filter_by_rate_distortion(
+                image,
+                opts,
+                crate::analyze::DEFAULT_RD_CANDIDATES,
+            )?;
+            filter
+        } else {
+            let stats = crate::analyze::ImageStats::from_image(image);
+            crate::analyze::recommend_filter(&stats)
+        };
+        Ok(EncodeOptions {
+            filter: chosen,
+            auto_filter: false,
+            auto_filter_rd: false,
+            ..opts.clone()
+        })
+    } else {
+        Ok(opts.clone())
+    }
+}
+
+/// The [`EncodeOptions::quality_target_psnr`] mutual-exclusion rules
+/// (the search manages the byte budget itself).
+fn reject_quality_target_conflicts(opts: &EncodeOptions) -> Result<()> {
+    if opts.byte_budget.is_some() {
+        return Err(IcerError::Unsupported(
+            "quality_target_psnr conflicts with byte_budget; pick one".into(),
+        ));
+    }
+    if opts.target_bytes.is_some() {
+        return Err(IcerError::Unsupported(
+            "quality_target_psnr conflicts with target_bytes; pick one".into(),
+        ));
+    }
+    if opts.rd_pruning {
+        return Err(IcerError::Unsupported(
+            "quality_target_psnr conflicts with rd_pruning; pick one".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Encode a multi-plane (colour) image as N independent single-plane ICER
@@ -658,73 +824,46 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
             "single-plane encoder requires Gray8".into(),
         ));
     }
-    let plane = image
-        .planes
-        .first()
-        .ok_or_else(|| IcerError::invalid("image has no planes"))?;
-    let w = image.width as usize;
-    let h = image.height as usize;
-    if w == 0 || h == 0 {
-        return Err(IcerError::invalid("image has zero dimension"));
-    }
 
     // Round 5: automatic filter selection. Resolve the effective filter
     // once at the top of encode, then proceed with a `resolved_opts`
     // that has `auto_filter` cleared so downstream paths see a
     // concrete filter id.
-    let resolved_opts = if opts.auto_filter && !opts.uncompressed {
-        let chosen = if opts.auto_filter_rd {
-            let (filter, _bytes) = crate::analyze::pick_filter_by_rate_distortion(
-                image,
-                opts,
-                crate::analyze::DEFAULT_RD_CANDIDATES,
-            )?;
-            filter
-        } else {
-            let stats = crate::analyze::ImageStats::from_image(image);
-            crate::analyze::recommend_filter(&stats)
-        };
-        EncodeOptions {
-            filter: chosen,
-            auto_filter: false,
-            auto_filter_rd: false,
-            ..opts.clone()
-        }
-    } else {
-        opts.clone()
-    };
+    let resolved_opts = resolve_auto_filter(image, opts)?;
     let opts = &resolved_opts;
 
     // Round 233: quality-target rate-control. Run a binary search over
     // byte-budget values, encode + decode each trial, compute PSNR,
     // and emit the smallest output meeting the target. The search is
     // implemented in `crate::analyze` so the encoder's main flow stays
-    // focused on the single-shot path.
+    // focused on the single-shot path. (Uncompressed-forced falls
+    // through: the round-trip is bit-exact by construction, every
+    // finite PSNR target is satisfied trivially.)
     if let Some(target_db) = opts.quality_target_psnr {
         if !opts.uncompressed {
-            // Reject conflicting options up-front: byte_budget /
-            // target_bytes / rd_pruning all conflict with the quality
-            // search managing the budget itself.
-            if opts.byte_budget.is_some() {
-                return Err(IcerError::Unsupported(
-                    "quality_target_psnr conflicts with byte_budget; pick one".into(),
-                ));
-            }
-            if opts.target_bytes.is_some() {
-                return Err(IcerError::Unsupported(
-                    "quality_target_psnr conflicts with target_bytes; pick one".into(),
-                ));
-            }
-            if opts.rd_pruning {
-                return Err(IcerError::Unsupported(
-                    "quality_target_psnr conflicts with rd_pruning; pick one".into(),
-                ));
-            }
+            reject_quality_target_conflicts(opts)?;
             return crate::analyze::encode_to_quality_target(image, opts, target_db);
         }
-        // Uncompressed-forced: the round-trip is bit-exact by
-        // construction, every finite PSNR target is satisfied
-        // trivially. Fall through to the regular encode path.
+    }
+
+    encode_single_plane_body(image, opts)
+}
+
+/// The single-plane encode body shared by the Gray8 and deep-sample
+/// entries: everything after filter resolution + quality-target
+/// dispatch. `opts` must already carry a concrete filter id. Returns a
+/// **bare** segment stream (the deep entry wraps it in the plane
+/// container).
+fn encode_single_plane_body(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    let plane = image
+        .planes
+        .first()
+        .ok_or_else(|| IcerError::invalid("image has no planes"))?;
+    let view = PlaneView::new(plane, image.pixel_format.bit_depth());
+    let w = image.width as usize;
+    let h = image.height as usize;
+    if w == 0 || h == 0 {
+        return Err(IcerError::invalid("image has zero dimension"));
     }
 
     let segment_count = opts.segment_count.max(1);
@@ -773,11 +912,11 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
                     .into(),
             ));
         }
-        return encode_transform_segmented(plane, w, h, opts, levels);
+        return encode_transform_segmented(view, w, h, opts, levels);
     }
 
     if segment_count == 1 {
-        let bytes = encode_one_segment(plane, w, 0, h, 0, opts, levels)?;
+        let bytes = encode_one_segment(view, w, 0, h, 0, opts, levels)?;
         if let Some(budget) = opts.byte_budget {
             if bytes.len() as u64 > budget {
                 // The lone segment cannot fit the byte budget even after
@@ -868,7 +1007,7 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
         let mut plans = Vec::with_capacity(n_segs);
         for (seg_idx, &(y_start, this_h)) in starts_heights.iter().enumerate() {
             plans.push(plan_one_row_segment_compressed(
-                plane,
+                view,
                 w,
                 y_start,
                 this_h,
@@ -917,8 +1056,7 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
             } else {
                 opts.clone()
             };
-            let bytes =
-                encode_one_segment(plane, w, y_start, this_h, seg_idx, &inner_opts, levels)?;
+            let bytes = encode_one_segment(view, w, y_start, this_h, seg_idx, &inner_opts, levels)?;
             if let Some(budget) = opts.byte_budget {
                 let reserve =
                     (n_segs - 1 - seg_idx as usize) as u64 * (SegmentHeader::ENCODED_BYTES as u64);
@@ -938,7 +1076,7 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     let mut encoded_segments: Vec<Vec<u8>> = Vec::with_capacity(n_segs);
     for seg_idx in 0..n_segs {
         let (y_start, this_h) = starts_heights[seg_idx];
-        let bytes = encode_one_segment(plane, w, y_start, this_h, seg_idx as u16, opts, levels)?;
+        let bytes = encode_one_segment(view, w, y_start, this_h, seg_idx as u16, opts, levels)?;
         encoded_segments.push(bytes);
     }
     // First pass: walk emission order, greedily include whole encoded
@@ -1024,7 +1162,7 @@ fn resolve_emission_order(opts: &EncodeOptions, n_segs: usize) -> Result<Vec<u16
 /// low-detail patch through the shared inverse transform, the §V.B
 /// containment behaviour).
 fn encode_transform_segmented(
-    plane: &IcerPlane,
+    view: PlaneView<'_>,
     w: usize,
     h: usize,
     opts: &EncodeOptions,
@@ -1054,10 +1192,7 @@ fn encode_transform_segmented(
     // §III.A level shift + one whole-image forward DWT.
     let mut coeffs: Vec<i32> = Vec::with_capacity(w * h);
     for y in 0..h {
-        let row = &plane.data[y * plane.stride..y * plane.stride + w];
-        for &px in row {
-            coeffs.push(px as i32 - 128);
-        }
+        view.shifted_row_into(&mut coeffs, y, w);
     }
     wavelet_int::forward_2d_dyadic(&mut coeffs, w, h, levels, opts.filter);
 
@@ -1303,7 +1438,7 @@ fn plan_packets_priority(
 /// §III.D fallback), returning the unbudgeted packet sequence instead
 /// of quota-cut wire bytes.
 fn plan_one_row_segment_compressed(
-    plane: &IcerPlane,
+    view: PlaneView<'_>,
     img_w: usize,
     y_start: usize,
     strip_h: usize,
@@ -1318,11 +1453,7 @@ fn plan_one_row_segment_compressed(
     }
     let mut coeffs: Vec<i32> = Vec::with_capacity(img_w * strip_h);
     for y in 0..strip_h {
-        let src_y = y_start + y;
-        let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
-        for &px in row {
-            coeffs.push(px as i32 - 128);
-        }
+        view.shifted_row_into(&mut coeffs, y_start + y, img_w);
     }
     wavelet_int::forward_2d_dyadic(&mut coeffs, img_w, strip_h, levels, opts.filter);
     let needed = select_bit_plane_count(&coeffs);
@@ -1840,7 +1971,7 @@ fn emit_skipped_placeholders(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_one_segment(
-    plane: &IcerPlane,
+    view: PlaneView<'_>,
     img_w: usize,
     y_start: usize,
     strip_h: usize,
@@ -1849,14 +1980,7 @@ fn encode_one_segment(
     levels: u8,
 ) -> Result<Vec<u8>> {
     if opts.uncompressed {
-        return encode_one_segment_uncompressed(
-            plane,
-            img_w,
-            y_start,
-            strip_h,
-            segment_index,
-            opts,
-        );
+        return encode_one_segment_uncompressed(view, img_w, y_start, strip_h, segment_index, opts);
     }
 
     // Compressed path. Optionally also produce the uncompressed
@@ -1866,17 +1990,22 @@ fn encode_one_segment(
     // was emitted, so the decoder reconstructs each segment via its
     // own flag without any caller-side awareness.
     let compressed =
-        encode_one_segment_compressed(plane, img_w, y_start, strip_h, segment_index, opts, levels)?;
+        encode_one_segment_compressed(view, img_w, y_start, strip_h, segment_index, opts, levels)?;
 
     if !opts.auto_uncompressed_fallback {
         return Ok(compressed);
     }
 
     // Uncompressed candidate. The wire format caps each segment's body
-    // length at u16::MAX bytes (§IV), so strips with more than 65535
-    // pixels can't be shipped uncompressed and the compressed result
-    // is kept unconditionally.
-    if img_w.saturating_mul(strip_h) > u16::MAX as usize {
+    // length at u16::MAX bytes (§IV), so strips whose raw sample bytes
+    // exceed 65535 (pixels at depth 8, half that in samples for the
+    // two-byte deep formats) can't be shipped uncompressed and the
+    // compressed result is kept unconditionally.
+    if img_w
+        .saturating_mul(strip_h)
+        .saturating_mul(view.sample_bytes())
+        > u16::MAX as usize
+    {
         return Ok(compressed);
     }
     // The uncompressed encoder needs `opts.uncompressed = true` to set
@@ -1885,7 +2014,7 @@ fn encode_one_segment(
     let mut uncompressed_opts = opts.clone();
     uncompressed_opts.uncompressed = true;
     match encode_one_segment_uncompressed(
-        plane,
+        view,
         img_w,
         y_start,
         strip_h,
@@ -1901,26 +2030,24 @@ fn encode_one_segment(
 }
 
 fn encode_one_segment_uncompressed(
-    plane: &IcerPlane,
+    view: PlaneView<'_>,
     img_w: usize,
     y_start: usize,
     strip_h: usize,
     segment_index: u16,
     opts: &EncodeOptions,
 ) -> Result<Vec<u8>> {
-    let body_len = img_w * strip_h;
+    let body_len = img_w * strip_h * view.sample_bytes();
     if body_len > u16::MAX as usize {
         return Err(IcerError::Unsupported(format!(
-            "uncompressed segment limited to {} pixels (got {})",
+            "uncompressed segment body limited to {} bytes (got {})",
             u16::MAX,
             body_len
         )));
     }
     let mut body = Vec::with_capacity(body_len);
     for y in 0..strip_h {
-        let src_y = y_start + y;
-        let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
-        body.extend_from_slice(row);
+        view.raw_row_extend(&mut body, y_start + y, img_w);
     }
     let packet = PacketHeader {
         bit_plane: 0,
@@ -1933,7 +2060,7 @@ fn encode_one_segment_uncompressed(
 
 #[allow(clippy::too_many_arguments)]
 fn encode_one_segment_compressed(
-    plane: &IcerPlane,
+    view: PlaneView<'_>,
     img_w: usize,
     y_start: usize,
     strip_h: usize,
@@ -1946,16 +2073,12 @@ fn encode_one_segment_compressed(
             "compressed segment requires width >= 2 and height >= 2; got {img_w}x{strip_h}"
         )));
     }
-    // Build signed coefficient buffer (shift by 128 so the centre of
-    // the unsigned 8-bit range maps to 0 -- IPN 42-155 §III.A
-    // "level-shift").
+    // Build signed coefficient buffer (shift by 2^(n-1) so the centre
+    // of the unsigned n-bit range maps to 0 -- IPN 42-155 §III.A
+    // "level-shift"; 128 on the historical 8-bit path).
     let mut coeffs: Vec<i32> = Vec::with_capacity(img_w * strip_h);
     for y in 0..strip_h {
-        let src_y = y_start + y;
-        let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
-        for &px in row {
-            coeffs.push(px as i32 - 128);
-        }
+        view.shifted_row_into(&mut coeffs, y_start + y, img_w);
     }
     // Forward DWT -- the §II.A reversible integer transform for the
     // selected Table 1 filter.
@@ -2066,11 +2189,7 @@ fn encode_one_segment_compressed(
             // measure *exact* reconstructed-image MSE.
             let mut orig: Vec<i32> = Vec::with_capacity(img_w * strip_h);
             for y in 0..strip_h {
-                let src_y = y_start + y;
-                let row = &plane.data[src_y * plane.stride..src_y * plane.stride + img_w];
-                for &px in row {
-                    orig.push(px as i32 - 128);
-                }
+                view.shifted_row_into(&mut orig, y_start + y, img_w);
             }
             Some(pick_lower_distortion_mask(
                 &packets,
@@ -2080,6 +2199,7 @@ fn encode_one_segment_compressed(
                 levels,
                 opts.filter,
                 &orig,
+                view.mid(),
                 greedy,
                 strict,
             ))
@@ -2475,6 +2595,7 @@ fn pick_lower_distortion_mask(
     levels: u8,
     filter: WaveletFilter,
     orig: &[i32],
+    mid: i32,
     greedy: Vec<bool>,
     strict: Vec<bool>,
 ) -> Vec<bool> {
@@ -2503,8 +2624,9 @@ fn pick_lower_distortion_mask(
             // ranks two plans by an *unclamped* MSE that can disagree with the
             // decoded PSNR on large-coefficient (e.g. sparse-impulse) content,
             // letting R-D pick a plan that actually decodes worse than strict.
-            let r_pixel = (r + 128).clamp(0, 255);
-            let o_pixel = (o + 128).clamp(0, 255);
+            let max_value = 2 * mid - 1; // (2^n - 1) for the n-bit domain
+            let r_pixel = (r + mid).clamp(0, max_value);
+            let o_pixel = (o + mid).clamp(0, max_value);
             let d = (o_pixel - r_pixel) as f64;
             acc += d * d;
         }
