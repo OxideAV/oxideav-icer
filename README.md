@@ -1481,6 +1481,8 @@ opt-level, `--quick` smoke):
 | `cube3d_filter_q_32x32x16/decode`      | ~2.3 ms| ~13.4 MiB/s|
 | `cube3d_td_filter_q_32x32x16_s4/encode`| ~2.6 ms| ~12.0 MiB/s|
 | `cube3d_td_filter_q_32x32x16_s4/decode`| ~2.5 ms| ~12.3 MiB/s|
+| `deep12_filter_q_64x64/encode`         | ~1.0 ms| ~7.6 MiB/s |
+| `deep12_filter_q_64x64/decode`         | ~1.0 ms| ~7.9 MiB/s |
 
 (2-D numbers refreshed r411 after the pipeline migration onto the
 §II.A integer transform.)
@@ -1527,6 +1529,13 @@ single default:
   natural `needed` (~7-8 on this ramp) emits extra near-empty bit-plane
   pairs, isolating the per-packet fixed cost (arith-coder init / flush
   / framing). Both directions roughly double between `q_4` and `q_16`.
+* **Deep-sample baseline** (`deep12_filter_q_64x64`): lossless
+  filter-Q encode + decode of a full-range 12-bit textured 64×64
+  (lossless decode asserted in setup), throughput per raw sample byte
+  (2 per pixel). The 12-bit image carries ~4 more magnitude bit planes
+  than the 8-bit ramp, so the per-pixel cost is ~3× the 8-bit group —
+  the §III bit-plane coder's cost scales with the delivered planes,
+  not the sample width.
 
 ## Licence
 

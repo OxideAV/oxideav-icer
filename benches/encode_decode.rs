@@ -653,6 +653,45 @@ fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
     group.finish();
 }
 
+/// Deep-sample (IPN 42-155 §II.C 12-bit MER operating point) encode +
+/// decode baseline: a full-range 12-bit textured 64x64 through the
+/// filter-Q compressed path (lossless decode asserted in setup).
+/// Throughput counts the raw sample bytes (2 per pixel) so the deep
+/// numbers are comparable to the 8-bit groups per transmitted byte.
+fn bench_deep_sample_path(c: &mut Criterion) {
+    let mut img = IcerImage::zeros(64, 64, oxideav_icer::IcerPixelFormat::GrayDeep { bits: 12 });
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            img.set_sample(0, x, y, ((x * 97 + y * 57 + (x ^ y) * 31) % 4096) as u16);
+        }
+    }
+    let opts = compressed_filter_q_opts();
+    let bytes = encode_icer(&img, &opts).unwrap();
+    assert_eq!(
+        parse_icer(&bytes).unwrap().planes,
+        img.planes,
+        "deep bench fixture must decode lossless"
+    );
+
+    let mut group = c.benchmark_group("deep12_filter_q_64x64");
+    group.throughput(Throughput::Bytes(
+        (img.width as u64) * (img.height as u64) * 2,
+    ));
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            let out = encode_icer(black_box(&img), black_box(&opts)).unwrap();
+            black_box(out);
+        });
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let out = parse_icer(black_box(&bytes)).unwrap();
+            black_box(out);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -665,5 +704,6 @@ criterion_group!(
     bench_filter_a_wavelet_levels_sweep,
     bench_cube3d_path,
     bench_transform_segments_and_min_loss,
+    bench_deep_sample_path,
 );
 criterion_main!(benches);
