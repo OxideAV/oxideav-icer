@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lenient-decode allocation hole** (found by the r433 bounded
+  `decode_segment` fuzz campaign): the lenient reconstruction spans
+  the full `0..=max_received_index` strip range including missing gap
+  strips, so two tiny *received* segments carrying a huge
+  `segment_index` gap bought a multi-GB placeholder allocation that
+  the received-segment pixel sum never counted against
+  `DecodeLimits`. `parse_icer_lenient` / `parse_icer_lenient_with_limits`
+  now cap the **reconstruction geometry** itself against
+  `max_total_pixels` (refusal pinned by `tests/lenient_decode.rs`;
+  the finding is seeded at
+  `fuzz/corpus/decode_segment/seed_lenient_index_gap_oom.bin`).
+
 ### Added
 
 - **Deep-sample (9..=16-bit) 2-D grayscale support**

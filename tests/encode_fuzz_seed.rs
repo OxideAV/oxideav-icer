@@ -71,8 +71,28 @@ fn drive(data: &[u8]) -> bool {
             *p = pixel_src[i % pixel_src.len()];
         }
     }
-    let mut img = IcerImage::zeros(width, height, IcerPixelFormat::Gray8);
-    img.planes[0].data = pixels;
+    // opt_a bit 4 flips deep-sample mode; bits 5..7 pick the depth
+    // (9..=16) — mirror of the fuzz target's deep synthesis. Deep
+    // sample words are tiled unmasked so out-of-range samples hit the
+    // level-shift / clamp paths.
+    let deep = (data[2] & 0x10) != 0;
+    let deep_bits = 9 + (data[2] >> 5);
+    let pixel_format = if deep {
+        IcerPixelFormat::GrayDeep { bits: deep_bits }
+    } else {
+        IcerPixelFormat::Gray8
+    };
+    let mut img = IcerImage::zeros(width, height, pixel_format);
+    if deep {
+        let plane = &mut img.planes[0];
+        if !pixel_src.is_empty() {
+            for (i, b) in plane.data.iter_mut().enumerate() {
+                *b = pixel_src[i % pixel_src.len()];
+            }
+        }
+    } else {
+        img.planes[0].data = pixels;
+    }
 
     let opt_a = data[2];
     let opt_b = data[3];
@@ -143,7 +163,10 @@ fn drive(data: &[u8]) -> bool {
     };
 
     if let Some(budget) = byte_budget {
-        let slop = (segment_count as u64) * 12;
+        // Deep-sample images additionally carry the 9-byte plane-
+        // container framing — part of the geometry-preserving minimum
+        // the encoder always emits (like the placeholder headers).
+        let slop = (segment_count as u64) * 12 + if deep { 9 } else { 0 };
         assert!(
             encoded.len() as u64 <= budget + slop,
             "encoded {} bytes > budget {} + slop {}",
@@ -157,8 +180,7 @@ fn drive(data: &[u8]) -> bool {
     assert_eq!(decoded.width, width, "strict-decode width mismatch");
     assert_eq!(decoded.height, height, "strict-decode height mismatch");
     assert_eq!(
-        decoded.pixel_format,
-        IcerPixelFormat::Gray8,
+        decoded.pixel_format, pixel_format,
         "strict-decode pixel format flipped"
     );
 
@@ -217,6 +239,30 @@ fn seeds() -> Vec<Vec<u8>> {
             0x00,
         ];
         v.extend((0..16384u32).map(|x| ((x as f32).sin() * 127.0 + 128.0) as u8));
+        v
+    });
+
+    // 5b. Deep-sample 12-bit 32x32 compressed (opt_a bit 4 + depth
+    //     bits 5..7 = 3 -> 9 + 3 = 12), filter Q.
+    out.push({
+        let mut v = vec![31, 31, 0b0111_0000, 0b0100_0011, 0, 0, 0, 0];
+        v.extend((0..2048u32).map(|x| (x * 7) as u8));
+        v
+    });
+
+    // 5c. Deep-sample 16-bit 24x20, multi-segment with a byte budget.
+    out.push({
+        let mut v = vec![
+            23,
+            19,
+            0b1111_0000,
+            0b0100_0011,
+            0b0000_0100,
+            0b0001_0000,
+            0x01,
+            0x40,
+        ];
+        v.extend((0..960u32).map(|x| (x ^ (x >> 5)) as u8));
         v
     });
 

@@ -86,6 +86,19 @@ fn seeds() -> Vec<Vec<u8>> {
         .unwrap(),
     );
     out.push(encode_icer(&img, &tf.with_priority_interleaving()).unwrap());
+    // Deep-sample (tag 2) container wire forms: compressed, §V.B
+    // transform-domain, and §III.D raw — the depth-byte decode paths.
+    let mut deep = IcerImage::zeros(24, 20, IcerPixelFormat::GrayDeep { bits: 12 });
+    for y in 0..20u32 {
+        for x in 0..24u32 {
+            deep.set_sample(0, x, y, ((x * 97 + y * 57 + (x ^ y) * 31) % 4096) as u16);
+        }
+    }
+    out.push(encode_icer(&deep, &EncodeOptions::compressed()).unwrap());
+    let mut deep_tf = EncodeOptions::compressed().with_transform_domain_segments();
+    deep_tf.segment_count = 4;
+    out.push(encode_icer(&deep, &deep_tf).unwrap());
+    out.push(encode_icer(&deep, &EncodeOptions::default()).unwrap());
     // ICER-3D cube wire forms: §V.D transform-domain segments (r414),
     // plain and quota-truncated — the flags-bit-1 decode paths.
     let mut cube = IcerCube::zeros(16, 16, 4, 10);

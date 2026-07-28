@@ -70,6 +70,8 @@ paraphrased, or cross-checked.
 | §V.D partitioning algorithm | full (IPN 42-155 §V.D eqs (9)-(21): LL-subband rectangle partition, integer-only, Fig. 17 worked example pinned parameter-for-parameter; `partition` + the §V.B maps `ll_segment_map` / `coefficient_segment_map`) |
 | §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment's loss decays to bit-exact outside a bounded wavelet-support bleed -- see "Transform-domain segmentation" below) |
 | §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
+| §II.C dynamic-range analysis (2-D) | full (Table 3 `Σ\|c_i\|` rationals + eq (8) approximate bound + the **exact Table 4** max-input-dynamic-range values for 8/16/32-bit words after one or two high-pass operations, `wavelet_int::{abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range}`; every cell cross-validated within ±2 of eq (8), the §II.C worked examples pinned, full-range 12-/16-bit checkerboards verified within the published word sizes on the live transform) |
+| Deep-sample (9..=16-bit) grayscale | full (`IcerPixelFormat::GrayDeep { bits }` -- the §II.C MER operating point (12-bit pixels in 16-bit words); a plane-container tag-2 framing carries the depth around a normal segment stream; lossless under all seven filters at every depth, composes with every mode -- see "Deep-sample grayscale" below) |
 
 End-to-end round-trips:
 
@@ -1050,20 +1052,34 @@ ramps + flat, filter-A and filter-F §II.A streams, a two-segment
 split, byte-budget-truncated inputs covering the partial-packet path,
 §V.B transform-domain + §VI.A minimum-loss + §III.A
 priority-interleaved wire modes, §VI.B budget-truncated multi-segment
-streams (row-strip and transform-domain), and ICER-3D cubes (row-strip
+streams (row-strip and transform-domain), ICER-3D cubes (row-strip
 plus the r414 §V.D transform-domain mode: plain, quota-truncated, and
-interleaved-entropy + min-loss).
+interleaved-entropy + min-loss), and deep-sample (tag-2 container)
+streams at 10/12/16 bits covering the compressed, §V.B, §III.D raw,
+quota-truncated, and priority-interleaved deep wire forms (r433). The
+`encode_roundtrip` target also synthesises `GrayDeep` images at
+fuzz-chosen depths with deliberately unmasked (out-of-range) sample
+words.
 
 ```bash
 cd fuzz
 cargo +nightly fuzz run decode_segment -- -max_total_time=60
 ```
 
-Local bounded runs on the r411 pipeline (§II.A transform + §VI.B
-quota): `decode_segment` 45132 iterations / 120 s and
-`encode_roundtrip` 7231 iterations / 180 s, 0 crashes. (The
-historical geometry-DoS surface — a 12-byte header requesting ~4 GB
-of decode allocation — is closed by the `DecodeLimits` caps below.)
+Local bounded runs on the r433 pipeline (deep-sample wire + §II.C
+analysis): `decode_segment` 22353 iterations / 180 s and
+`encode_roundtrip` 6376 iterations / 240 s, 0 findings after fixes.
+(The historical geometry-DoS surface — a 12-byte header requesting
+~4 GB of decode allocation — is closed by the `DecodeLimits` caps
+below.) The r433 campaign additionally surfaced — and the same round
+fixed — a **lenient-decode allocation hole**: the gap-filled
+reconstruction spans the full `0..=max_received_index` strip range, so
+two tiny received strips at a huge `segment_index` gap bought a
+multi-GB placeholder allocation the received-pixel sum never counted.
+`parse_icer_lenient*` now caps the *reconstruction geometry* against
+`DecodeLimits::max_total_pixels`
+(`fuzz/corpus/decode_segment/seed_lenient_index_gap_oom.bin` +
+`tests/lenient_decode.rs` pin the refusal).
 
 A daily fuzz run lives at `.github/workflows/fuzz.yml` (30-minute
 budget; OxideAV reusable workflow).
@@ -1071,7 +1087,9 @@ budget; OxideAV reusable workflow).
 `tests/mutation_smoke.rs` additionally gives every push a bounded,
 deterministic corruption sweep (single-byte flips, exhaustive
 header-field value sweeps, every truncation point, cross-seed splices)
-over the §V.B transform-domain and §VI.A minimum-loss wire forms. On
+over the §V.B transform-domain, §VI.A minimum-loss, §III.A
+priority-interleaved, ICER-3D §V.D, and deep-sample (tag-2 container)
+wire forms. On
 its first run it caught two decode-side panics reachable from corrupted
 streams (bit-plane counts near 31 decode coefficients near `i32::MAX`):
 the 5/3 lifting inner neighbour sums and the inverse level shift both
@@ -1220,6 +1238,51 @@ colour path is bit-exact too. The `DecodeLimits` DoS caps apply per plane
 RGB↔YCbCr colour-transform stage are not implemented (the deployed pipeline
 applies the colour transform before ICER -- this crate sees three
 already-decorrelated 4:4:4 planes).
+
+## Deep-sample grayscale (IPN 42-155 §II.C)
+
+The paper's own operating point is deep imagery: "On MER, all cameras
+produce 12-bit pixels and each is stored using a 16-bit word" (§II.C),
+and every §VII benchmark image is 12-bit. `IcerPixelFormat::GrayDeep {
+bits }` (9..=16) carries that path end to end:
+
+```rust
+use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+
+let mut img = IcerImage::zeros(1024, 1024, IcerPixelFormat::GrayDeep { bits: 12 });
+img.set_sample(0, 3, 7, 4095);                       // LSB-aligned LE u16 words
+let bytes = encode_icer(&img, &EncodeOptions::compressed())?; // lossless, any filter
+let decoded = parse_icer(&bytes)?;
+assert_eq!(decoded.sample(0, 3, 7), 4095);
+```
+
+Wire form: the 12-byte segment header has no free field left for a
+sample depth, and a bare deep stream would be indistinguishable from an
+8-bit one — so a deep image rides the plane-container framing with
+format tag `2` plus one bit-depth byte, around a normal single-plane
+segment stream whose coefficients simply span the deeper range (the
+§III bit-plane coder, context model, and packet machinery are
+depth-agnostic; §II.C Table 4 guarantees 16-bit input can never
+overflow the crate's `i32` coefficient words). **Every existing wire
+form is unchanged**: Gray8 streams stay bare byte-for-byte, colour
+containers keep tag 1.
+
+The §III.A level shift generalises to `2^(n-1)`, the decode clamp to
+`[0, 2^n - 1]`, placeholder / missing-strip fills to the n-bit
+midpoint, and the §III.D raw path ships little-endian sample pairs
+(halving the raw-strip pixel ceiling to 32767 samples). Deep composes
+with all seven §II.A filters (lossless end to end, pinned at every
+depth 9..=16), row-strip and §V.B transform-domain segmentation, both
+entropy backends, §III.A priority interleaving, §VI.A min-loss, §VI.B
+byte quotas (the container's 9 framing bytes are charged against the
+budget so the hard cap bounds the total output), ROI priorities, the
+§III.D fallback, lenient decode, `DecodeLimits`, and quality-target
+rate-control. PSNR / SSIM peaks follow the §VII definition (`2^b - 1`
+for `b`-bit input); `ImageStats` scans deep samples down-shifted to
+the 8-bit domain so the filter-selection thresholds keep their
+calibration. The `registry` conversion maps 10-/12-/16-bit onto the
+matching `oxideav-core` plain-gray deep formats (other depths ride the
+16-bit word LSB-aligned).
 
 ## ICER-3D (IPN 42-164)
 

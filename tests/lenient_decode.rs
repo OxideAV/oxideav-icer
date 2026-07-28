@@ -355,3 +355,46 @@ fn lenient_rejects_duplicate_segment_indices() {
         assert!(parse_icer(&concat).is_err());
     }
 }
+
+#[test]
+fn lenient_caps_reconstruction_geometry_not_just_received_pixels() {
+    // Bounded decode_segment fuzz campaign finding (r433; also seeded
+    // at fuzz/corpus/decode_segment/seed_lenient_index_gap_oom.bin):
+    // the lenient reconstruction spans the full 0..=max_received_index
+    // strip range including missing gap strips, so two tiny *received*
+    // segments at a huge segment_index gap used to buy a multi-GB
+    // placeholder allocation that the received-pixel sum never
+    // counted. The reconstruction geometry itself must honour
+    // `DecodeLimits::max_total_pixels`.
+    let bytes = {
+        let mut opts = EncodeOptions::compressed();
+        opts.segment_count = 2;
+        encode_icer(&ramp_image(32, 8), &opts).expect("encode")
+    };
+    let ranges = segment_byte_ranges(&bytes);
+    assert_eq!(ranges.len(), 2);
+    // Rewrite segment 1's index (header bytes 10..12, big-endian) to
+    // 0xFFFF: the gap now spans 65534 missing strips.
+    let mut gapped = bytes.clone();
+    let hdr = ranges[1].start;
+    gapped[hdr + 10] = 0xFF;
+    gapped[hdr + 11] = 0xFF;
+
+    let tight = DecodeLimits {
+        max_pixels_per_segment: 1 << 20,
+        max_total_pixels: 1 << 22,
+    };
+    let err = parse_icer_lenient_with_limits(&gapped, &tight)
+        .expect_err("65534-strip gap must be refused under the cap");
+    match err {
+        IcerError::Unsupported(msg) => assert!(
+            msg.contains("max_total_pixels"),
+            "unexpected refusal: {msg}"
+        ),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+
+    // An in-cap gap still decodes leniently (the feature under test).
+    let dropped = drop_segment(&bytes, 1);
+    assert!(parse_icer_lenient_with_limits(&dropped, &tight).is_ok());
+}

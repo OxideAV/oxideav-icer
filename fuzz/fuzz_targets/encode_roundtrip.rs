@@ -31,6 +31,12 @@
 //! input-validation gaps and self-roundtrip break, not to stress
 //! large-image allocations (which the decode harness already covers
 //! via the wire-claimed dimensions path).
+//!
+//! Deep-sample coverage: one fuzz bit flips the image to the
+//! `GrayDeep` (9..=16-bit) format with a fuzz-chosen depth; the pixel
+//! bytes are tiled into the two-byte little-endian sample words
+//! **unmasked**, so out-of-range samples (above `2^bits - 1`) hammer
+//! the level-shift / clamp paths too.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_icer::{
@@ -109,8 +115,32 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    let mut img = IcerImage::zeros(width, height, IcerPixelFormat::Gray8);
-    img.planes[0].data = pixels;
+    // ---- Pixel format ------------------------------------------------
+    // opt_a bit 4 flips deep-sample mode; bits 5..7 pick the depth
+    // (9..=16). The filter uses only the low three bits of opt_a and
+    // bit 3 is the priority-interleaving flag, so this rides free
+    // space.
+    let deep = (data[2] & 0x10) != 0;
+    let deep_bits = 9 + (data[2] >> 5); // 9..=16
+    let pixel_format = if deep {
+        IcerPixelFormat::GrayDeep { bits: deep_bits }
+    } else {
+        IcerPixelFormat::Gray8
+    };
+    let mut img = IcerImage::zeros(width, height, pixel_format);
+    if deep {
+        // Tile the fuzz bytes across the two-byte sample words,
+        // deliberately unmasked: samples above 2^bits - 1 exercise the
+        // encoder's level-shift and the decoder's clamp.
+        let plane = &mut img.planes[0];
+        if !pixel_src.is_empty() {
+            for (i, b) in plane.data.iter_mut().enumerate() {
+                *b = pixel_src[i % pixel_src.len()];
+            }
+        }
+    } else {
+        img.planes[0].data = pixels;
+    }
 
     // ---- Options -----------------------------------------------------
     let opt_a = data[2];
@@ -201,8 +231,12 @@ fuzz_target!(|data: &[u8]| {
         // The advertised contract is "≤ budget bytes plus the segment
         // header already committed before the first packet". The
         // segment header is 12 bytes; allow up to segment_count * 12
-        // as committed-header slop.
-        let slop = (segment_count as u64) * 12;
+        // as committed-header slop. A deep-sample image is additionally
+        // wrapped in the 9-byte plane-container framing, which is part
+        // of the geometry-preserving minimum the encoder always emits
+        // even when the budget is below it (exactly like the
+        // placeholder headers).
+        let slop = (segment_count as u64) * 12 + if deep { 9 } else { 0 };
         assert!(
             encoded.len() as u64 <= budget + slop,
             "encoded {} bytes > budget {} + slop {}",
@@ -227,8 +261,7 @@ fuzz_target!(|data: &[u8]| {
         decoded.height
     );
     assert_eq!(
-        decoded.pixel_format,
-        IcerPixelFormat::Gray8,
+        decoded.pixel_format, pixel_format,
         "strict-decode pixel format flipped"
     );
 

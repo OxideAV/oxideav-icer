@@ -1015,6 +1015,24 @@ fn parse_icer_lenient_single_plane(
         return Err(IcerError::invalid("multi-segment height overflow"));
     }
 
+    // The reconstructed image spans the full 0..=max_received_index
+    // strip range including the missing gap strips, so the *total
+    // reconstruction geometry* must honour the pixel cap — the
+    // received-segment pixel sum alone does not bound it (two tiny
+    // received strips at a huge segment_index gap would otherwise buy
+    // a multi-GB placeholder allocation; found by the bounded
+    // decode_segment fuzz campaign, r433).
+    let recon_pixels = (canonical_width as u64)
+        .checked_mul(total_height as u64)
+        .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+    if recon_pixels > limits.max_total_pixels {
+        return Err(IcerError::Unsupported(format!(
+            "lenient reconstruction geometry {canonical_width}x{total_height} = {recon_pixels} \
+             pixels exceeds total cap of {} pixels (see DecodeLimits::max_total_pixels)",
+            limits.max_total_pixels
+        )));
+    }
+
     let mut img = IcerImage::zeros(
         canonical_width as u32,
         total_height as u32,
