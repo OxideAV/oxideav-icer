@@ -164,6 +164,9 @@ pub use wavelet3d::{
     coefficient_word_bits, dynamic_range_expansion, forward_3d, high_pass_gamma, inverse_3d,
     spatial_stage_count, spectral_stage_count,
 };
+pub use wavelet_int::{
+    abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range,
+};
 
 // Registry-gated public surface.
 #[cfg(feature = "registry")]

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **IPN 42-155 §II.C dynamic-range analysis for the 2-D path**
+  (`wavelet_int::{abs_tap_sum, approx_max_input_range, max_input_range,
+  word_bits_for_input_range}`): the Table 3 `Σ|c_i|` per-filter
+  rationals (shared with the IPN 42-164 §III.B `γ` factors — both
+  papers define the constant identically), the equation (8) approximate
+  overflow bound, and the exact **Table 4** maximum-input-dynamic-range
+  values for 8/16/32-bit coefficient words after one or two high-pass
+  filter operations (two operations — an HH subband — is the §II.B
+  pyramid's worst case at any depth). Every Table 4 cell is
+  cross-validated to within ±2 of the independently-computed eq (8)
+  bound; the §II.C worked examples are pinned (filter F 16-bit two-op
+  6449 vs eq (8) ≈6450; 12-bit MER pixels fit 16-bit words under every
+  filter; 14-bit pixels fit 16-bit words after one but not two
+  operations; 16-bit input can never overflow the crate's `i32`
+  coefficient buffers). Full-range 12-bit / 16-bit checkerboards are
+  driven through the live §II.A transform and verified within the
+  published word sizes.
+
 ### Changed
 
 - **`WaveletFilter` variants renamed to the IPN 42-155 §II.A spec

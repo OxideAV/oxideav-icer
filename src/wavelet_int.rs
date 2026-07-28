@@ -463,6 +463,130 @@ pub fn inverse_2d_dyadic(
     }
 }
 
+// ---------------------------------------------------------------------------
+// IPN 42-155 §II.C — dynamic range of wavelet-transformed data
+// ---------------------------------------------------------------------------
+
+/// IPN 42-155 §II.C Table 3 — `Σ|c_i|`, the sum of the absolute values
+/// of the taps of the linear high-pass filter that approximates one
+/// 1-D high-pass operation, as an exact rational `(numerator,
+/// denominator)`.
+///
+/// §II.C: after one high-pass operation the approximate dynamic-range
+/// expansion is `Σ|c_i|` (`log2(Σ|c_i|)` bits); after two operations
+/// (an HH subband — one horizontal + one vertical high-pass) it is
+/// `(Σ|c_i|)^2`. Low-pass filtering "amounts to pixel averaging" and
+/// does not expand the range, and under the §II.B pyramid every deeper
+/// stage decomposes the (low-pass) LL lattice — so **two** high-pass
+/// operations is the worst case for any subband of any 2-D
+/// decomposition depth.
+///
+/// The same per-filter rationals appear as the IPN 42-164 §III.B `γ`
+/// factors (both papers define the constant as the sum of the absolute
+/// linear-approximation taps); this is a thin 2-D-named re-export of
+/// [`crate::wavelet3d::high_pass_gamma`] kept so §II.C call sites read
+/// against the 42-155 table they cite.
+pub fn abs_tap_sum(filter: WaveletFilter) -> (u32, u32) {
+    crate::wavelet3d::high_pass_gamma(filter)
+}
+
+/// IPN 42-155 §II.C equation (8) — the *approximate* maximum input
+/// dynamic range `x_max - x_min` such that `b`-bit words storing the
+/// output of `high_pass_ops` high-pass filter operations cannot
+/// overflow:
+///
+/// ```text
+///     x_max - x_min  <=  2 (2^(b-1) - 1) / (Σ|c_i|)^ops
+/// ```
+///
+/// (the `2^(b-1) - 1` bound on both `h_max` and `-h_min` is §II.C
+/// footnote 6: transformed pixels are stored in sign-magnitude form,
+/// §III.A). Returns the floor of the bound, or `None` for a word size
+/// outside `{8, 16, 32}` or an op count outside `{1, 2}` (the §II.C
+/// tabulated domain). The bound is a linear approximation — §II.C
+/// notes it can be "just slightly optimistic" against the exact
+/// nonlinear transform; [`max_input_range`] carries the exact values.
+pub fn approx_max_input_range(
+    filter: WaveletFilter,
+    word_bits: u8,
+    high_pass_ops: u8,
+) -> Option<u64> {
+    if !matches!(word_bits, 8 | 16 | 32) || !matches!(high_pass_ops, 1 | 2) {
+        return None;
+    }
+    let (num, den) = abs_tap_sum(filter);
+    let (num, den) = (num as u128, den as u128);
+    let half_range = (1u128 << (word_bits - 1)) - 1; // 2^(b-1) - 1
+    let (n_pow, d_pow) = if high_pass_ops == 2 {
+        (num * num, den * den)
+    } else {
+        (num, den)
+    };
+    Some((2 * half_range * d_pow / n_pow) as u64)
+}
+
+/// IPN 42-155 §II.C **Table 4** — the maximum input dynamic range
+/// (`x_max - x_min`) that guarantees a `word_bits`-bit output word will
+/// not overflow following `high_pass_ops` (1 or 2) high-pass filter
+/// operations. "Entries in this table are computed exactly using the
+/// nonlinear wavelet transforms" — these are the paper's authoritative
+/// values, not the eq (8) approximation.
+///
+/// Returns `None` for a word size outside `{8, 16, 32}` or an op count
+/// outside `{1, 2}`.
+///
+/// §II.C worked examples (pinned by tests):
+///
+/// * 12-bit input (range 4095) fits 16-bit words after two high-pass
+///   operations under **every** filter (the table's two-op 16-bit
+///   column is at least 6449) — the MER operating point ("On MER, all
+///   cameras produce 12-bit pixels and each is stored using a 16-bit
+///   word").
+/// * 14-bit input (range 16383) fits 16-bit words after **one** but
+///   not two high-pass operations, for every filter.
+pub fn max_input_range(filter: WaveletFilter, word_bits: u8, high_pass_ops: u8) -> Option<u64> {
+    // Table 4 rows in filter order A..F, Q; columns (one op: 8/16/32-bit
+    // word, two ops: 8/16/32-bit word).
+    let row: [u64; 6] = match filter {
+        WaveletFilter::FilterA => [101, 26213, 1717986917, 40, 10485, 687194766],
+        WaveletFilter::FilterB => [92, 23830, 1561806289, 33, 8665, 567929559],
+        WaveletFilter::FilterC => [81, 20971, 1374389534, 25, 6710, 439804651],
+        WaveletFilter::FilterD => [99, 25574, 1676084798, 38, 9980, 654081872],
+        WaveletFilter::FilterE => [86, 22309, 1462116525, 29, 7594, 497741795],
+        WaveletFilter::FilterF => [79, 20559, 1347440719, 24, 6449, 422726500],
+        WaveletFilter::FilterQ => [92, 23830, 1561806289, 33, 8665, 567929559],
+    };
+    let col = match (high_pass_ops, word_bits) {
+        (1, 8) => 0,
+        (1, 16) => 1,
+        (1, 32) => 2,
+        (2, 8) => 3,
+        (2, 16) => 4,
+        (2, 32) => 5,
+        _ => return None,
+    };
+    Some(row[col])
+}
+
+/// The smallest word size in `{8, 16, 32}` bits whose §II.C **Table 4**
+/// two-high-pass-operation entry accommodates `input_range =
+/// x_max - x_min` — i.e. the smallest tabulated word that can store
+/// every coefficient of a 2-D pyramidal decomposition of such input
+/// (the HH subbands see two high-pass operations; every other subband
+/// sees at most one, §II.C). Returns `None` when even 32-bit words are
+/// insufficient per the table.
+///
+/// The §II.C MER example pins `word_bits_for_input_range(4095, f) ==
+/// 16` for every filter (12-bit pixels stored in 16-bit words).
+pub fn word_bits_for_input_range(input_range: u64, filter: WaveletFilter) -> Option<u8> {
+    for word_bits in [8u8, 16, 32] {
+        if input_range <= max_input_range(filter, word_bits, 2)? {
+            return Some(word_bits);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +769,153 @@ mod tests {
         assert_eq!((q.a_m1, q.a_0, q.a_1), (a.a_m1, a.a_0, a.a_1));
         assert_eq!(q.b, 8);
         assert_eq!(a.b, 0);
+    }
+
+    // -- IPN 42-155 §II.C dynamic-range analysis -------------------------
+
+    #[test]
+    fn table3_abs_tap_sums_pin() {
+        // §II.C Table 3, Σ|c_i| column, as exact rationals.
+        let pins = [
+            (WaveletFilter::FilterA, (5, 2)),
+            (WaveletFilter::FilterB, (11, 4)),
+            (WaveletFilter::FilterC, (25, 8)),
+            (WaveletFilter::FilterD, (41, 16)),
+            (WaveletFilter::FilterE, (47, 16)),
+            (WaveletFilter::FilterF, (51, 16)),
+            (WaveletFilter::FilterQ, (11, 4)),
+        ];
+        for (f, expect) in pins {
+            assert_eq!(abs_tap_sum(f), expect, "{f:?} Σ|c_i|");
+        }
+        // Worst-case two-op expansion "about 3.34 bits, arising from
+        // filter F": (51/16)^2 = 2601/256, log2 ≈ 3.345.
+        let (n, d) = abs_tap_sum(WaveletFilter::FilterF);
+        let two_op = ((n as f64) / (d as f64)).powi(2);
+        let bits = two_op.log2();
+        assert!((bits - 3.34).abs() < 0.01, "filter F two-op bits {bits}");
+    }
+
+    #[test]
+    fn table4_exact_pins_and_eq8_consistency() {
+        // Every Table 4 cell must sit within ±2 of the eq (8) linear
+        // bound — §II.C notes eq (8) "turns out to be just slightly
+        // optimistic" (filter F, 16-bit, two ops: eq (8) gives ≈6450.1
+        // where the exact value is 6449), and the approximation error
+        // is bounded by eq (6)/(7). This cross-validates the exact
+        // transcription against the independently-computed rationals.
+        for f in ALL {
+            for ops in [1u8, 2] {
+                for wb in [8u8, 16, 32] {
+                    let exact = max_input_range(f, wb, ops).unwrap();
+                    let approx = approx_max_input_range(f, wb, ops).unwrap();
+                    let diff = exact.abs_diff(approx);
+                    assert!(
+                        diff <= 2,
+                        "{f:?} {ops}-op {wb}-bit: exact {exact} vs eq(8) {approx}"
+                    );
+                }
+            }
+        }
+        // The §II.C worked example: filter F, 16-bit words, two ops.
+        assert_eq!(max_input_range(WaveletFilter::FilterF, 16, 2), Some(6449));
+        assert_eq!(
+            approx_max_input_range(WaveletFilter::FilterF, 16, 2),
+            Some(6450)
+        );
+        // Filters B and Q share Σ|c_i| = 11/4, so their exact columns
+        // coincide throughout Table 4.
+        for ops in [1u8, 2] {
+            for wb in [8u8, 16, 32] {
+                assert_eq!(
+                    max_input_range(WaveletFilter::FilterB, wb, ops),
+                    max_input_range(WaveletFilter::FilterQ, wb, ops)
+                );
+            }
+        }
+        // Out-of-domain queries refuse rather than alias.
+        assert_eq!(max_input_range(WaveletFilter::FilterQ, 12, 1), None);
+        assert_eq!(max_input_range(WaveletFilter::FilterQ, 16, 3), None);
+        assert_eq!(approx_max_input_range(WaveletFilter::FilterQ, 24, 2), None);
+    }
+
+    #[test]
+    fn mer_12bit_and_14bit_word_size_examples() {
+        // §II.C: "On MER, all cameras produce 12-bit pixels and each is
+        // stored using a 16-bit word ... for each filter, using 16-bit
+        // words, we can accommodate an input pixel dynamic range of at
+        // least 6449, which easily supports 12-bit input pixels."
+        for f in ALL {
+            assert!(max_input_range(f, 16, 2).unwrap() >= 6449, "{f:?}");
+            assert!(4095 <= max_input_range(f, 16, 2).unwrap(), "{f:?}");
+            assert_eq!(word_bits_for_input_range(4095, f), Some(16), "{f:?}");
+            // "for 14-bit input pixels, 16-bit words are adequate to
+            // store the wavelet transform output following one but not
+            // two high-pass filter operations."
+            assert!(16383 <= max_input_range(f, 16, 1).unwrap(), "{f:?}");
+            assert!(16383 > max_input_range(f, 16, 2).unwrap(), "{f:?}");
+            assert_eq!(word_bits_for_input_range(16383, f), Some(32), "{f:?}");
+            // 8-bit input needs 16-bit words two-op (the two-op 8-bit
+            // column tops out at 40 < 255)...
+            assert_eq!(word_bits_for_input_range(255, f), Some(16), "{f:?}");
+            // ...and 16-bit input (range 65535) sits far below every
+            // two-op 32-bit-word entry (min 422726500, filter F), so
+            // the crate's i32 coefficient buffers can never overflow
+            // for any sample depth up to 16 bits under any filter.
+            assert!(65535 <= max_input_range(f, 32, 2).unwrap(), "{f:?}");
+            assert_eq!(word_bits_for_input_range(65535, f), Some(32), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn live_transform_respects_published_word_sizes() {
+        // Empirical §II.C witness: a full-range 12-bit checkerboard
+        // (the range-maximising input shape — §II.C: the output range
+        // "is fully utilized when the rows and columns of the image
+        // conspire together to maximize the range of output values in
+        // an HH subband") stays within 16-bit coefficient words under
+        // every filter and depth 1..=3, per the Table 4 12-bit MER
+        // example. A full-range 16-bit checkerboard likewise stays
+        // within the §II.C word budget for two high-pass operations
+        // (`coefficient_word_bits(16, f, 2)`-bit signed words).
+        for f in ALL {
+            for levels in 1u8..=3 {
+                let (w, h) = (32usize, 32);
+                let mut buf12: Vec<i32> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        if (x ^ y) & 1 == 0 {
+                            -2048
+                        } else {
+                            2047
+                        }
+                    })
+                    .collect();
+                forward_2d_dyadic(&mut buf12, w, h, levels, f);
+                let max12 = buf12.iter().map(|c| c.unsigned_abs()).max().unwrap();
+                assert!(
+                    max12 < (1 << 15),
+                    "{f:?} depth {levels}: 12-bit input overflowed 16-bit words ({max12})"
+                );
+
+                let mut buf16: Vec<i32> = (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        if (x ^ y) & 1 == 0 {
+                            -32768
+                        } else {
+                            32767
+                        }
+                    })
+                    .collect();
+                forward_2d_dyadic(&mut buf16, w, h, levels, f);
+                let max16 = buf16.iter().map(|c| c.unsigned_abs()).max().unwrap();
+                let word = crate::wavelet3d::coefficient_word_bits(16, f, 2);
+                assert!(
+                    max16 < (1u32 << (word - 1)),
+                    "{f:?} depth {levels}: 16-bit input exceeded {word}-bit words ({max16})"
+                );
+            }
+        }
     }
 }
