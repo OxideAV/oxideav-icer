@@ -692,6 +692,78 @@ fn bench_deep_sample_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// Representative-size throughput reference (r454): the 2-D
+/// compressed path at 256x256 and the 3-D cube path at 64x64x32 —
+/// the sizes the README throughput table reports. Textured fixtures
+/// keep the context modeler + entropy coder realistically busy;
+/// lossless decode is asserted in setup so a perf tweak that changes
+/// the wire form fails the bench run.
+fn bench_representative_sizes(c: &mut Criterion) {
+    let mut img = IcerImage::zeros(256, 256, oxideav_icer::IcerPixelFormat::Gray8);
+    {
+        let stride = img.planes[0].stride;
+        for y in 0..256usize {
+            for x in 0..256usize {
+                img.planes[0].data[y * stride + x] =
+                    ((x * 97 + y * 57 + (x ^ y) * 31) & 0xFF) as u8;
+            }
+        }
+    }
+    // A textured 256x256 frame overflows the wire's u16 segment-body
+    // limit as a single segment — exactly the multi-segment operating
+    // point §V.C prescribes at this size (Typical picks 4-6).
+    let mut opts = compressed_filter_q_opts();
+    opts.segment_count = 4;
+    let bytes = encode_icer(&img, &opts).unwrap();
+    assert_eq!(
+        parse_icer(&bytes).unwrap().planes[0].data,
+        img.planes[0].data,
+        "representative 2-D fixture must decode lossless"
+    );
+
+    let mut group = c.benchmark_group("representative_gray8_256x256_s4");
+    group.sample_size(20);
+    group.throughput(Throughput::Bytes(256 * 256));
+    group.bench_function("encode", |b| {
+        b.iter(|| black_box(encode_icer(black_box(&img), &opts).unwrap()));
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| black_box(parse_icer(black_box(&bytes)).unwrap()));
+    });
+    group.finish();
+
+    let (w, h, bands) = (64u32, 64u32, 32u32);
+    let mut cube = IcerCube::zeros(w, h, bands, 12);
+    let (wu, hu) = (w as usize, h as usize);
+    for b in 0..bands as usize {
+        let dc = 800 + ((b * 137) % 1200) as i32;
+        for y in 0..hu {
+            for x in 0..wu {
+                let t = ((x * 13 + y * 29 + b * 7) % 257) as i32 - 128;
+                cube.samples[b * wu * hu + y * wu + x] = (dc + t).clamp(0, 4095) as u16;
+            }
+        }
+    }
+    let cube_opts = CubeEncodeOptions::default();
+    let cube_bytes = encode_icer3d(&cube, &cube_opts).unwrap();
+    assert_eq!(
+        parse_icer3d(&cube_bytes).unwrap(),
+        cube,
+        "representative cube fixture must decode lossless"
+    );
+
+    let mut group = c.benchmark_group("representative_cube3d_64x64x32");
+    group.sample_size(10);
+    group.throughput(Throughput::Bytes((cube.samples.len() * 2) as u64));
+    group.bench_function("encode", |b| {
+        b.iter(|| black_box(encode_icer3d(black_box(&cube), &cube_opts).unwrap()));
+    });
+    group.bench_function("decode", |b| {
+        b.iter(|| black_box(parse_icer3d(black_box(&cube_bytes)).unwrap()));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_compressed,
@@ -705,5 +777,6 @@ criterion_group!(
     bench_cube3d_path,
     bench_transform_segments_and_min_loss,
     bench_deep_sample_path,
+    bench_representative_sizes,
 );
 criterion_main!(benches);
