@@ -82,47 +82,6 @@ fn has_hv_significant(pattern: u8) -> bool {
     pattern & HV_NEIGHBOUR_MASK != 0
 }
 
-/// Significance context for coefficient `(x, y)` from its 8-neighbour
-/// significance `pattern`, dispatched on the coefficient's subband per
-/// IPN 42-155 §III.B.
-///
-/// When `levels == 0` the scanner is subband-agnostic and uses the
-/// uniform [`significance_context`] classification (legacy / unit-test
-/// path). When `levels >= 1` the coefficient's `(SubbandType, level)` is
-/// resolved via [`classify_position`] and the spec-exact §III.B Table 6
-/// (LL/LH/HL) or Table 7 (HH) is used, with the HL context-template
-/// transpose. The neighbour-count granularity also sharpens here: the
-/// uniform path collapses V and D to "0 / 1+", while the spec tables key
-/// on the full `(h, v, d)` counts.
-#[inline]
-fn significance_ctx_for(pattern: u8, x: usize, y: usize, levels: u8) -> usize {
-    if levels == 0 {
-        return significance_context(pattern);
-    }
-    let (kind, _) = classify_position(x, y, levels);
-    let (h, v, d) = neighbour_counts(pattern);
-    significance_context_subband(h, v, d, kind == SubbandType::Hh, kind == SubbandType::Hl)
-}
-
-/// `(sign_context, predicted_sign_is_negative)` for coefficient `(x, y)`,
-/// dispatched on the subband's HL transpose per IPN 42-155 §III.B Table 8.
-/// `levels == 0` keeps the subband-agnostic Table 8 lookup.
-#[inline]
-fn sign_ctx_for(h_pat: u8, v_pat: u8, x: usize, y: usize, levels: u8) -> (usize, bool) {
-    if levels == 0 {
-        return (
-            sign_context(h_pat, v_pat),
-            sign_prediction_flip(h_pat, v_pat),
-        );
-    }
-    let (kind, _) = classify_position(x, y, levels);
-    let is_hl = kind == SubbandType::Hl;
-    (
-        sign_context_subband(h_pat, v_pat, is_hl),
-        sign_prediction_flip_subband(h_pat, v_pat, is_hl),
-    )
-}
-
 /// Restricts which coefficients (and which of their magnitude bit
 /// planes) the scan passes visit. Two orthogonal restrictions compose:
 ///
@@ -832,8 +791,8 @@ fn encode_significance_pass(
                 if !filter.visits(i, bp) || significant[i] {
                     continue;
                 }
-                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
-                let ctx = significance_ctx_for(pat, x, y, levels);
+                let (ctx, stride, is_hl) =
+                    significance_visit(significant, width, height, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
 
                 let mag = coeffs[i].unsigned_abs();
@@ -850,9 +809,17 @@ fn encode_significance_pass(
 
                     // Sign bit with sign-flip convention (IPN 42-155 §III.B),
                     // subband-aware (HL axis transpose for Table 8).
-                    let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
-                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    let (sctx, flip) = sign_visit(
+                        significant,
+                        sign,
+                        width,
+                        height,
+                        x,
+                        y,
+                        stride,
+                        is_hl,
+                        levels,
+                    );
                     debug_assert!(sctx < CONTEXT_COUNT);
                     // Encode the (possibly flipped) sign bit.
                     let raw_sign = u8::from(sign[i]);
@@ -900,8 +867,8 @@ fn decode_significance_pass(
                 if !filter.visits(i, bp) || significant[i] {
                     continue;
                 }
-                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
-                let ctx = significance_ctx_for(pat, x, y, levels);
+                let (ctx, stride, is_hl) =
+                    significance_visit(significant, width, height, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.get_bit(num, den)?;
                 model.observe(ctx, bit);
@@ -911,9 +878,17 @@ fn decode_significance_pass(
                     cat[i] = 1;
                     mag[i] |= 1u32 << bp;
                     last_bit[i] = bp as u8;
-                    let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
-                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    let (sctx, flip) = sign_visit(
+                        significant,
+                        sign,
+                        width,
+                        height,
+                        x,
+                        y,
+                        stride,
+                        is_hl,
+                        levels,
+                    );
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.get_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
@@ -969,14 +944,7 @@ fn encode_refinement_pass(
                 if highest_set_bit(m) == Some(bp as u32) {
                     continue;
                 }
-                let has_hv = has_hv_significant(neighbour_significance_pattern(
-                    significant,
-                    width,
-                    height,
-                    x,
-                    y,
-                    levels,
-                ));
+                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
                 let bit = ((m >> bp) & 1) as u8;
                 match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
@@ -1067,14 +1035,7 @@ fn decode_refinement_pass(
                 if highest_set_bit(mag[i]) == Some(bp as u32) {
                     continue;
                 }
-                let has_hv = has_hv_significant(neighbour_significance_pattern(
-                    significant,
-                    width,
-                    height,
-                    x,
-                    y,
-                    levels,
-                ));
+                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
                 let bit = match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
                         let (num, den) = model.probability(rctx);
@@ -1175,8 +1136,8 @@ fn encode_priority_unit(
             if !significant[i] {
                 // Significance bit; sign immediately after the first
                 // nonzero magnitude bit (§III).
-                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
-                let ctx = significance_ctx_for(pat, x, y, levels);
+                let (ctx, stride, is_hl) =
+                    significance_visit(significant, width, height, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
                 let mag = coeffs[i].unsigned_abs();
                 let bit = ((mag >> abs_bit) & 1) as u8;
@@ -1187,9 +1148,17 @@ fn encode_priority_unit(
                     significant[i] = true;
                     cat[i] = 1;
                     sign[i] = coeffs[i] < 0;
-                    let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
-                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    let (sctx, flip) = sign_visit(
+                        significant,
+                        sign,
+                        width,
+                        height,
+                        x,
+                        y,
+                        stride,
+                        is_hl,
+                        levels,
+                    );
                     debug_assert!(sctx < CONTEXT_COUNT);
                     let raw_sign = u8::from(sign[i]);
                     let coded_sign = if flip { 1 - raw_sign } else { raw_sign };
@@ -1205,14 +1174,7 @@ fn encode_priority_unit(
                 // this very plane took the significance branch above).
                 let m = coeffs[i].unsigned_abs();
                 debug_assert!(highest_set_bit(m) > Some(abs_bit as u32));
-                let has_hv = has_hv_significant(neighbour_significance_pattern(
-                    significant,
-                    width,
-                    height,
-                    x,
-                    y,
-                    levels,
-                ));
+                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
                 let bit = ((m >> abs_bit) & 1) as u8;
                 match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
@@ -1267,8 +1229,8 @@ fn decode_priority_unit(
                 continue;
             }
             if !significant[i] {
-                let pat = neighbour_significance_pattern(significant, width, height, x, y, levels);
-                let ctx = significance_ctx_for(pat, x, y, levels);
+                let (ctx, stride, is_hl) =
+                    significance_visit(significant, width, height, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.get_bit(num, den)?;
                 model.observe(ctx, bit);
@@ -1277,9 +1239,17 @@ fn decode_priority_unit(
                     cat[i] = 1;
                     mag[i] |= 1u32 << abs_bit;
                     last_bit[i] = abs_bit as u8;
-                    let (h_pat, v_pat) =
-                        neighbour_sign_pattern(significant, sign, width, height, x, y, levels);
-                    let (sctx, flip) = sign_ctx_for(h_pat, v_pat, x, y, levels);
+                    let (sctx, flip) = sign_visit(
+                        significant,
+                        sign,
+                        width,
+                        height,
+                        x,
+                        y,
+                        stride,
+                        is_hl,
+                        levels,
+                    );
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.get_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
@@ -1287,14 +1257,7 @@ fn decode_priority_unit(
                     sign[i] = raw_sign == 1;
                 }
             } else {
-                let has_hv = has_hv_significant(neighbour_significance_pattern(
-                    significant,
-                    width,
-                    height,
-                    x,
-                    y,
-                    levels,
-                ));
+                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
                 let bit = match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
                         let (num, den) = model.probability(rctx);
@@ -1740,45 +1703,174 @@ fn neighbour_significance_pattern(
     y: usize,
     levels: u8,
 ) -> u8 {
-    let stride = subband_stride(x, y, levels) as isize;
-    let mut pat = 0u8;
-    let neighbours = [
-        // (dx, dy, bit)
-        (-1isize, -1isize, 0u8),
-        (0, -1, 1),
-        (1, -1, 2),
-        (-1, 0, 3),
-        (1, 0, 4),
-        (-1, 1, 5),
-        (0, 1, 6),
-        (1, 1, 7),
-    ];
-    for (dx, dy, bit) in neighbours {
-        let nx = x as isize + dx * stride;
-        let ny = y as isize + dy * stride;
-        if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
-            let idx = (ny as usize) * width + (nx as usize);
-            if significant[idx] {
+    let stride = subband_stride(x, y, levels);
+    gather_pattern_strided(significant, width, height, x, y, stride)
+}
+
+/// Interior/edge-split gather of the 8 same-subband neighbour
+/// significance flags at a precomputed `stride` (r454 perf). The
+/// interior fast path (all eight neighbours in bounds) drops the
+/// per-neighbour signed bounds arithmetic that previously ran eight
+/// times per visited bit; the edge fallback walks the identical
+/// neighbour list. Bit layout unchanged.
+#[inline]
+fn gather_pattern_strided(
+    significant: &[bool],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    stride: usize,
+) -> u8 {
+    if x >= stride && y >= stride && x + stride < width && y + stride < height {
+        let up = (y - stride) * width + x;
+        let mid = y * width + x;
+        let down = (y + stride) * width + x;
+        u8::from(significant[up - stride])
+            | (u8::from(significant[up]) << 1)
+            | (u8::from(significant[up + stride]) << 2)
+            | (u8::from(significant[mid - stride]) << 3)
+            | (u8::from(significant[mid + stride]) << 4)
+            | (u8::from(significant[down - stride]) << 5)
+            | (u8::from(significant[down]) << 6)
+            | (u8::from(significant[down + stride]) << 7)
+    } else {
+        let s = stride as isize;
+        let mut pat = 0u8;
+        for (dx, dy, bit) in [
+            (-1isize, -1isize, 0u8),
+            (0, -1, 1),
+            (1, -1, 2),
+            (-1, 0, 3),
+            (1, 0, 4),
+            (-1, 1, 5),
+            (0, 1, 6),
+            (1, 1, 7),
+        ] {
+            let nx = x as isize + dx * s;
+            let ny = y as isize + dy * s;
+            if nx >= 0
+                && ny >= 0
+                && (nx as usize) < width
+                && (ny as usize) < height
+                && significant[(ny as usize) * width + (nx as usize)]
+            {
                 pat |= 1 << bit;
             }
         }
+        pat
     }
-    pat
 }
 
-/// Build the `(h_pattern, v_pattern)` packed-pair fed into
-/// [`crate::context::sign_context`] / [`crate::context::sign_prediction_flip`].
-///
-/// Layout per context.rs sign_context doc:
-///   bits 0,1 = (neighbour-A significant, neighbour-A negative)
-///   bits 2,3 = (neighbour-B significant, neighbour-B negative)
-///
-/// Horizontal: A=W, B=E. Vertical: A=N, B=S.
-///
-/// The four sign neighbours are the same-subband nearest pixels (IPN
-/// 42-155 §III.B), i.e. `subband_stride(x, y, levels)` apart in the
-/// interleaved buffer rather than one cell apart. `levels == 0` keeps the
-/// legacy unit-stride spatial walk.
+/// One-shot per-visit classification for the significance pass (r454
+/// perf): classify the coefficient once, gather its neighbour pattern
+/// at that stride, and return the §III.B context together with the
+/// `(stride, is_hl)` pair the sign branch reuses — the previous shape
+/// re-ran [`classify_position`] two to four times per visited bit.
+/// `levels == 0` keeps the legacy subband-agnostic classification.
+#[inline]
+fn significance_visit(
+    significant: &[bool],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    levels: u8,
+) -> (usize, usize, bool) {
+    if levels == 0 {
+        let pat = gather_pattern_strided(significant, width, height, x, y, 1);
+        return (significance_context(pat), 1, false);
+    }
+    let (kind, level) = classify_position(x, y, levels);
+    let stride = 1usize << level;
+    let pat = gather_pattern_strided(significant, width, height, x, y, stride);
+    let (h, v, d) = neighbour_counts(pat);
+    (
+        significance_context_subband(h, v, d, kind == SubbandType::Hh, kind == SubbandType::Hl),
+        stride,
+        kind == SubbandType::Hl,
+    )
+}
+
+/// Sign context + prediction flip for a coefficient that just turned
+/// significant, reusing the `(stride, is_hl)` classification from
+/// [`significance_visit`] (r454 perf). The H/V pair patterns are the
+/// same-subband W/E and N/S neighbours at the subband stride (IPN
+/// 42-155 §III.B); `levels == 0` keeps the subband-agnostic Table 8
+/// lookup. Identical bit behaviour to the previous
+/// `neighbour_sign_pattern` + `sign_ctx_for` pair.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn sign_visit(
+    significant: &[bool],
+    sign: &[bool],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    stride: usize,
+    is_hl: bool,
+    levels: u8,
+) -> (usize, bool) {
+    let s = stride as isize;
+    let h = pair_pattern(
+        significant,
+        sign,
+        width,
+        height,
+        x as isize - s,
+        y as isize,
+        x as isize + s,
+        y as isize,
+    );
+    let v = pair_pattern(
+        significant,
+        sign,
+        width,
+        height,
+        x as isize,
+        y as isize - s,
+        x as isize,
+        y as isize + s,
+    );
+    if levels == 0 {
+        (sign_context(h, v), sign_prediction_flip(h, v))
+    } else {
+        (
+            sign_context_subband(h, v, is_hl),
+            sign_prediction_flip_subband(h, v, is_hl),
+        )
+    }
+}
+
+/// Significance probe for the refinement pass's context 9/10 split
+/// (r454 perf): probe exactly the neighbours [`HV_NEIGHBOUR_MASK`]
+/// selects — N (bit 1), W (bit 3), S (bit 6) at the subband stride —
+/// instead of gathering the full 8-neighbour pattern. Exactly
+/// `has_hv_significant(neighbour_significance_pattern(..))`, mask
+/// semantics included (the historical mask does not test East; the
+/// wire-digest suite pins that equivalence).
+#[inline]
+fn refinement_has_hv(
+    significant: &[bool],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    levels: u8,
+) -> bool {
+    let stride = subband_stride(x, y, levels);
+    let i = y * width + x;
+    (x >= stride && significant[i - stride])
+        || (y >= stride && significant[i - stride * width])
+        || (y + stride < height && significant[i + stride * width])
+}
+
+/// Legacy `(h_pattern, v_pattern)` sign-neighbour gather (bits 0,1 =
+/// W/N significant+negative, bits 2,3 = E/S) used by the single-packet
+/// subband-agnostic path; the multi-packet passes use [`sign_visit`],
+/// which reuses the stride from [`significance_visit`] instead of
+/// re-deriving it here.
 fn neighbour_sign_pattern(
     significant: &[bool],
     sign: &[bool],

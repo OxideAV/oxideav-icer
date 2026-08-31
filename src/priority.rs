@@ -461,22 +461,30 @@ pub fn subband_lattice(subband: Subband) -> SubbandLattice {
 /// position that stays even/even through every level is the final `LL`.
 ///
 /// Returns `(subband_type, level)` where `level` is `1..=levels`.
-pub fn classify_position(mut x: usize, mut y: usize, levels: u8) -> (SubbandType, u8) {
-    let mut level = 1u8;
-    loop {
-        if level > levels {
-            return (SubbandType::Ll, levels);
-        }
-        match (x % 2, y % 2) {
-            (0, 0) => {
-                x /= 2;
-                y /= 2;
-                level += 1;
-            }
-            (1, 0) => return (SubbandType::Hl, level),
-            (0, 1) => return (SubbandType::Lh, level),
-            _ => return (SubbandType::Hh, level),
-        }
+#[inline]
+pub fn classify_position(x: usize, y: usize, levels: u8) -> (SubbandType, u8) {
+    // Closed form of the dyadic walk (r454 perf): the walk divides both
+    // coordinates by 2 while both are even, i.e. exactly
+    // `tz = trailing_zeros(x | y)` times. If the walk survives all
+    // `levels` stages the position is deep LL; otherwise the first
+    // odd-parity pair appears at stage `tz + 1` and its parities
+    // `((x >> tz) & 1, (y >> tz) & 1)` name the subband. Equivalent to
+    // the original loop for every input (the parity table is the loop's
+    // match, the `x | y == 0` case is the all-even LL fallthrough);
+    // pinned by `subband_lattice_inverts_classify_position` +
+    // `classify_position_basic_parities` and the wire-digest suite.
+    let both = x | y;
+    if both == 0 {
+        return (SubbandType::Ll, levels);
+    }
+    let tz = both.trailing_zeros() as u8;
+    if tz >= levels {
+        return (SubbandType::Ll, levels);
+    }
+    match ((x >> tz) & 1, (y >> tz) & 1) {
+        (1, 0) => (SubbandType::Hl, tz + 1),
+        (0, 1) => (SubbandType::Lh, tz + 1),
+        _ => (SubbandType::Hh, tz + 1),
     }
 }
 
