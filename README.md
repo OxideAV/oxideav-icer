@@ -1097,9 +1097,10 @@ cd fuzz
 cargo +nightly fuzz run decode_segment -- -max_total_time=60
 ```
 
-Local bounded runs on the r433 pipeline (deep-sample wire + §II.C
-analysis): `decode_segment` 22353 iterations / 180 s and
-`encode_roundtrip` 6376 iterations / 240 s, 0 findings after fixes.
+Local bounded runs on the r454 pipeline (§V.C auto-segments wire
+synthesis + the r454 scan optimisations): `decode_segment` 26596
+iterations / 461 s and `encode_roundtrip` 9226 iterations / 451 s,
+0 findings.
 (The historical geometry-DoS surface — a 12-byte header requesting
 ~4 GB of decode allocation — is closed by the `DecodeLimits` caps
 below.) The r433 campaign additionally surfaced — and the same round
@@ -1520,6 +1521,32 @@ opt-level, `--quick` smoke):
 
 (2-D numbers refreshed r411 after the pipeline migration onto the
 §II.A integer transform.)
+
+Representative-size groups (r454) cover the sizes the throughput
+numbers below report: `representative_gray8_256x256_s4` (a textured
+256x256 frame in 4 §V.C row strips — a frame of this size overflows
+the u16 segment-body limit as a single segment) and
+`representative_cube3d_64x64x32` (the 12-bit hyperspectral cube).
+Measured on aarch64-darwin (M-series, full criterion run, r454):
+
+| Group                                     | Time    | Throughput |
+|-------------------------------------------|---------|------------|
+| `representative_gray8_256x256_s4/encode`  | ~16 ms  | ~3.9 MiB/s |
+| `representative_gray8_256x256_s4/decode`  | ~14.5 ms| ~4.3 MiB/s |
+| `representative_cube3d_64x64x32/encode`   | ~21 ms  | ~12 MiB/s  |
+| `representative_cube3d_64x64x32/decode`   | ~20 ms  | ~12 MiB/s  |
+
+The r454 profiling pass (`sample` call-tree profiles over release
+encode/decode loops) put >89% of 2-D time in the bit-plane scan +
+arithmetic coder and drove two bit-identical optimisations —
+`classify_position` in closed form over `trailing_zeros(x | y)` and
+one-classify visit helpers with an interior fast-path neighbour
+gather. Interleaved A/B against the pre-r454 build on the textured
+256x256 fixture: **encode 54.6 -> 58.5 full-image passes/s (+7.2%),
+decode 55.1 -> 60.2 (+9.1%)**, consistent across rounds; the 3-D cube
+path is unchanged. `tests/wire_digest.rs` freezes the wire bytes and
+reconstructed samples of 15 encode modes (FNV-1a), so any future
+performance work is provably output-identical or fails CI.
 
 The filter-A groups run the same §II.A integer recurrence as filter Q
 with the Table 1 filter-A parameters (`beta = 0` skips the `d[n+1]`

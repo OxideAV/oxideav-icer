@@ -789,6 +789,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entropy-coder, or framing machinery, and no ICER specification section
   is involved.
 
+### Changed
+
+- **Bit-plane scan performance** (r454 profiling pass): profiling the
+  new representative-size benches put >89% of 2-D time in the
+  bit-plane scan + arithmetic coder; `classify_position` now runs in
+  closed form over `trailing_zeros(x | y)` and the scan passes
+  classify each visited coefficient once (`significance_visit` /
+  `sign_visit` / `refinement_has_hv`, with an interior fast-path
+  neighbour gather) instead of two to four times. Interleaved A/B on
+  a textured 256x256 filter-Q encode: +7.2% encode, +9.1% decode;
+  3-D cube path unchanged. Output pinned byte-identical across 15
+  encode modes by the new `tests/wire_digest.rs` (FNV-1a digests of
+  wire bytes + reconstructed samples, both directions).
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-icer/compare/v0.0.3...v0.0.4) - 2026-06-10
 
 ### Other
