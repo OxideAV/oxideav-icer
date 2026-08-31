@@ -49,6 +49,7 @@ paraphrased, or cross-checked.
 | Auto filter selection (heuristic) | full (`EncodeOptions::with_auto_filter()`, single-pass) |
 | Auto filter selection (rate-distortion) | full (`EncodeOptions::with_auto_filter_rd()`, N-pass trial) |
 | ROI segment prioritisation | full (`with_segment_priorities` + `with_center_roi`; IPN 42-155 §III.E independent-segment scheduling) |
+| §V.C segment-count selection | full (`analyze::recommend_segment_count` + `EncodeOptions::with_auto_segments(ChannelReliability)` -- the §V.C guidance as a documented decision tree: MER ≤32 cap, four-to-six sweet spot, 1 for reliable channels / small images, scaled by image area / expected compressed bytes / channel reliability; capped by §V.D eq (9) + the row-strip 2-row minimum so the pick is valid for both segmentation modes -- see "Choosing the number of segments" below) |
 | R-D budget pruning | full (`EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
 | Decode-side resource limits | full (`DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits; `DecodeLimits` bounds decode *compute* as well as allocation -- the `decode_segment` fuzz harness uses a tight 1 MPx/segment budget so a single crafted header declaring multi-MPx geometry cannot spend tens of seconds in the inverse DWT + bit-plane scan) |
@@ -709,6 +710,36 @@ let opts = EncodeOptions::compressed()
     .with_byte_budget(8192);            // hard cap on output bytes
 let bytes = encode_icer(&image, &opts)?;
 ```
+
+## Choosing the number of segments (IPN 42-155 §V.C)
+
+§V.C pins the segment-count operating envelope: the MER implementation
+"limits the number of segments to 32 or fewer" (tighter when the image
+is small and the decomposition deep), "many images are most effectively
+compressed using four to six segments", one segment is reasonable when
+"packet losses are rare or when compressing a small image", and "larger
+images, larger numbers of compressed bytes, and less reliable channels"
+warrant more. `analyze::recommend_segment_count(width, height, levels,
+expected_bytes, channel)` realises that guidance as a transparent
+decision tree (thresholds documented inline; clean-room defaults in the
+same spirit as `recommend_filter`), and
+`EncodeOptions::with_auto_segments(ChannelReliability)` resolves
+`segment_count` from it at encode time — the byte quota, when set,
+feeds the §V.C "number of compressed bytes" axis. The pick is always
+geometry-valid: capped by §V.D eq (9) (`s ≤ LL-subband area`), this
+crate's row-strip 2-row minimum, and the MER cap of 32.
+
+```rust
+let opts = EncodeOptions::compressed()
+    .with_auto_segments(ChannelReliability::Typical)  // §V.C pick
+    .with_byte_budget(20_000);                        // feeds the bytes axis
+let bytes = encode_icer(&image, &opts)?;
+```
+
+Composes with row-strip and §V.B transform-domain segmentation, both
+entropy backends, deep samples, colour, and the §VI quotas; mutually
+exclusive with `segment_priorities` / `with_center_roi` (the priority
+vector length must equal a count that is not known until encode time).
 
 ## ROI segment prioritisation
 

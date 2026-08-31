@@ -215,6 +215,116 @@ pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
     WaveletFilter::FilterQ
 }
 
+/// Channel-reliability classes consumed by
+/// [`recommend_segment_count`] -- the "less reliable channels" axis of
+/// IPN 42-155 §V.C "Choosing the Number of Segments": "we would tend
+/// to use a larger number of segments for larger images, larger
+/// numbers of compressed bytes, and less reliable channels."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelReliability {
+    /// Packet losses are rare. §V.C: "If packet losses are rare or
+    /// when compressing a small image, one might reasonably set the
+    /// number of segments to 1. However, some amount of segmentation
+    /// may slightly improve compression effectiveness, especially on
+    /// large images."
+    Reliable,
+    /// The nominal deep-space channel -- the §V.C sweet spot: "Many
+    /// images are most effectively compressed using four to six
+    /// segments."
+    Typical,
+    /// A high-loss channel: trade compression effectiveness for
+    /// tighter containment, up to the MER cap ("The MER implementation
+    /// of ICER limits the number of segments to 32 or fewer").
+    Lossy,
+}
+
+/// Recommend an error-containment segment count per IPN 42-155 §V.C
+/// "Choosing the Number of Segments".
+///
+/// §V.C pins the operating envelope -- the MER cap of 32 (with
+/// "tighter limits when the image is small and the number of stages of
+/// wavelet decomposition is large"), the four-to-six sweet spot, one
+/// segment for rare losses / small images, and the three scaling axes
+/// (image size, compressed-byte volume, channel reliability) -- but
+/// leaves the exact mapping to the implementation (the MER build's own
+/// tighter-limit table lives in an unstaged reference, §V.C footnote
+/// 9). The thresholds here are therefore documented clean-room
+/// defaults in the same spirit as [`recommend_filter`]:
+///
+///   * **Base pick by area + channel**:
+///     `Typical`  -> 1 below 4096 px, then 4 / 5 / 6 stepping up at
+///     65536 px and 1 MPx (the §V.C four-to-six sweet spot);
+///     `Reliable` -> 1, or 4 from 1 MPx up (segmentation "may slightly
+///     improve compression effectiveness, especially on large
+///     images"); `Lossy` -> double the Typical pick (minimum 4).
+///   * **Compressed-byte volume** (`expected_bytes`, e.g. the §VI
+///     byte quota): the containment benefit "is determined primarily
+///     by the number of output bytes produced", while segments small
+///     in compressed bytes lose their benefit ("it becomes more likely
+///     that a single frame loss will affect multiple segments"). The
+///     pick is clamped toward roughly 1--32 KiB of compressed data per
+///     segment.
+///   * **Validity caps**, applied last: the MER cap of 32; §V.D
+///     eq (9) `s <= wh` on the LL subband (`ceil(W/2^D) *
+///     ceil(H/2^D)`), which realises §V.C's "tighter limits when the
+///     image is small and the number of stages of wavelet
+///     decomposition is large"; and this crate's row-strip 2-row
+///     minimum so the result is valid for either segmentation mode.
+///
+/// The returned count is always >= 1 and valid for both the row-strip
+/// and the §V.B transform-domain segmentation of a `width x height`
+/// image at `wavelet_levels` decomposition stages.
+pub fn recommend_segment_count(
+    width: u32,
+    height: u32,
+    wavelet_levels: u8,
+    expected_bytes: Option<u64>,
+    channel: ChannelReliability,
+) -> u16 {
+    let area = width as u64 * height as u64;
+    let typical_base: u64 = if area < 4096 {
+        1
+    } else if area < 65536 {
+        4
+    } else if area < (1 << 20) {
+        5
+    } else {
+        6
+    };
+    let base: u64 = match channel {
+        ChannelReliability::Reliable => {
+            if area >= (1 << 20) {
+                4
+            } else {
+                1
+            }
+        }
+        ChannelReliability::Typical => typical_base,
+        ChannelReliability::Lossy => (typical_base * 2).max(4),
+    };
+
+    // §V.C compressed-byte-volume axis: aim for ~1-32 KiB of
+    // compressed data per segment.
+    let mut s = base;
+    if let Some(bytes) = expected_bytes {
+        let max_by_bytes = (bytes / 1024).max(1);
+        let min_by_bytes = (bytes / (32 * 1024)).min(32);
+        s = s.min(max_by_bytes).max(min_by_bytes);
+    }
+
+    // Validity caps: MER 32; §V.D eq (9) on the LL subband; the
+    // row-strip 2-row minimum.
+    let d = wavelet_levels.clamp(1, 6);
+    let (ll_w, ll_h) = crate::partition::ll_dimensions(width as usize, height as usize, d);
+    let ll_area = ll_w as u64 * ll_h as u64;
+    s = s
+        .min(32)
+        .min(ll_area)
+        .min((height as u64 / 2).max(1))
+        .max(1);
+    s as u16
+}
+
 /// The default candidate-filter set explored by
 /// [`pick_filter_by_rate_distortion`]. Q + A are the pair the paper's
 /// deployments highlight; they share the same `alpha` triple and

@@ -40,6 +40,7 @@ fn base_opts() -> EncodeOptions {
         transform_segments: false,
         min_loss: 0,
         priority_interleaving: false,
+        auto_segments: None,
     }
 }
 

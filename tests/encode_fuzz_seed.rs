@@ -109,6 +109,17 @@ fn drive(data: &[u8]) -> bool {
     let bit_plane_count = ((opt_b >> 3) & 0x0F).max(1);
     let uncompressed = (opt_c & 0x01) != 0;
     let segment_count = ((opt_c >> 1) as u16 & 0x1F).clamp(1, MAX_SEGMENTS);
+
+    // §V.C auto segment-count selection rides the redundant top of the
+    // raw 5-bit segment-count field (raw 17..=31 all clamp to
+    // MAX_SEGMENTS, so 29..=31 are free encodings): 29 -> Reliable,
+    // 30 -> Typical, 31 -> Lossy.
+    let auto_segments = match (opt_c >> 1) & 0x1F {
+        29 => Some(oxideav_icer::ChannelReliability::Reliable),
+        30 => Some(oxideav_icer::ChannelReliability::Typical),
+        31 => Some(oxideav_icer::ChannelReliability::Lossy),
+        _ => None,
+    };
     let auto_filter = (opt_d & 0x01) != 0;
     let auto_filter_rd = (opt_d & 0x02) != 0;
     let rd_pruning = (opt_d & 0x04) != 0;
@@ -155,6 +166,7 @@ fn drive(data: &[u8]) -> bool {
         transform_segments: false,
         min_loss: 0,
         priority_interleaving,
+        auto_segments,
     };
 
     let encoded = match encode_icer(&img, &opts) {
@@ -166,7 +178,20 @@ fn drive(data: &[u8]) -> bool {
         // Deep-sample images additionally carry the 9-byte plane-
         // container framing — part of the geometry-preserving minimum
         // the encoder always emits (like the placeholder headers).
-        let slop = (segment_count as u64) * 12 + if deep { 9 } else { 0 };
+        // §V.C auto-selection can raise the on-the-wire segment count
+        // above the synthesized one; placeholder headers are charged
+        // against the same slop, so size it from the effective count.
+        let eff_segments = match auto_segments {
+            Some(ch) if opts.segment_priorities.is_none() => oxideav_icer::recommend_segment_count(
+                width,
+                height,
+                wavelet_levels,
+                byte_budget.or(target_bytes),
+                ch,
+            ),
+            _ => segment_count,
+        };
+        let slop = (eff_segments as u64) * 12 + if deep { 9 } else { 0 };
         assert!(
             encoded.len() as u64 <= budget + slop,
             "encoded {} bytes > budget {} + slop {}",

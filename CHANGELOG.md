@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§V.C automatic segment-count selection**
+  (`analyze::recommend_segment_count` +
+  `EncodeOptions::with_auto_segments(ChannelReliability)`) — IPN
+  42-155 §V.C "Choosing the Number of Segments" as a documented
+  decision tree: the MER ≤32 cap, the four-to-six sweet spot, one
+  segment for rare losses / small images, and the three §V.C scaling
+  axes (image area, expected compressed bytes — fed by the §VI byte
+  quota when set — and channel reliability), always capped to a
+  geometry-valid count (§V.D eq (9) on the LL subband + the row-strip
+  2-row minimum). Resolved at encode time, overriding any explicit
+  `segment_count` (auto_filter's override semantics); composes with
+  row-strip and §V.B transform-domain segmentation, deep samples,
+  colour, and the quotas; mutually exclusive with
+  `segment_priorities` / `with_center_roi`.
+
 - **Deep-sample (9..=16-bit) 2-D grayscale support**
   (`IcerPixelFormat::GrayDeep { bits }`) — IPN 42-155 §II.C's own
   operating point ("On MER, all cameras produce 12-bit pixels and each

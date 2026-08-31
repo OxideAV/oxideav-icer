@@ -401,6 +401,26 @@ pub struct EncodeOptions {
     /// distortion-priority position). Ignored when
     /// [`Self::uncompressed`] forces the raw-pixel path.
     pub priority_interleaving: bool,
+
+    /// IPN 42-155 §V.C automatic segment-count selection.
+    ///
+    /// When `Some(channel)`, the encoder resolves
+    /// [`Self::segment_count`] at encode time via
+    /// [`crate::analyze::recommend_segment_count`] -- the §V.C
+    /// guidance (MER <=32 cap, four-to-six sweet spot, scaled by image
+    /// area / expected compressed bytes / channel reliability, capped
+    /// by §V.D eq (9) and the row-strip 2-row minimum). Any
+    /// explicitly-set `segment_count` is **overridden** (mirroring
+    /// [`Self::auto_filter`]'s override semantics). The byte quota
+    /// ([`Self::byte_budget`], else [`Self::target_bytes`]) feeds the
+    /// §V.C "number of compressed bytes" axis.
+    ///
+    /// Composes with row-strip and §V.B transform-domain segmentation,
+    /// both entropy backends, the §VI quotas, deep samples, and
+    /// colour. Mutually exclusive with [`Self::segment_priorities`] /
+    /// `with_center_roi` -- the priority vector length must equal a
+    /// segment count that is not known until encode time.
+    pub auto_segments: Option<crate::analyze::ChannelReliability>,
 }
 
 impl Default for EncodeOptions {
@@ -429,6 +449,7 @@ impl Default for EncodeOptions {
             transform_segments: false,
             min_loss: 0,
             priority_interleaving: false,
+            auto_segments: None,
         }
     }
 }
@@ -441,6 +462,15 @@ impl EncodeOptions {
             uncompressed: false,
             ..Self::default()
         }
+    }
+
+    /// Enable IPN 42-155 §V.C automatic segment-count selection for
+    /// the given channel-reliability class. See
+    /// [`EncodeOptions::auto_segments`].
+    #[must_use]
+    pub fn with_auto_segments(mut self, channel: crate::analyze::ChannelReliability) -> Self {
+        self.auto_segments = Some(channel);
+        self
     }
 
     /// Set a hard byte budget. The encoder will not exceed this many
@@ -702,6 +732,7 @@ fn encode_icer_deep(image: &IcerImage, bits: u8, opts: &EncodeOptions) -> Result
     // Filter auto-selection mirrors the single-plane entry: resolve
     // once up-front, then thread a concrete filter id everywhere.
     let resolved_opts = resolve_auto_filter(image, opts)?;
+    let resolved_opts = resolve_auto_segments(image, &resolved_opts)?;
     let opts = &resolved_opts;
 
     // Quality-target rate-control runs at THIS level so its trial
@@ -760,6 +791,40 @@ fn resolve_auto_filter(image: &IcerImage, opts: &EncodeOptions) -> Result<Encode
     } else {
         Ok(opts.clone())
     }
+}
+
+/// Resolve [`EncodeOptions::auto_segments`] into a concrete
+/// [`EncodeOptions::segment_count`] per IPN 42-155 §V.C (no-op clone
+/// when auto-selection is off). Runs immediately after filter
+/// resolution and **before** the quality-target dispatch, so the
+/// recommendation never varies across the quality search's trial
+/// budgets (quality-target conflicts with both quota fields anyway).
+/// Shared by the Gray8 and deep-sample entries; the colour path
+/// resolves per plane on identical dimensions, so every plane gets the
+/// same count.
+fn resolve_auto_segments(image: &IcerImage, opts: &EncodeOptions) -> Result<EncodeOptions> {
+    let Some(channel) = opts.auto_segments else {
+        return Ok(opts.clone());
+    };
+    if opts.segment_priorities.is_some() {
+        return Err(IcerError::Unsupported(
+            "auto_segments conflicts with segment_priorities / with_center_roi; \
+             the priority vector length must equal the not-yet-resolved segment count"
+                .into(),
+        ));
+    }
+    let s = crate::analyze::recommend_segment_count(
+        image.width,
+        image.height,
+        opts.wavelet_levels.clamp(1, 6),
+        opts.byte_budget.or(opts.target_bytes),
+        channel,
+    );
+    Ok(EncodeOptions {
+        segment_count: s,
+        auto_segments: None,
+        ..opts.clone()
+    })
 }
 
 /// The [`EncodeOptions::quality_target_psnr`] mutual-exclusion rules
@@ -830,6 +895,7 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     // that has `auto_filter` cleared so downstream paths see a
     // concrete filter id.
     let resolved_opts = resolve_auto_filter(image, opts)?;
+    let resolved_opts = resolve_auto_segments(image, &resolved_opts)?;
     let opts = &resolved_opts;
 
     // Round 233: quality-target rate-control. Run a binary search over
