@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-icer/compare/v0.0.4...v0.0.5) - 2026-08-31
+
+### Other
+
+- r454 docs — §V.C measured throughput, wire-digest coverage, refreshed fuzz numbers
+- bit-plane scan profiling pass — closed-form classify_position + one-classify visit helpers
+- wire+decode digest pins and representative-size benches
+- IPN 42-155 §V.C segment-count selection — recommend_segment_count + with_auto_segments(ChannelReliability)
+- registry deep-frame selection — CodecParameters pixel_format drives the GrayDeep encode path
+- deep-sample criterion baseline — 12-bit filter-Q 64x64 encode/decode group
+- depth-mode fuzz hardening — lenient reconstruction-geometry cap + deep wire coverage
+- deep-sample 9..=16-bit 2-D grayscale — the §II.C 12-bit MER operating point end to end
+- IPN 42-155 §II.C dynamic-range analysis — Table 3 tap-sum rationals + exact Table 4 word-size constraints
+- ICER-3D loss-tolerant decode — salvage the delivered prefix per the §I progressive promise
+- r414 docs + §V.D cube bench — README ICER-3D sections, measured containment + byte tables
+- IPN 42-164 §III.B dynamic-range expansion — Table 1 γ factors + the word-size rule
+- ICER-3D error-containment gates — segment-loss confinement pinned + new-mode fuzz seeds
+- ICER-3D cross-segment progressive quota — global priority-interleaved packet cut
+- ICER-3D §II.B transform-domain segmentation — the §V.D rectangle partition for cubes
+- windowed 3-D bit-plane geometry — §V.D segment scans over a shared cube transform
+- rename WaveletFilter variants to the §II.A spec names — FilterQ / FilterA
+- r411 docs — §II.A migration + §VI.B quota sections, re-measured tables
+- fuzz corpus seeds for the §II.A filter wire + §VI.B quota streams
+- IPN 42-155 §VI.B cross-segment progressive byte quota
+- migrate the pipeline onto the IPN 42-155 §II.A integer transform — all seven filters lossless
+- rustdoc hygiene — resolve three IcerError intra-doc links + escape a bracketed spec-reference numeral
+- r405 docs — §III.A interleaving section, §II.B fix notes, re-measured tables
+- §III.A subband-priority interleaving — the spec's progressive packet schedule, end to end
+- fix §II.B pyramid recursion — decompose the LL lattice, not the top-left rectangle
+- fix §IV.C interleaved-coder mid-stream buffer-full flush desync
+- add CI / crates.io / docs.rs / MIT-license badges
+- windowed §V.B segment scans — transform-domain encode at row-strip parity
+- r389 docs + criterion pins — §V.B/§VI.A README sections, CHANGELOG, bench group
+- mutation-smoke hardening — two decode-side overflow fixes + new-mode fuzz seeds
+- §V.B transform-domain segmentation emitter + §VI.A minimum-loss, end to end
+- wire framing for §V.B transform-domain segments + the §VI.A quality goal
+- ScanFilter — §V.B segment-restricted + §VI.A plane-excluded bit-plane scans
+- IPN 42-155 §V.B segment maps — LL partition mapped to every subband
+- refresh fuzz/Cargo.lock path-dep version (0.0.3 -> 0.0.4)
+- criterion baseline for the ICER-3D cube path
+- IPN 42-155 §V.D partitioning algorithm — spec-exact rectangle partition
+- README + CHANGELOG — document the ICER-3D subsystem
+- fuzz the ICER-3D cube decoder + per-push corpus smoke
+- ICER-3D integration suite — 3-D beats per-band 2-D, quota/min-loss composition, corruption sweep
+- fix two scheduled-fuzz crashes — lenient duplicate-index OOB + single-segment budget bypass
+- ICER-3D cube pipeline — encode/decode API with §IV.B rate control
+- ICER-3D §IV bit-plane coder over the spectral context model
+- ICER-3D §IV.C spectral context modeler (Tables 2-6)
+- ICER-3D §IV.A subband priorities + Appendix index assignment
+- ICER-3D §III.A three-dimensional wavelet decomposition
+- §IV interleaved-backend robustness + compression coverage
+- §IV interleaved coder is a selectable encode/decode backend (full pipeline)
+- bit-plane passes run on a selectable entropy backend (§IV interleaved or arithmetic)
+- context-driven §IV interleaved-coder wrapper (drop-in for the arith coder)
+- §IV interleaved entropy coder — circular-buffer encode/decode
+- §IV interleaved-entropy-coder component codes (Golomb + Table 10 bins)
+- README status row — note the §III.B same-subband neighbourhood
+- lock §III.B same-subband-walk fidelity gains with regression coverage
+- spec-exact §III.B same-subband neighbour walk
+- README — narrow the interop gap note to the genuine remaining items
+- fix stale context.rs module-doc — describe the §III.C MER estimator
+- refresh lib.rs crate-doc for the §III.B/§III.C spec-exact contexts
+- spec-exact §III.C probability estimator (MER 2/4 init, rescale at 500)
+- subband-aware bit-plane scanner — wire §III.B Table 6/7 + HL transpose
+- spec-exact §III.B Table 6/7 per-subband context tables + HL transpose
+- pin §III.B category-model strict-MSB truncation win on the checkerboard
+- systematic decode-configuration + progressive-quality coverage
+- spec-exact §III.B four-category context model + category-3 uncoded magnitude bits
+- end-to-end budget-truncation fidelity regression for §III.A per-coefficient deadzone
+- per-coefficient §III.A deadzone reconstruction on mid-plane truncation
+- document geometry-preserving budget truncation + compute-bounded DecodeLimits
+- bound decode_segment fuzz compute via tight DecodeLimits (DoS slow-unit)
+- fix budget-truncated multi-segment encode dropping image rows (IPN 42-155 §V.B)
+- §III.A image-domain-weighted R-D packet selection
+- colour (YUV 4:4:4) encode + decode per IPN 42-155 §III
+- §III.A deadzone mid-bin reconstruction for truncated streams
+- §III.A subband priority model -- Fig. 7 weights + cross-subband bit-plane encode order
+- spec-exact reversible integer filters A-F + Q from IPN 42-155 §II.A
+- refresh to current status, drop per-round changelog cruft
+- structural-similarity index (SSIM) post-decode quality metric
+
 ### Fixed
 
 - **Lenient-decode allocation hole** (found by the r433 bounded
