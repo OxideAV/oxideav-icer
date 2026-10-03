@@ -17,6 +17,197 @@ Progress Report 42-164* (2006) -- abbreviated `IPN 42-164`. Those two
 papers are the sole sources; no other material was consulted,
 paraphrased, or cross-checked.
 
+## Standalone use
+
+The crate implements the OxideAV image-crate contract
+(`IMAGE_CRATE_API`) at its root and builds with
+`default-features = false` — no `oxideav-core` in the tree:
+
+```toml
+[dependencies]
+oxideav-icer = { version = "0.0", default-features = false }
+```
+
+```rust
+let bytes = std::fs::read("in.icer")?;
+if oxideav_icer::probe(&bytes) {
+    let info = oxideav_icer::info(&bytes)?;          // framing only: width, height, format, frames, bit_depth
+    let img  = oxideav_icer::decode(&bytes)?;        // IcerImage, native layout (Gray8 / Gray16Le / Yuv444P / Gbrp8)
+    let rgba: Vec<u8> = img.to_rgba8();              // tightly packed RGBA, 4 * width bytes per row
+    let (w, h) = (img.width(), img.height());
+
+    let opts = oxideav_icer::EncodeOptions::compressed().with_segment_count(4);
+    let out: Vec<u8> = oxideav_icer::encode_rgba8(w, h, &rgba, &opts)?;   // planar RGB, lossless
+    std::fs::write("out.icer", out)?;
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+| Item | ICER specifics |
+|---|---|
+| `probe(bytes) -> bool` | Structural sniff, allocation-free (ICER has no file magic): the ICER-3D cube magic `00 00 C3 01`; or the plane container (`00 00`, tag `0..=3`, plane count matching the tag); or a 12-byte segment header whose every field is in range (non-zero sync prefix, filter id `0..=6`, `1..=6` levels, non-zero width / height, `1..=32` bit-planes, valid §V.B total / index). |
+| `info(bytes) -> ImageInfo` | Header-only walk of every segment (or the 17-byte cube header): `width`, `height`, `format`, `frames` (1, or a cube's band count), `has_alpha` (always `false`), `color`, `has_icc` / `has_exif` / `has_xmp` (always `false`), plus the extras `bit_depth`, `kind` (`Segments` / `PlaneContainer` / `Cube`) and `segments` (one `SegmentMetadata` per 2-D segment). `info_with(bytes, &DecodeOptions)` applies explicit caps. |
+| `decode(bytes) -> IcerImage` / `decode_with(bytes, &DecodeOptions)` | Native layout; band 0 of a cube. |
+| `decode_rgb8` / `decode_rgba8` | `RgbImage { width, height, data }` / `RgbaImage` (3 / 4 bytes per pixel, alpha `255`). |
+| `decode_all(bytes) -> Vec<Frame>` / `decode_all_with` | One `Frame { image, delay: None, index }` per spectral band of an ICER-3D cube (`index` = band); a one-element `Vec` for a 2-D stream. |
+| `decode_from<R: Read>` | Reads to end, then `decode`. |
+| `encode(&IcerImage, &EncodeOptions) -> Vec<u8>` | Writes the layout as given: `Gray8` → bare segment stream (the historical wire form), `Gray16Le` → deep plane container (tag 2 + depth byte), `Yuv444P` / `Gbrp8` → three component streams (tags 1 / 3). Never converts. |
+| `encode_rgb8(w, h, &rgb, &opts)` / `encode_rgba8` | Planar RGB (`Gbrp8`) — three independent, lossless component streams; `decode_rgb8(encode_rgb8(..))` is the input exactly. **`encode_rgba8` drops alpha** (ICER has no alpha mechanism). |
+| `encode_to<W: Write>` | `encode`, then write. |
+| `encode_all(&[Frame], &opts)` | One frame → `encode`; two or more gray frames of equal geometry / `bit_depth` → an ICER-3D cube (`encode_icer3d` with `filter`, `wavelet_levels`, `segment_count`, `byte_budget`, `min_loss`, `interleaved_entropy`, `transform_segments` mapped onto `CubeEncodeOptions`). |
+| `IcerImage` | `{ width, height, format: PixelFormat, planes: Vec<Plane>, color: ColorInfo, metadata: Metadata, bit_depth: u8 }` — no palette (ICER has none). `new` / `zeros` / `zeros_deep` / `from_rgb8` / `from_rgba8` / `with_bit_depth` validate (`Result`); `width()`, `height()`, `format()`, `bit_depth()`, `as_bytes()` (`Some` for the gray layouts), `into_raw()`, `to_rgb8()`, `to_rgba8()`, `sample()` / `set_sample()`. |
+| `PixelFormat` = `IcerPixelFormat` | `Gray8`, `Gray16Le`, `Yuv444P`, `Gbrp8` — names mirror `oxideav_core::PixelFormat`. |
+| `Error` = `IcerError` | `InvalidData`, `Unsupported`, `LimitExceeded`, `Io(std::io::Error)`, `Truncated`. |
+
+The depth APIs keep their names: the segment walker (`walk_segment`,
+`SegmentHeader`, `PacketHeader`), the wavelet / context / entropy
+stages, the loss-tolerant `parse_icer_lenient` / `parse_icer_lenient_with`,
+the cube pipeline (`encode_icer3d`, `parse_icer3d`, `parse_icer3d_with`,
+`parse_icer3d_lenient`, `IcerCube`, `CubeEncodeOptions`) and the analysis
+helpers (`analyze`, `psnr_db`, `ssim`, `DistortionReport`, …). The
+pre-contract names (`parse_icer`, `parse_icer_with_limits`,
+`parse_icer_metadata`, `encode_icer`, `DecodeLimits`, `IcerPlane`, …)
+remain for one release as `#[deprecated]` wrappers.
+
+## Framework use
+
+The default `registry` Cargo feature pulls in `oxideav-core` and adds:
+
+* `register(&mut RuntimeContext)` — codec factories + the `.icer`
+  extension hint (also wired into `oxideav_meta::register_all` through
+  `oxideav_core::register!`); `register_codecs(&mut CodecRegistry)` /
+  `register_containers(&mut ContainerRegistry)` for one side only.
+* `make_decoder(&CodecParameters)` / `make_encoder(&CodecParameters)` —
+  the factories behind the registry. The `Decoder` yields one frame per
+  2-D stream and one frame **per spectral band** of a cube (the same
+  walk as `decode_all`); the `Encoder` needs `width` / `height` and
+  reads the layout from `pixel_format` (`Gray8` / `Gray10Le` /
+  `Gray12Le` / `Gray16Le` / `Yuv444P` / `Gbrp8`; without it a 1-plane
+  frame is `Gray8` and a 3-plane frame `Yuv444P`).
+* the frame bridge: `From<IcerImage> for VideoFrame`,
+  `IcerImage::from_video_frame(&VideoFrame, &CodecParameters)` and
+  `TryFrom<(&VideoFrame, &CodecParameters)>`; `to_core_pixel_format` /
+  `from_core_pixel_format` map the layouts 1:1 by name, except that a
+  `Gray16Le` image at exactly 10 / 12 bits is labelled with core's
+  dedicated `Gray10Le` / `Gray12Le` rung (same LSB-aligned words). Any
+  other depth not implied by the core format (9, 11, 13–15-bit gray, or
+  a shallow cube band) rides the frame's **significant-bits**
+  side-channel. **No colour signal is stamped** on frames: ICER defines
+  no colour semantics and the stream carries none (see "Metadata and
+  colour").
+
+Both trait impls are thin adapters over the standalone functions — one
+implementation.
+
+## Supported layouts
+
+Decode (what `decode` / `info` report):
+
+| Wire form | `format` | `bit_depth` | planes | notes |
+|---|---|---|---|---|
+| bare segment stream (IPN 42-155 §IV) | `Gray8` | 8 | 1 | the historical form |
+| plane container tag 2 | `Gray16Le` | 9..=16 (depth byte) | 1 | exact LSB-aligned `u16` LE samples |
+| plane container tag 1 | `Yuv444P` | 8 | 3 (Y, Cb, Cr) | co-sited 4:4:4 |
+| plane container tag 3 | `Gbrp8` | 8 | 3 (G, B, R) | planar RGB |
+| ICER-3D cube (IPN 42-164) | `Gray8` (depth ≤ 8) / `Gray16Le` | 1..=16 (cube header) | 1 per band | `decode` = band 0, `decode_all` = every band |
+
+Encode (`encode` writes the layout as given; `encode_rgb8` / `encode_rgba8`
+produce `Gbrp8`; `encode_all` of 2+ frames produces a cube):
+
+| `format` | wire form | lossless | notes |
+|---|---|---|---|
+| `Gray8` | bare segment stream | yes (any filter, no quota) | `bit_depth < 8` is written as 8-bit (the bare form has no depth field) |
+| `Gray16Le` | plane container tag 2 | yes | `bit_depth` 9..=16 required (`InvalidData` otherwise) |
+| `Yuv444P` | plane container tag 1 | yes | three independent component streams |
+| `Gbrp8` | plane container tag 3 | yes | three independent component streams |
+| cube (`encode_all`) | ICER-3D stream | yes at `min_loss` 0 without quota | gray frames only, equal geometry and `bit_depth` |
+
+Lossy operation is progressive truncation only (`byte_budget` /
+`target_bytes` / `min_loss` / `quality_target_psnr`); the transform is
+reversible under all seven §II.A filters, and `decode(encode(img)) ==
+img` is pinned for every layout.
+
+## Options
+
+`EncodeOptions` (`#[non_exhaustive]`, `Default`, every behaviour variant a
+field with a `with_*` builder; start from `EncodeOptions::new()` — the
+IPN 42-155 §III.D uncompressed path — or `EncodeOptions::compressed()`):
+
+| Field | Builder | Effect |
+|---|---|---|
+| `uncompressed: bool` (default `true`) | `with_uncompressed`, `compressed()` | raw-sample §III.D segments vs the wavelet + bit-plane + entropy pipeline |
+| `filter: WaveletFilter` (`FilterQ`) | `with_filter` | the §II.A reversible integer filter (A–F, Q) |
+| `wavelet_levels: u8` (3) | `with_wavelet_levels` | dyadic decomposition levels `1..=6` |
+| `bit_plane_count: u8` (8) | `with_bit_plane_count` | bit-planes coded per subband (`1..=32`) |
+| `segment_count: u16` (1) | `with_segment_count`, `with_auto_segments(ChannelReliability)`, `with_center_roi` | §V row strips / §V.B transform-domain segments |
+| `sync_prefix: u16` (`0xACED`) | `with_sync_prefix` | the 16-bit segment sync word (implementation-chosen per §IV) |
+| `byte_budget` / `target_bytes` / `rd_pruning` | `with_byte_budget`, `with_target_bytes`, `with_rd_budget` | §VI.B byte quota (hard / soft / R-D pruned) |
+| `quality_target_psnr` | `with_quality_target` | §VI.A-style quality goal by PSNR search |
+| `min_loss: u8` | `with_min_loss` | §VI.A minimum-loss parameter |
+| `auto_filter` / `auto_filter_rd` | `with_auto_filter`, `with_auto_filter_rd` | automatic filter selection |
+| `segment_priorities` | `with_segment_priorities`, `with_center_roi` | ROI segment ordering |
+| `auto_uncompressed_fallback` | `with_uncompressed_fallback` | per-segment §III.D fallback |
+| `interleaved_entropy` | `with_interleaved_entropy` | §IV interleaved entropy coder instead of the arithmetic coder |
+| `transform_segments` | `with_transform_domain_segments` | §V.B transform-domain segmentation |
+| `priority_interleaving` | `with_priority_interleaving` | §III.A subband-priority packet schedule |
+
+`DecodeOptions` (`#[non_exhaustive]`, `Default`, `with_*`): `max_width`,
+`max_height`, `max_pixels`, `max_bytes` (`Option`, `None` = unlimited),
+`strict` and the ICER extra `max_pixels_per_segment` — see "Limits".
+`strict` is a documented no-op: ICER's framing has no optional leniency
+(every structural rule is always enforced, and a stream cut short
+mid-packet is the format's progressive design, not an error); the
+loss-tolerant decode of a stream with *missing segments* is the separate
+`parse_icer_lenient` depth API.
+
+## Metadata and colour
+
+ICER carries **no metadata and no colour signalling**: the 12-byte
+segment header, the plane container and the cube header hold geometry
+and coding parameters only (IPN 42-155 §IV, IPN 42-164 §II). Therefore
+`Metadata { icc, exif, xmp, gamma }` is always empty on a decoded image
+and the encoder cannot carry whatever a caller sets, and `ColorInfo` is
+the crate's documented convention — not the format's — which is why the
+`registry` adapter does not stamp it on framework frames (wave-3 ruling):
+
+| layout | `ColorInfo` default | `to_rgb8` / `to_rgba8` |
+|---|---|---|
+| `Gray8`, `Gray16Le` | `range: Full` (the §III.A level shift by `2^(depth-1)` assumes samples span the whole word), `primaries: 2`, `transfer: 2`, `matrix: 0` | sample clamped to `2^bit_depth − 1`, reduced by round-half-up `(v × 255 + max/2) / max` (identity at depth 8), replicated to R = G = B |
+| `Gbrp8` | same as gray | planes re-interleaved as R, G, B — exact |
+| `Yuv444P` | `range: Limited` (what core's `Yuv444P` denotes), `primaries: 2`, `transfer: 2`, `matrix: 2` | BT.601 coefficients unless `color.matrix == 1` (BT.709); limited range (Y 16..235, C 16..240) unless `color.range == Full`; fixed-point 16-fraction-bit kernel, rounded, clamped |
+
+No primaries / transfer are invented for the unspecified code points.
+Alpha is always `255`; `has_alpha` is always `false`.
+
+## Limits
+
+Every cap in `DecodeOptions` is checked on the framing **before** any
+plane or wavelet-coefficient buffer is allocated and before any inverse
+DWT runs, failing with `Error::LimitExceeded`. `info` applies the same
+caps as `decode`, so the policy cannot be bypassed by stopping at the
+metadata stage.
+
+| field | default | meaning |
+|---|---|---|
+| `max_width` / `max_height` | `None` | the 16-bit header fields already bound both to 65535 |
+| `max_pixels_per_segment` (ICER extra) | 64 MPx | one segment's `width × height` — the unit the coefficient buffer and inverse DWT are sized by (a cube: `width × strip_height × bands`, or the whole cube in transform-domain mode) |
+| `max_pixels` | 256 MPx | the stitched image's `width × height`, summed over row-strip segments and over the planes of a container; a cube's `width × height × bands` |
+| `max_bytes` | 1 GiB | decoded plane bytes (`pixels × sample_bytes × planes`; a cube is materialised as `u16` samples) |
+| `strict` | `false` | no effect (see "Options") |
+
+Why pixel caps and not only bytes: the wire format's `u16` width /
+height admit `65535 × 65535 ≈ 4.29 GPx` per segment — a 12-byte header
+could request a ~4 GB plane plus ~16 GB of `i32` coefficients. The
+defaults sit two orders of magnitude above every published Mars-rover
+Pancam / Hazcam / Mastcam-Z frame (1–2 MPx) and bound a worst-case
+multi-segment image at ~1 GB. `DecodeOptions::new().unlimited()` lifts
+every cap for trusted input; the `decode_segment` fuzz harness runs at a
+tight 1 MPx / segment so a crafted header cannot spend tens of seconds
+in a legitimate, bounded inverse DWT. The lenient decoder additionally
+caps the *reconstruction geometry* it infers from a gapped
+`segment_index` sequence (two tiny received strips at a huge index gap
+would otherwise buy a multi-GB placeholder allocation).
+
 ## Status
 
 | Subsystem                | Status            |
@@ -52,10 +243,10 @@ paraphrased, or cross-checked.
 | §V.C segment-count selection | full (`analyze::recommend_segment_count` + `EncodeOptions::with_auto_segments(ChannelReliability)` -- the §V.C guidance as a documented decision tree: MER ≤32 cap, four-to-six sweet spot, 1 for reliable channels / small images, scaled by image area / expected compressed bytes / channel reliability; capped by §V.D eq (9) + the row-strip 2-row minimum so the pick is valid for both segmentation modes -- see "Choosing the number of segments" below) |
 | R-D budget pruning | full (`EncodeOptions::with_rd_budget(n)` -- per-segment cost-per-byte packet selection per IPN 42-155 §IV.B rate-allocation principle) |
 | Decoder / Encoder traits | full (gated on default `registry` feature) |
-| Decode-side resource limits | full (`DecodeLimits` + `parse_icer_with_limits`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits; `DecodeLimits` bounds decode *compute* as well as allocation -- the `decode_segment` fuzz harness uses a tight 1 MPx/segment budget so a single crafted header declaring multi-MPx geometry cannot spend tens of seconds in the inverse DWT + bit-plane scan) |
+| Decode-side resource limits | full (`DecodeOptions` + `decode_with`; default 64 MPx/segment, 256 MPx total; closes the 4 GB-per-plane DoS surface the wire format admits; `DecodeOptions` bounds decode *compute* as well as allocation -- the `decode_segment` fuzz harness uses a tight 1 MPx/segment budget so a single crafted header declaring multi-MPx geometry cannot spend tens of seconds in the inverse DWT + bit-plane scan) |
 | Per-segment uncompressed fallback | full (`EncodeOptions::with_uncompressed_fallback()` -- per-segment §III.D choice between compressed and raw-pixel paths; byte-smaller wins) |
 | Lenient multi-segment decode | full (`parse_icer_lenient` -- tolerates missing segments per IPN 42-155 §III.E independent-segment scheduling; missing strips reconstruct as flat 128; segment 0 must be present to pin canonical strip height) |
-| Encode-side fuzz harness | full (`fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode_icer`, self-roundtrips through `parse_icer` + `parse_icer_lenient`; complements the decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
+| Encode-side fuzz harness | full (`fuzz/fuzz_targets/encode_roundtrip.rs` synthesises bounded `IcerImage` + `EncodeOptions` from fuzzer bytes, drives `encode`, self-roundtrips through `decode` + `parse_icer_lenient`; complements the decode harness; `tests/encode_fuzz_seed.rs` runs the same logic on 17 hand-curated seeds every CI push) |
 | Quality-target rate-control | full (`EncodeOptions::with_quality_target(target_db: f32)` -- binary search over byte budgets, decode each trial, compute PSNR via `analyze::psnr_db`, emit the smallest output whose PSNR is >= the target. Inverse shape of `with_byte_budget`. Mutually exclusive with `byte_budget` / `target_bytes` / `rd_pruning`; uncompressed-forced is a no-op; above-ceiling targets return the unbudgeted encode as best-effort) |
 | Post-decode quality metrics | full (`DistortionReport` MSE/RMSE/MAE/max-abs/PSNR + `region_mae` + `ssim` -- mean structural-similarity index over a sliding 8x8 window; all spec-neutral) |
 | Benchmark sweeps | full (criterion suite sweeps `wavelet_levels`, `segment_count`, and `bit_plane_count` on the §II.A filter-Q and filter-A paths -- see Benchmarks below) |
@@ -63,7 +254,7 @@ paraphrased, or cross-checked.
 | ICER-3D 3-D wavelet decomposition | full (IPN 42-164 §III.A staged decomposition -- spatially-low-pass / spectrally-high-pass subbands keep decomposing spatially; bit-exact reversible for all seven §II.A integer filters across degenerate geometries -- see `wavelet3d`) |
 | ICER-3D subband priorities + indices | full (IPN 42-164 §IV.A `p = 2b + L - H + 3` + the Appendix index-assignment rules; paper pins verified (subband 21 H=2/L=6, `p = 2b+7`; only subband 0 reaches priority 0) -- see `subband3d`) |
 | ICER-3D spectral context modeler | full (IPN 42-164 §IV.C Tables 2-6: 19 contexts from the two spectral-neighbour coefficients, Table 6 sign prediction + agreement bits, category-3 uncoded -- see `context3d`) |
-| ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip **and** §V.D transform-domain segments, `DecodeLimits` caps -- see "ICER-3D" below) |
+| ICER-3D cube encode + decode | full (IPN 42-164 pipeline: §III.A mean subtraction (one mean per band per segment on the wire) + §IV bit-plane coder with one packet per priority value + §IV.B byte quota / minimum-loss rate control; lossless at min-loss 0, both entropy backends, row-strip **and** §V.D transform-domain segments, `DecodeOptions` caps -- see "ICER-3D" below) |
 | ICER-3D §II.B transform-domain segmentation | full (`CubeEncodeOptions::with_transform_domain_segments()` -- the spec form: one whole-cube transform, error-containment segments as IPN 42-155 §V.D rectangles of the spatially-low-pass lattice "extend[ing] through all spectral bands", per-segment context modeler / entropy coder / §III.A means; decoder recomputes the partition from header fields; segment-loss containment pinned (residual ≤ 4 beyond a `3·2^ts` dilation, bit-exact beyond `8·2^ts`, lost windows reconstruct mean-anchored at 2x+ better MAE than a flat fill) -- see "ICER-3D" below) |
 | ICER-3D cross-segment progressive quota | full (the §IV.B byte quota cuts the **global** priority-interleaved packet order -- all segments' packets of a priority before the next lower priority, the IPN 42-155 §VI.B Fig. 23 arrangement carried to cubes -- so no segment starves; budgeted wire pinned packet-for-packet against a simulated global-order prefix; ample quota byte-identical) |
 | ICER-3D §III.B dynamic-range analysis | full (Table 1 γ factors as exact rationals + the word-size rule, `high_pass_gamma` / `dynamic_range_expansion` / `coefficient_word_bits`; all 21 table cells + the filter-A 12-bit → 16-bit-word worked example pinned; the live transform verified within the published word sizes on full-range extremes) |
@@ -72,7 +263,7 @@ paraphrased, or cross-checked.
 | §V.B transform-domain segmentation | full (`EncodeOptions::with_transform_domain_segments()` -- one whole-image DWT, §V.D LL partition mapped to every subband, each segment coded with its own context modeler + entropy coder; decoder recomputes the partition from the header parameters per §V.D; lenient decode no longer needs segment 0; a lost segment's loss decays to bit-exact outside a bounded wavelet-support bleed -- see "Transform-domain segmentation" below) |
 | §VI.A minimum-loss parameter (2-D) | full (`EncodeOptions::with_min_loss(M)` -- per-subband Fig. 18 LSB-plane exclusion, `M` on the wire in every packet header, composes with both segmentation modes + both entropy backends + the byte quota; M=0 byte-identical to the historical stream -- see "Minimum-loss quality goal" below) |
 | §II.C dynamic-range analysis (2-D) | full (Table 3 `Σ\|c_i\|` rationals + eq (8) approximate bound + the **exact Table 4** max-input-dynamic-range values for 8/16/32-bit words after one or two high-pass operations, `wavelet_int::{abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range}`; every cell cross-validated within ±2 of eq (8), the §II.C worked examples pinned, full-range 12-/16-bit checkerboards verified within the published word sizes on the live transform) |
-| Deep-sample (9..=16-bit) grayscale | full (`IcerPixelFormat::GrayDeep { bits }` -- the §II.C MER operating point (12-bit pixels in 16-bit words); a plane-container tag-2 framing carries the depth around a normal segment stream; lossless under all seven filters at every depth, composes with every mode -- see "Deep-sample grayscale" below) |
+| Deep-sample (9..=16-bit) grayscale | full (`IcerPixelFormat::Gray16Le` + `IcerImage::bit_depth` (9..=16) -- the §II.C MER operating point (12-bit pixels in 16-bit words); a plane-container tag-2 framing carries the depth around a normal segment stream; lossless under all seven filters at every depth, composes with every mode -- see "Deep-sample grayscale" below) |
 
 End-to-end round-trips:
 
@@ -367,8 +558,8 @@ either backend; only the per-packet entropy coding differs.
 ```rust
 let opts = EncodeOptions::compressed()
     .with_interleaved_entropy();         // code with the §IV coder
-let bytes = encode_icer(&image, &opts)?;
-let decoded = parse_icer(&bytes)?;       // decoder dispatches on the wire flag
+let bytes = encode(&image, &opts)?;
+let decoded = decode(&bytes)?;       // decoder dispatches on the wire flag
 ```
 
 The backend choice is recorded in a previously-reserved segment-header bit
@@ -464,8 +655,8 @@ exactly as §III describes:
 let opts = EncodeOptions::compressed()
     .with_priority_interleaving()       // §III.A progressive order
     .with_byte_budget(2_000);           // quota cut on a priority boundary
-let bytes = encode_icer(&image, &opts)?;
-let decoded = parse_icer(&bytes)?;      // decoder dispatches on the wire flag
+let bytes = encode(&image, &opts)?;
+let decoded = decode(&bytes)?;      // decoder dispatches on the wire flag
 ```
 
 The mode rides a previously-reserved header bit (byte 2 bit 7 — the
@@ -516,8 +707,8 @@ containing LL pixel `(x >> D, y >> D)` (`coefficient_segment_map`).
 let mut opts = oxideav_icer::EncodeOptions::compressed()
     .with_transform_domain_segments();
 opts.segment_count = 8;                  // §V.D partition of the LL subband
-let bytes = oxideav_icer::encode_icer(&image, &opts)?;
-let decoded = oxideav_icer::parse_icer(&bytes)?;   // recomputes the partition
+let bytes = oxideav_icer::encode(&image, &opts)?;
+let decoded = oxideav_icer::decode(&bytes)?;   // recomputes the partition
 ```
 
 Wire form: one segment per §V.D rectangle, each header carrying the
@@ -635,11 +826,13 @@ min-loss since r383; this is the 2-D §VI.A realisation.
   (The earlier §III.B same-subband-neighbour approximation is **resolved** --
   see "Per-subband context tables" above; the scanner now walks the
   spec-exact same-subband neighbourhood.)
-* **Chroma subsampling**. Colour support (`IcerPixelFormat::Yuv444P`) is
-  implemented for co-sited 4:4:4 (see "Colour images" below). Subsampled
-  layouts (4:2:2 / 4:2:0) and the RGB↔YCbCr colour-transform stage are
-  deferred -- the deployed Mars-rover Bayer/colour pipeline applies the colour
-  transform *before* ICER, which sees three already-decorrelated 4:4:4 planes.
+* **Chroma subsampling**. Colour support (`IcerPixelFormat::Yuv444P` and
+  planar RGB `Gbrp8`) is implemented for co-sited 4:4:4 (see "Colour
+  images" below). Subsampled layouts (4:2:2 / 4:2:0) are deferred -- the
+  deployed Mars-rover Bayer/colour pipeline applies the colour transform
+  *before* ICER, which sees three already-decorrelated 4:4:4 planes; the
+  contract's RGB raw path therefore codes R, G, B as three independent
+  planes rather than inventing a YCbCr transform.
 
 ## Documentation gaps
 
@@ -708,7 +901,7 @@ auto-selected filter is then passed through the existing quota path.
 let opts = EncodeOptions::compressed()
     .with_auto_filter_rd()              // try Q and A, pick smaller
     .with_byte_budget(8192);            // hard cap on output bytes
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 ```
 
 ## Choosing the number of segments (IPN 42-155 §V.C)
@@ -733,7 +926,7 @@ crate's row-strip 2-row minimum, and the MER cap of 32.
 let opts = EncodeOptions::compressed()
     .with_auto_segments(ChannelReliability::Typical)  // §V.C pick
     .with_byte_budget(20_000);                        // feeds the bytes axis
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 ```
 
 Composes with row-strip and §V.B transform-domain segmentation, both
@@ -765,7 +958,7 @@ That freedom is surfaced as two `EncodeOptions` builders:
 
 The on-the-wire byte stream contains every segment in priority order
 *plus* zero-body placeholder headers for any segment the byte budget
-forced the encoder to drop. The decoder (`parse_icer`) already sorts
+forced the encoder to drop. The decoder (`decode`) already sorts
 segments by `segment_index` before stitching, so the priority ordering
 is transparent on decode; dropped segments reconstruct as flat 128
 (level-shifted zero coefficients).
@@ -774,10 +967,10 @@ is transparent on decode; dropped segments reconstruct as flat 128
 let opts = EncodeOptions::compressed()
     .with_byte_budget(220)              // very tight budget
     .with_center_roi();                 // centre-first emission
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 // Decode: dropped strips materialise as flat 128, centre strips
 // keep their fidelity.
-let decoded = parse_icer(&bytes)?;
+let decoded = decode(&bytes)?;
 ```
 
 **Empirical measurement** (128-row image, 4 segments, 900-byte budget
@@ -875,7 +1068,7 @@ score-non-monotonic.
 ```rust
 let opts = EncodeOptions::compressed()
     .with_rd_budget(400);                // hard cap + R-D selection
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 assert!(bytes.len() <= 400);
 ```
 
@@ -893,7 +1086,7 @@ IPN 42-155 §III.E "Image Partitioning" makes each segment a
 self-contained, independently-decodable unit precisely so that the
 receiver can still recover most of the image from whatever survived.
 
-`parse_icer` enforces a contiguous `segment_index` sequence and
+`decode` enforces a contiguous `segment_index` sequence and
 rejects a stream missing any segment with
 `IcerError::invalid("non-contiguous segment indices: ...")`. The lenient
 counterpart:
@@ -917,7 +1110,7 @@ Constraints:
 * Segment 0 must be present (it pins the canonical strip height + the
   canonical width). A missing segment 0 returns `IcerError::Truncated`.
 * The canonical strip height is read from segment 0; non-trailing
-  received segments must agree on that height (matches `encode_icer`'s
+  received segments must agree on that height (matches `encode`'s
   `div_ceil(h, segment_count)` row-strip split, where every strip
   except the last has identical height).
 * Width mismatch among received segments still surfaces as
@@ -928,8 +1121,8 @@ Constraints:
   has no way to detect that a higher-indexed segment was supposed to
   exist (the wire format carries no total-segment-count field).
 
-Composes with `DecodeLimits` (the DoS-cap policy applies
-identically via `parse_icer_lenient_with_limits`) and with every
+Composes with `DecodeOptions` (the DoS-cap policy applies
+identically via `parse_icer_lenient_with`) and with every
 encoder path (filter Q / filter A / uncompressed §III.D).
 
 ## Quality-target rate-control
@@ -941,8 +1134,8 @@ report back the smallest byte count that meets it.
 ```rust
 let opts = EncodeOptions::compressed()
     .with_quality_target(30.0);                 // PSNR floor in dB
-let bytes = encode_icer(&image, &opts)?;
-let decoded = parse_icer(&bytes)?;
+let bytes = encode(&image, &opts)?;
+let decoded = decode(&bytes)?;
 let achieved = oxideav_icer::analyze::psnr_db(&image, &decoded);
 assert!(achieved >= 30.0);
 ```
@@ -987,7 +1180,7 @@ to ICER's value proposition for deep-space imaging:
 
 ### Quota-controlled encoding
 
-`encode_icer(image, &opts)` now supports truncation to a caller-
+`encode(image, &opts)` supports truncation to a caller-
 specified byte budget. ICER's signature feature — **emitting
 progressive packets MSB-down and stopping once the quota is
 exhausted** — is fully implemented. Anything not yet emitted simply
@@ -1012,14 +1205,14 @@ point.
 ```rust
 let opts = EncodeOptions::compressed()
     .with_byte_budget(8192);          // hard cap
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 assert!(bytes.len() <= 8192);
 
 // Soft target + hard cap:
 let opts = EncodeOptions::compressed()
     .with_target_bytes(8192)          // soft target — finish current bit-plane pair
     .with_byte_budget(10_000);        // hard cap — never exceeded
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 assert!(bytes.len() <= 10_000);
 ```
 
@@ -1048,34 +1241,21 @@ the "ICER-3D" section above. The remaining 3-D delta is the same
 interop unknown as the 2-D path: the papers leave the byte-level
 container to the implementation.
 
-## Standalone vs registry build
-
-The default `registry` feature wires up the `oxideav-core`
-`Decoder` / `Encoder` trait surface plus the `register()` entry
-point. Image-library consumers that want to decode ICER without
-pulling in the framework should depend on the crate with
-`default-features = false`:
-
-```toml
-[dependencies]
-oxideav-icer = { version = "0.0", default-features = false }
-```
-
-The standalone API is `parse_icer(bytes) -> Result<IcerImage>`,
-`parse_icer_metadata(bytes) -> Result<IcerMetadata>`, and
-`encode_icer(image, &EncodeOptions) -> Result<Vec<u8>>`. Compressed
-mode is opt-in via `EncodeOptions::compressed()`; multi-segment
-encode is opt-in via `EncodeOptions::segment_count`.
-
 ## Fuzzing
 
-A cargo-fuzz harness under `fuzz/` runs every byte slice through
-three decode-side entry points and asserts none panic / abort /
-OOM:
+A cargo-fuzz harness under `fuzz/` runs every byte slice through the
+contract entry points and the depth decoders and asserts none panic /
+abort / OOM:
 
+* `probe` -- the allocation-free sniff (must accept whatever `info`
+  accepts).
 * `header::walk_segment` -- single-segment framing parse.
-* `parse_icer_metadata` -- multi-segment walk (header-only).
-* `parse_icer` -- full decode (arith coder + inverse DWT + stitch).
+* `info` -- multi-segment walk (header-only).
+* `decode` / `decode_all` -- full decode (arith coder + inverse DWT +
+  stitch; one frame per cube band; `decode_all[0]` must equal `decode`),
+  followed by `to_rgb8` / `to_rgba8` (infallible on decoder output).
+* `parse_icer_lenient_with`, `parse_icer3d_with`,
+  `parse_icer3d_lenient_with` -- the loss-tolerant and cube depth paths.
 
 The seed corpus under `fuzz/corpus/decode_segment/` is generated
 from icer's own encoder: an uncompressed ramp, compressed filter-Q
@@ -1087,8 +1267,9 @@ streams (row-strip and transform-domain), ICER-3D cubes (row-strip
 plus the r414 §V.D transform-domain mode: plain, quota-truncated, and
 interleaved-entropy + min-loss), and deep-sample (tag-2 container)
 streams at 10/12/16 bits covering the compressed, §V.B, §III.D raw,
-quota-truncated, and priority-interleaved deep wire forms (r433). The
-`encode_roundtrip` target also synthesises `GrayDeep` images at
+quota-truncated, and priority-interleaved deep wire forms (r433), and
+planar-RGB (tag-3 `Gbrp8`) containers (r468). The
+`encode_roundtrip` target also synthesises `Gray16Le` images at
 fuzz-chosen depths with deliberately unmasked (out-of-range) sample
 words.
 
@@ -1100,16 +1281,18 @@ cargo +nightly fuzz run decode_segment -- -max_total_time=60
 Local bounded runs on the r454 pipeline (§V.C auto-segments wire
 synthesis + the r454 scan optimisations): `decode_segment` 26596
 iterations / 461 s and `encode_roundtrip` 9226 iterations / 451 s,
-0 findings.
+0 findings. r468 (contract layers + `Gbrp8` seeds): `decode_segment`
+20119 iterations / 151 s and `encode_roundtrip` 3117 iterations /
+151 s, 0 findings.
 (The historical geometry-DoS surface — a 12-byte header requesting
-~4 GB of decode allocation — is closed by the `DecodeLimits` caps
+~4 GB of decode allocation — is closed by the `DecodeOptions` caps
 below.) The r433 campaign additionally surfaced — and the same round
 fixed — a **lenient-decode allocation hole**: the gap-filled
 reconstruction spans the full `0..=max_received_index` strip range, so
 two tiny received strips at a huge `segment_index` gap bought a
 multi-GB placeholder allocation the received-pixel sum never counted.
 `parse_icer_lenient*` now caps the *reconstruction geometry* against
-`DecodeLimits::max_total_pixels`
+`DecodeOptions::max_pixels`
 (`fuzz/corpus/decode_segment/seed_lenient_index_gap_oom.bin` +
 `tests/lenient_decode.rs` pin the refusal).
 
@@ -1129,53 +1312,6 @@ overflowed in debug — the lifting sums now wrap and the level shift
 saturates. Corpus seeds for the new wire modes (`seed_transform_*`,
 `seed_minloss*`) feed both the scheduled fuzz run and the per-push
 corpus smoke.
-
-## Decode-side resource limits
-
-The cargo-fuzz decode harness surfaced a DoS vector inherent
-to the wire format: the 12-byte segment header carries `width` and
-`height` as `u16` each, which means a 12-byte input can declare up
-to `65535 * 65535 ≈ 4.29 GPx` per segment. Without a cap,
-`parse_icer` would dutifully allocate a ~4 GB plane plus
-~16 GB of `i32` coefficient buffers before discovering the body was
-empty.
-
-An application-level geometry cap is available via
-[`DecodeLimits`]:
-
-```rust
-let limits = oxideav_icer::DecodeLimits::default();
-//         max_pixels_per_segment = 64 MPx
-//         max_total_pixels       = 256 MPx
-let img = oxideav_icer::parse_icer_with_limits(bytes, &limits)?;
-
-// Trusted-input batch path — uncapped:
-let img = oxideav_icer::parse_icer_with_limits(
-    bytes,
-    &oxideav_icer::DecodeLimits::unlimited(),
-)?;
-```
-
-The bare-name `parse_icer` / `parse_icer_metadata` entry points
-apply `DecodeLimits::default` automatically — every existing caller
-gets the conservative policy without an API change. Callers who
-need a different policy (oversized HiRISE-style strips, trusted
-batch processing) use the `_with_limits` variants explicitly.
-
-The defaults (64 MPx per segment, 256 MPx total) sit two orders of
-magnitude above every published Mars-rover Pancam / Hazcam / Mastcam-Z
-delivery frame and three orders of magnitude below the 4 GB
-wire-format ceiling, so realistic inputs are unaffected and synthetic
-worst-case inputs are rejected with `IcerError::Unsupported` before
-any plane allocation.
-
-A segment that exceeds the per-segment cap, or a multi-segment image
-whose stitched pixel count exceeds the total cap, returns
-`IcerError::Unsupported` (a deliberate application-policy refusal,
-not a wire-format error). The metadata walker
-(`parse_icer_metadata`) and the full decoder (`parse_icer`) apply
-the same cap, so an attacker cannot bypass the policy by stopping at
-the metadata stage.
 
 ## Per-segment uncompressed fallback
 
@@ -1202,10 +1338,10 @@ This is surfaced as an `EncodeOptions` builder:
 ```rust
 let opts = EncodeOptions::compressed()
     .with_uncompressed_fallback();
-let bytes = encode_icer(&image, &opts)?;
+let bytes = encode(&image, &opts)?;
 // Decoder reads each segment's `uncompressed` flag and reconstructs
 // accordingly -- no caller-side awareness needed.
-let decoded = parse_icer(&bytes)?;
+let decoded = decode(&bytes)?;
 ```
 
 Compose-rules:
@@ -1235,21 +1371,32 @@ and a stacked noise/ramp image (each strip independently decides).
 IPN 42-155 §III describes ICER as fundamentally a **single-component**
 coder; the deployed colour scheme runs one independent ICER instance per
 colour component, sharing only the outer image metadata. This crate models
-that exactly. An `IcerPixelFormat::Yuv444P` image is encoded as **three
-independent single-plane ICER bitstreams** (luma + Cb + Cr, co-sited
-4:4:4), each carrying its own segments / packets / arithmetic-coded bodies,
+that exactly. A three-plane image (`IcerPixelFormat::Yuv444P` — luma +
+Cb + Cr, co-sited 4:4:4 — or `IcerPixelFormat::Gbrp8` — planar G, B, R)
+is encoded as **three independent single-plane ICER bitstreams**, each
+carrying its own segments / packets / arithmetic-coded bodies,
 concatenated behind a small multi-plane container header (the
-`plane_container` module).
+`plane_container` module; tag 1 = `Yuv444P`, tag 3 = `Gbrp8`).
 
 ```rust
-use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat};
 
 let img = IcerImage::zeros(64, 64, IcerPixelFormat::Yuv444P); // 3 planes
-let bytes = encode_icer(&img, &EncodeOptions::compressed())?; // filter Q
-let decoded = parse_icer(&bytes)?;
-assert_eq!(decoded.pixel_format, IcerPixelFormat::Yuv444P);
+let bytes = encode(&img, &EncodeOptions::compressed())?;      // filter Q
+let decoded = decode(&bytes)?;
+assert_eq!(decoded.format, IcerPixelFormat::Yuv444P);
 assert_eq!(decoded.planes.len(), 3);
+# Ok::<(), oxideav_icer::Error>(())
 ```
+
+`Gbrp8` is the natural layout of the contract's RGB raw path
+(`encode_rgb8` / `encode_rgba8` / `IcerImage::from_rgb8`): because every
+component is coded losslessly on its own, `decode_rgb8(encode_rgb8(..))`
+returns the input bytes exactly and no colour matrix is ever applied.
+`Yuv444P` is for callers who bring already-decorrelated luma / chroma
+planes (the deployed pipeline applies the colour transform before ICER);
+`IcerImage::to_rgb8` converts it with the kernel described under
+"Metadata and colour".
 
 **Backward compatibility.** The container is marked by a leading `0x0000`
 16-bit sentinel. A single-plane (Gray8) stream can never begin with
@@ -1260,32 +1407,34 @@ ambiguity, and **every previously-encoded Gray8 stream is byte-for-byte
 unchanged** and decodes exactly as before -- the colour container is only
 emitted for multi-plane images.
 
-The colour path threads through every decode entry point
-(`parse_icer`, `parse_icer_with_limits`, `parse_icer_metadata`,
-`parse_icer_lenient`) and the registry `Encoder` (a 3-plane `Frame::Video`
-selects the colour path; a 1-plane frame stays Gray8). Filter-Q colour
-round-trips are bit-exact across all three planes; the uncompressed §III.D
-colour path is bit-exact too. The `DecodeLimits` DoS caps apply per plane
-*and* to the colour-image total. Chroma subsampling (4:2:2 / 4:2:0) and the
-RGB↔YCbCr colour-transform stage are not implemented (the deployed pipeline
-applies the colour transform before ICER -- this crate sees three
-already-decorrelated 4:4:4 planes).
+The colour path threads through every decode entry point (`decode`,
+`decode_with`, `info`, `parse_icer_lenient`) and the registry `Encoder`
+(`CodecParameters::pixel_format` `Yuv444P` / `Gbrp8`, or a 3-plane frame
+without a declared format, selects the colour path; a 1-plane frame stays
+Gray8). Filter-Q colour round-trips are bit-exact across all three planes;
+the uncompressed §III.D colour path is bit-exact too. The `DecodeOptions`
+caps apply per plane *and* to the colour-image total. Chroma subsampling
+(4:2:2 / 4:2:0) is not implemented.
 
 ## Deep-sample grayscale (IPN 42-155 §II.C)
 
 The paper's own operating point is deep imagery: "On MER, all cameras
 produce 12-bit pixels and each is stored using a 16-bit word" (§II.C),
-and every §VII benchmark image is 12-bit. `IcerPixelFormat::GrayDeep {
-bits }` (9..=16) carries that path end to end:
+and every §VII benchmark image is 12-bit. `IcerPixelFormat::Gray16Le`
+with `IcerImage::bit_depth` in `9..=16` carries that path end to end
+(samples are the exact values, LSB-aligned in little-endian words —
+never left-justified):
 
 ```rust
-use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat};
 
-let mut img = IcerImage::zeros(1024, 1024, IcerPixelFormat::GrayDeep { bits: 12 });
-img.set_sample(0, 3, 7, 4095);                       // LSB-aligned LE u16 words
-let bytes = encode_icer(&img, &EncodeOptions::compressed())?; // lossless, any filter
-let decoded = parse_icer(&bytes)?;
+let mut img = IcerImage::zeros_deep(1024, 1024, 12)?;   // Gray16Le, bit_depth 12
+img.set_sample(0, 3, 7, 4095);                            // LSB-aligned LE u16 words
+let bytes = encode(&img, &EncodeOptions::compressed())?;  // lossless, any filter
+let decoded = decode(&bytes)?;
+assert_eq!((decoded.format, decoded.bit_depth), (IcerPixelFormat::Gray16Le, 12));
 assert_eq!(decoded.sample(0, 3, 7), 4095);
+# Ok::<(), oxideav_icer::Error>(())
 ```
 
 Wire form: the 12-byte segment header has no free field left for a
@@ -1308,16 +1457,17 @@ depth 9..=16), row-strip and §V.B transform-domain segmentation, both
 entropy backends, §III.A priority interleaving, §VI.A min-loss, §VI.B
 byte quotas (the container's 9 framing bytes are charged against the
 budget so the hard cap bounds the total output), ROI priorities, the
-§III.D fallback, lenient decode, `DecodeLimits`, and quality-target
+§III.D fallback, lenient decode, `DecodeOptions`, and quality-target
 rate-control. PSNR / SSIM peaks follow the §VII definition (`2^b - 1`
 for `b`-bit input); `ImageStats` scans deep samples down-shifted to
 the 8-bit domain so the filter-selection thresholds keep their
-calibration. The `registry` conversion maps 10-/12-/16-bit onto the
-matching `oxideav-core` plain-gray deep formats (other depths ride the
-16-bit word LSB-aligned), and the registry encoder selects the deep
-path when `CodecParameters::pixel_format` declares `Gray10Le` /
-`Gray12Le` / `Gray16Le` — without the declaration a 16-bit plane would
-be silently misread as twice-as-wide 8-bit samples.
+calibration. The `registry` conversion labels 10-/12-bit images with
+the matching `oxideav-core` `Gray10Le` / `Gray12Le` rungs and every
+other depth as `Gray16Le` with the frame's significant-bits
+side-channel set, and the registry encoder selects the deep path when
+`CodecParameters::pixel_format` declares `Gray10Le` / `Gray12Le` /
+`Gray16Le` — without the declaration a 16-bit plane would be silently
+misread as twice-as-wide 8-bit samples.
 
 ## ICER-3D (IPN 42-164)
 
@@ -1442,7 +1592,7 @@ transform seams and keeping loss soft-bounded per the profile above.
 loss does occur, any received data for the affected segment that
 precedes the lost portion will allow a lower fidelity reconstruction
 of that segment" (IPN 42-164 §I). `parse_icer3d_lenient` (and its
-`_with_limits` variant) realises that promise for a truncated or
+`_with` variant taking `&DecodeOptions`) realises that promise for a truncated or
 partially corrupt downlink where the strict `parse_icer3d` refuses the
 stream: every complete packet is salvaged in wire order — a cut
 mid-packet keeps the segment's delivered packet prefix (§III.A
@@ -1467,7 +1617,7 @@ the header flags.
 The wire framing (0x0000 + 0xC3 magic, never ambiguous against a 2-D
 single-plane stream or the colour container) is implementation-defined
 -- both papers leave the byte-level container open. Decode applies the
-same `DecodeLimits` caps as the 2-D path (per strip and per cube)
+same `DecodeOptions` caps as the 2-D path (per strip and per cube)
 before any allocation, survives every single-byte corruption and prefix
 truncation of a valid stream (test-pinned), and the `decode_segment`
 fuzz target drives `parse_icer3d` on every input alongside the 2-D

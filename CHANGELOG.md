@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `IMAGE_CRATE_API` contract surface at the crate root: `probe`, `info` /
+  `info_with`, `decode` / `decode_with` / `decode_rgb8` / `decode_rgba8` /
+  `decode_all` / `decode_all_with` / `decode_from`, `encode` /
+  `encode_rgb8` / `encode_rgba8` / `encode_to` / `encode_all`; records
+  `Plane`, `ColorInfo`, `ColorRange`, `Metadata`, `RgbImage`, `RgbaImage`,
+  `ImageInfo` (+ ICER extras `bit_depth`, `kind: StreamKind`, `segments`),
+  `Frame` (+ `index` = cube band), `DecodeOptions` (`max_width`,
+  `max_height`, `max_pixels`, `max_bytes`, `strict`, + ICER extra
+  `max_pixels_per_segment`), `PixelFormat` / `Error` aliases.
+- `IcerPixelFormat::Gbrp8` — planar 8-bit RGB (plane-container tag 3),
+  the lossless natural layout of `encode_rgb8` / `encode_rgba8` /
+  `IcerImage::from_rgb8` / `from_rgba8`; `to_rgb8` re-interleaves exactly.
+- `IcerImage::{new, zeros_deep, from_rgb8, from_rgba8, with_color,
+  with_metadata, with_bit_depth, validate, as_bytes, into_raw, to_rgb8,
+  to_rgba8}`; deep gray tone-scales by round-half-up over `2^bit_depth - 1`,
+  `Yuv444P` converts with a BT.601 (or BT.709 when `color.matrix == 1`)
+  fixed-point kernel honouring `color.range`.
+- `IcerError::{LimitExceeded, Io}` (+ `From<std::io::Error>`); every
+  `DecodeOptions` cap now fails with `LimitExceeded` before allocation
+  (previously `Unsupported`).
+- `EncodeOptions::{new, with_uncompressed, with_sync_prefix, with_filter,
+  with_wavelet_levels, with_bit_plane_count, with_segment_count,
+  with_rd_pruning}`.
+- `IcerCube::{band_image, from_band_images}`; `parse_icer3d_with`,
+  `parse_icer3d_lenient_with`, `parse_icer_lenient_with` taking
+  `&DecodeOptions`.
+- Registry: public `make_decoder` / `make_encoder`, `to_core_pixel_format`
+  / `from_core_pixel_format`, `From<IcerImage> for VideoFrame`,
+  `IcerImage::from_video_frame` + `TryFrom<(&VideoFrame, &CodecParameters)>`;
+  the `Decoder` emits one frame per ICER-3D band and uses `NeedMore` /
+  `Eof`; depths not implied by the core format ride the significant-bits
+  side-channel; `LimitExceeded` maps to `Error::ResourceExhausted`.
+- CI `ci-standalone` job runs the tests and clippy `--no-default-features`;
+  the `decode_segment` fuzz target covers `probe` / `info` / `decode` /
+  `decode_all` / the RGB conversions; `Gbrp8` corpus seeds;
+  `Cargo.toml` `exclude = ["/tests", "/fuzz"]`.
+
+### Changed
+
+- `IcerImage` takes the contract shape — `format` (was `pixel_format`),
+  `planes: Vec<Plane>`, new `color`, `metadata` and `bit_depth` fields,
+  `pts` removed, `#[non_exhaustive]`, `PartialEq` only (no `Eq`).
+- `IcerPixelFormat::GrayDeep { bits }` is now `Gray16Le` with the depth on
+  `IcerImage::bit_depth` (samples unchanged: exact LSB-aligned `u16` LE);
+  the enum is `#[non_exhaustive]`.
+- `IcerError` is `#[non_exhaustive]` and no longer derives `Clone` /
+  `PartialEq` / `Eq` (it carries `std::io::Error`); match on variants.
+- `EncodeOptions` is `#[non_exhaustive]` (struct-update syntax from other
+  crates no longer compiles — use the builders or field assignment).
+- `plane_container::encode_container` takes the bit depth as an argument;
+  `ParsedContainer` gains `bit_depth` and is `#[non_exhaustive]`.
+- `SegmentMetadata` is `#[non_exhaustive]` with a `new` constructor.
+- Framework `Decoder::receive_frame` / `Encoder::receive_packet` return
+  `NeedMore` / `Eof` instead of `InvalidData` when nothing is queued.
+
+### Deprecated
+
+- `parse_icer` → `decode`; `parse_icer_with_limits` → `decode_with`;
+  `parse_icer_metadata` / `parse_icer_metadata_with_limits` → `info`
+  (`ImageInfo::segments` carries the records); `encode_icer` → `encode`;
+  `parse_icer_lenient_with_limits` → `parse_icer_lenient_with`;
+  `parse_icer3d_with_limits` → `parse_icer3d_with`;
+  `parse_icer3d_lenient_with_limits` → `parse_icer3d_lenient_with`;
+  `DecodeLimits` → `DecodeOptions` (`From` conversion provided);
+  `IcerPlane` → `Plane`; `IcerMetadata` → `ImageInfo`. All remain for one
+  release as thin wrappers.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-icer/compare/v0.0.4...v0.0.5) - 2026-08-31
 
 ### Other
