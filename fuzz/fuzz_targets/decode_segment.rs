@@ -2,16 +2,20 @@
 
 //! Decode-side fuzz harness for the ICER framing + entropy parsers.
 //!
-//! Every byte slice is fed through three layers of the decode stack:
+//! Every byte slice is fed through the contract entry points
+//! (`probe` / `info` / `decode` / `decode_all`) and the depth decoders:
 //!
+//! 0. [`oxideav_icer::probe`] — the allocation-free structural sniff.
 //! 1. [`oxideav_icer::walk_segment`] — single-segment framing parse;
 //!    surfaces header + packet boundaries without running the entropy
 //!    stage.
 //! 2. [`oxideav_icer::info`] — multi-segment walk
 //!    returning only header-level metadata for every segment in the
 //!    stream.
-//! 3. [`oxideav_icer::decode`] — full decode (framing + arithmetic
-//!    coder + inverse wavelet + multi-segment stitch).
+//! 3. [`oxideav_icer::decode`] / [`oxideav_icer::decode_all`] — full
+//!    decode (framing + arithmetic coder + inverse wavelet +
+//!    multi-segment stitch; one frame per cube band), followed by the
+//!    `to_rgb8` / `to_rgba8` conversions.
 //!
 //! The contract under test is that every entry point *returns* — a
 //! malformed stream produces `Err(IcerError::…)`, a well-formed one
@@ -42,8 +46,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_icer::{
-    parse_icer3d_with, parse_icer_lenient_with, info,
-    decode_with, walk_segment, DecodeOptions,
+    decode_all_with, decode_with, info, parse_icer3d_with, parse_icer_lenient_with, probe,
+    walk_segment, DecodeOptions,
 };
 
 /// Per-iteration geometry budget. Far below the public 64 MPx default so
@@ -55,6 +59,10 @@ fn fuzz_limits() -> DecodeOptions {
 }
 
 fuzz_target!(|data: &[u8]| {
+    // Layer 0: the contract sniff. Total and allocation-free by
+    // contract; must never panic.
+    let plausible = probe(data);
+
     // Layer 1: pure framing on the first segment. Exercises
     // `SegmentHeader::parse` + `PacketHeader::parse` for every packet
     // in the first segment.
@@ -63,16 +71,29 @@ fuzz_target!(|data: &[u8]| {
     // Layer 2: multi-segment walk under the DEFAULT limits. Header-only
     // (no pixel buffers materialised), so it is cheap at any geometry and
     // keeps coverage of the default-limits geometry-validation refusal
-    // path the public API enforces.
-    let _ = info(data);
+    // path the public API enforces. A stream `info` accepts must have
+    // been accepted by `probe` (the sniff is a superset of the walk).
+    if let Ok(i) = info(data) {
+        assert!(plausible, "info accepted a stream probe rejected");
+        assert!(i.frames >= 1);
+    }
 
     // Layer 3: full decode under the tight per-run geometry budget.
     // Drives the arithmetic coder + inverse wavelet + plane
     // reconstruction + multi-segment stitch. The tight cap keeps each
     // iteration in the millisecond range while still catching
     // attacker-controlled allocation sizing bugs and entropy-stage
-    // panics.
-    let _ = decode_with(data, &fuzz_limits());
+    // panics. The RGB conversions must be infallible on anything the
+    // decoder produced, and `decode_all` must agree with `decode` on the
+    // first image.
+    if let Ok(img) = decode_with(data, &fuzz_limits()) {
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.len(), img.width as usize * img.height as usize * 3);
+        assert_eq!(img.to_rgba8().len(), rgb.len() / 3 * 4);
+        let all = decode_all_with(data, &fuzz_limits()).expect("decode_all follows decode");
+        assert!(!all.is_empty());
+        assert_eq!(all[0].image, img);
+    }
     let _ = parse_icer_lenient_with(data, &fuzz_limits());
 
     // Layer 4: the ICER-3D cube decoder (IPN 42-164) under the same

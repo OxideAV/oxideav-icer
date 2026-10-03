@@ -16,18 +16,25 @@ jobs:
     uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
     secrets: inherit
 
-  # Standalone (no-`registry`) build verification. Image-library
-  # consumers depend on the crate with `default-features = false` to
-  # skip the `oxideav-core` dep tree entirely; this job ensures the
-  # gated paths stay compiling on every change.
-  standalone:
-    name: Build (no registry)
+  # Standalone (no-`registry`) verification per IMAGE_CRATE_API. Image-
+  # library consumers depend on the crate with `default-features = false`
+  # to skip the `oxideav-core` dep tree entirely; this job ensures the
+  # gated paths build, pass their tests and stay clippy-clean on every
+  # change.
+  ci-standalone:
+    name: Standalone (no registry)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: standalone
-      - name: cargo build --lib --no-default-features
-        run: cargo build --lib --no-default-features --verbose
+      - name: cargo build --no-default-features
+        run: cargo build --no-default-features --verbose
+      - name: cargo test --no-default-features
+        run: cargo test --no-default-features -- --test-threads=4
+      - name: cargo clippy --no-default-features
+        run: cargo clippy --all-targets --no-default-features --no-deps -- -D warnings

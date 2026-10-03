@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-icer"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust ICER (JPL wavelet image compressor, Mars rover heritage) — clean-room from Kiely & Klimesh IPN PR 42-155 (2003)"
+# crates.io caps a package at 10 MiB; the fixture suite and the fuzz
+# corpus are repository-only.
+exclude = ["/tests", "/fuzz"]
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-icer"
@@ -17,9 +20,9 @@ categories = ["multimedia::encoding", "multimedia::images"]
 # `oxideav-core` is gated behind the default-on `registry` feature so
 # image-library consumers can depend on `oxideav-icer` with
 # `default-features = false` and avoid the framework dep tree entirely.
-# Without `registry` the crate exposes a free-standing
-# `parse_icer_metadata` / `decode_icer_subbands` / `encode_icer` API
-# plus crate-local `IcerImage` / `IcerError` types using std primitives.
+# Without `registry` the crate exposes the IMAGE_CRATE_API contract
+# (`probe` / `info` / `decode*` / `encode*`) plus crate-local
+# `IcerImage` / `IcerError` types using std primitives.
 oxideav-core = { version = "0.1", optional = true }
 
 [features]

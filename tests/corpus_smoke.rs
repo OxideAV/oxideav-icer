@@ -7,7 +7,8 @@
 //! input fails CI immediately instead of waiting for the cron.
 
 use oxideav_icer::{
-    decode_with, info, parse_icer3d_with, parse_icer_lenient_with, walk_segment, DecodeOptions,
+    decode_all_with, decode_with, info, parse_icer3d_with, parse_icer_lenient_with, probe,
+    walk_segment, DecodeOptions,
 };
 
 /// Same tight per-iteration geometry budget the fuzz target uses.
@@ -27,9 +28,30 @@ fn decode_segment_corpus_is_panic_free() {
             continue;
         }
         let data = std::fs::read(&path).expect("read corpus entry");
+        let plausible = probe(&data);
         let _ = walk_segment(&data);
-        let _ = info(&data);
-        let _ = decode_with(&data, &fuzz_limits());
+        if let Ok(i) = info(&data) {
+            assert!(
+                plausible,
+                "{}: info accepted what probe rejected",
+                path.display()
+            );
+            assert!(i.frames >= 1);
+        }
+        if let Ok(img) = decode_with(&data, &fuzz_limits()) {
+            // The contract conversions are infallible on decoder output
+            // and `decode_all` agrees with `decode` on the first image.
+            assert_eq!(
+                img.to_rgb8().len(),
+                img.width as usize * img.height as usize * 3
+            );
+            assert_eq!(
+                img.to_rgba8().len(),
+                img.width as usize * img.height as usize * 4
+            );
+            let all = decode_all_with(&data, &fuzz_limits()).expect("decode_all follows decode");
+            assert_eq!(all[0].image, img, "{}", path.display());
+        }
         let _ = parse_icer_lenient_with(&data, &fuzz_limits());
         let _ = parse_icer3d_with(&data, &fuzz_limits());
         let _ = oxideav_icer::parse_icer3d_lenient_with(&data, &fuzz_limits());
