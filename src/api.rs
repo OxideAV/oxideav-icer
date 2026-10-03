@@ -1,8 +1,7 @@
 //! The contract entry points (`IMAGE_CRATE_API`): `probe`, `info`,
 //! `decode*`, `encode*`. Thin, documented fronts over the decoder's
-//! [`crate::decoder::decode_image`] / [`crate::decoder::walk_stream`],
-//! the cube pipeline in [`crate::cube`] and the encoder's
-//! [`crate::encoder::encode_image`].
+//! crate-internal `decode_image` / `walk_stream`, the cube pipeline in
+//! [`crate::cube`] and the encoder's crate-internal `encode_image`.
 //!
 //! # The three wire forms
 //!

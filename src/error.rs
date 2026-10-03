@@ -1,7 +1,7 @@
 //! Crate-local error type — std-primitives only so the standalone
 //! (no `registry`) build never depends on `oxideav-core`.
 //!
-//! See [`crate::registry`] for the (optional) `From<IcerError> for
+//! See the `registry` module for the (optional) `From<IcerError> for
 //! oxideav_core::Error` bridge.
 
 use core::fmt;

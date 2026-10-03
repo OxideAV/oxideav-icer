@@ -2,10 +2,10 @@
 //! the contract fronts in [`crate::api`] (`info` / `decode` /
 //! `decode_with`) and the depth APIs kept here:
 //!
-//!   * [`walk_stream`] (crate-internal) -- header-only walk of every
+//!   * `walk_stream` (crate-internal) -- header-only walk of every
 //!     segment, container-aware; what [`crate::info`] reports. Does not
 //!     run pixels through the entropy coder and allocates no plane.
-//!   * [`decode_image`] (crate-internal) -- full pixel decode. Handles
+//!   * `decode_image` (crate-internal) -- full pixel decode. Handles
 //!     single-segment, multi-segment, uncompressed (IPN 42-155 §III.D),
 //!     and compressed (bit-plane scanner + binary arithmetic coder)
 //!     cases, bare or behind the plane container.

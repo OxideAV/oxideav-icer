@@ -58,7 +58,7 @@ impl From<IcerError> for Error {
 /// labelled `Gray10Le` / `Gray12Le` (core's dedicated rungs for the
 /// same LSB-aligned 16-bit words). Every other depth rides the named
 /// format and is described by the frame's significant-bits
-/// side-channel (see [`image_into_video_frame`]).
+/// side-channel (set by the frame bridge, `From<IcerImage> for VideoFrame`).
 pub fn to_core_pixel_format(f: IcerPixelFormat, bit_depth: u8) -> PixelFormat {
     match (f, bit_depth) {
         (IcerPixelFormat::Gray8, _) => PixelFormat::Gray8,

@@ -113,8 +113,8 @@
 //! ## Framework use
 //!
 //! The default `registry` Cargo feature pulls in `oxideav-core` and
-//! exposes [`register`] (`RuntimeContext`), [`register_codecs`] /
-//! [`register_containers`], the [`make_decoder`] / [`make_encoder`]
+//! exposes `register` (`RuntimeContext`), `register_codecs` /
+//! `register_containers`, the `make_decoder` / `make_encoder`
 //! factories, and the frame bridge (`From<IcerImage> for VideoFrame`,
 //! `IcerImage::from_video_frame`). The trait-side `Decoder` / `Encoder`
 //! are thin adapters over the standalone functions.
