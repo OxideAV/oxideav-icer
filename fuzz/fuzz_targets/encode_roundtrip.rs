@@ -2,8 +2,8 @@
 
 //! Encode-side fuzz harness for the ICER encoder + self-roundtrip.
 //!
-//! The decode-side harness [`decode_segment`] hammers `parse_icer` /
-//! `parse_icer_metadata` / `walk_segment` with attacker-controlled
+//! The decode-side harness [`decode_segment`] hammers `decode` /
+//! `info` / `walk_segment` with attacker-controlled
 //! bytes off the wire. That covers everything a malicious downlink
 //! peer might send, but it does **not** exercise the encoder.
 //!
@@ -15,12 +15,12 @@
 //!    count, byte-budget, ROI permutation, R-D pruning flag, automatic
 //!    uncompressed fallback flag and uncompressed-force flag are all
 //!    derived from the fuzz input.
-//! 3. Call [`oxideav_icer::encode_icer`] and assert it returns (never
+//! 3. Call [`oxideav_icer::encode`] and assert it returns (never
 //!    panics, never integer-overflows in debug, never tries to
 //!    allocate based on caller-controlled width/height products that
 //!    overflow `usize`).
 //! 4. On `Ok`, feed the produced bytes through both
-//!    [`oxideav_icer::parse_icer`] and
+//!    [`oxideav_icer::decode`] and
 //!    [`oxideav_icer::parse_icer_lenient`] and confirm those also
 //!    return rather than panicking. When the strict decoder succeeds,
 //!    verify the geometry matches what was encoded.
@@ -33,14 +33,14 @@
 //! via the wire-claimed dimensions path).
 //!
 //! Deep-sample coverage: one fuzz bit flips the image to the
-//! `GrayDeep` (9..=16-bit) format with a fuzz-chosen depth; the pixel
+//! `Gray16Le` (9..=16-bit) format with a fuzz-chosen depth; the pixel
 //! bytes are tiled into the two-byte little-endian sample words
 //! **unmasked**, so out-of-range samples (above `2^bits - 1`) hammer
 //! the level-shift / clamp paths too.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_lenient, EncodeOptions, IcerImage, IcerPixelFormat,
+    encode, decode, parse_icer_lenient, EncodeOptions, IcerImage, IcerPixelFormat,
     WaveletFilter,
 };
 
@@ -123,11 +123,14 @@ fuzz_target!(|data: &[u8]| {
     let deep = (data[2] & 0x10) != 0;
     let deep_bits = 9 + (data[2] >> 5); // 9..=16
     let pixel_format = if deep {
-        IcerPixelFormat::GrayDeep { bits: deep_bits }
+        IcerPixelFormat::Gray16Le
     } else {
         IcerPixelFormat::Gray8
     };
     let mut img = IcerImage::zeros(width, height, pixel_format);
+    if deep {
+        img = img.with_bit_depth(deep_bits).expect("9..=16 is the deep range");
+    }
     if deep {
         // Tile the fuzz bytes across the two-byte sample words,
         // deliberately unmasked: samples above 2^bits - 1 exercise the
@@ -204,33 +207,32 @@ fuzz_target!(|data: &[u8]| {
         None
     };
 
-    let opts = EncodeOptions {
-        sync_prefix: 0xACED,
-        filter,
-        wavelet_levels,
-        bit_plane_count,
-        uncompressed,
-        segment_count,
-        byte_budget,
-        target_bytes,
-        auto_filter,
-        auto_filter_rd,
-        segment_priorities,
-        rd_pruning,
-        auto_uncompressed_fallback,
-        quality_target_psnr: None,
-        interleaved_entropy,
-        transform_segments,
-        min_loss,
-        priority_interleaving,
-        auto_segments,
-    };
+    let mut opts = EncodeOptions::new();
+    opts.sync_prefix = 0xACED;
+    opts.filter = filter;
+    opts.wavelet_levels = wavelet_levels;
+    opts.bit_plane_count = bit_plane_count;
+    opts.uncompressed = uncompressed;
+    opts.segment_count = segment_count;
+    opts.byte_budget = byte_budget;
+    opts.target_bytes = target_bytes;
+    opts.auto_filter = auto_filter;
+    opts.auto_filter_rd = auto_filter_rd;
+    opts.segment_priorities = segment_priorities;
+    opts.rd_pruning = rd_pruning;
+    opts.auto_uncompressed_fallback = auto_uncompressed_fallback;
+    opts.quality_target_psnr = None;
+    opts.interleaved_entropy = interleaved_entropy;
+    opts.transform_segments = transform_segments;
+    opts.min_loss = min_loss;
+    opts.priority_interleaving = priority_interleaving;
+    opts.auto_segments = auto_segments;
 
     // ---- Encode ------------------------------------------------------
     // The contract: encode returns either Ok(bytes) or Err(IcerError).
     // It must not panic, must not integer-overflow in debug, must not
     // allocate beyond what `width * height * planes` justifies.
-    let encoded = match encode_icer(&img, &opts) {
+    let encoded = match encode(&img, &opts) {
         Ok(b) => b,
         Err(_) => return,
     };
@@ -274,7 +276,7 @@ fuzz_target!(|data: &[u8]| {
     // ---- Decode (strict) --------------------------------------------
     // The encoder's output should always be parseable by the strict
     // decoder. Geometry must match.
-    let decoded = parse_icer(&encoded).expect("strict decode of self-encoded stream failed");
+    let decoded = decode(&encoded).expect("strict decode of self-encoded stream failed");
     assert_eq!(
         decoded.width, width,
         "strict-decode width mismatch (encoded {width}, decoded {})",
@@ -286,8 +288,9 @@ fuzz_target!(|data: &[u8]| {
         decoded.height
     );
     assert_eq!(
-        decoded.pixel_format, pixel_format,
-        "strict-decode pixel format flipped"
+        (decoded.format, decoded.bit_depth),
+        (pixel_format, img.bit_depth),
+        "strict-decode pixel format / depth flipped"
     );
 
     // ---- Decode (lenient) -------------------------------------------

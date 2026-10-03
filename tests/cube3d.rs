@@ -7,8 +7,8 @@
 //! the decoder must survive arbitrary corruption of a valid stream.
 
 use oxideav_icer::{
-    encode_icer, encode_icer3d, parse_icer3d, CubeEncodeOptions, EncodeOptions, IcerCube,
-    IcerImage, IcerPixelFormat,
+    encode, encode_icer3d, parse_icer3d, CubeEncodeOptions, EncodeOptions, IcerCube, IcerImage,
+    IcerPixelFormat,
 };
 
 /// A synthetic scene with strong inter-band correlation: every band is
@@ -90,11 +90,12 @@ fn cube_coding_beats_per_band_2d_lossless() {
         }
         // 2-D lossless: compressed path, filter Q (the reversible
         // default), same 3-level decomposition depth.
-        let opts = EncodeOptions {
-            wavelet_levels: 3,
-            ..EncodeOptions::compressed()
+        let opts = {
+            let mut o = EncodeOptions::compressed();
+            o.wavelet_levels = 3;
+            o
         };
-        band_sum += encode_icer(&img, &opts).unwrap().len();
+        band_sum += encode(&img, &opts).unwrap().len();
     }
 
     assert!(

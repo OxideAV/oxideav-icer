@@ -1,111 +1,49 @@
-//! High-level decoder entry points.
+//! High-level 2-D decoder entry points — the one implementation behind
+//! the contract fronts in [`crate::api`] (`info` / `decode` /
+//! `decode_with`) and the depth APIs kept here:
 //!
-//! Round-3 surface:
-//!
-//!   * [`parse_icer_metadata`] -- parse the framing of every segment
-//!     in the input, returning per-segment header info + packet byte
-//!     ranges. Does not run pixels through the entropy coder.
-//!   * [`parse_icer`] -- full pixel decode. Handles single-segment,
-//!     multi-segment, uncompressed (IPN 42-155 §III.D), and compressed
-//!     (bit-plane scanner + binary arithmetic coder) cases.
+//!   * [`walk_stream`] (crate-internal) -- header-only walk of every
+//!     segment, container-aware; what [`crate::info`] reports. Does not
+//!     run pixels through the entropy coder and allocates no plane.
+//!   * [`decode_image`] (crate-internal) -- full pixel decode. Handles
+//!     single-segment, multi-segment, uncompressed (IPN 42-155 §III.D),
+//!     and compressed (bit-plane scanner + binary arithmetic coder)
+//!     cases, bare or behind the plane container.
+//!   * [`parse_icer_lenient`] / [`parse_icer_lenient_with`] -- the
+//!     loss-tolerant decode with a presence report ([`LenientDecode`]).
 //!   * [`decode_uncompressed_icer`] -- explicit entry point for the
 //!     uncompressed-only fallback.
+//!   * the pre-contract names ([`parse_icer`], [`parse_icer_with_limits`],
+//!     [`parse_icer_metadata`], [`parse_icer_metadata_with_limits`],
+//!     [`parse_icer_lenient_with_limits`]) stay for one release as
+//!     deprecated wrappers.
 //!
-//! Multi-packet support: the compressed-segment decoder now processes
-//! each packet independently per bit-plane (significance + refinement
-//! per IPN 42-155 §IV). Packets can arrive truncated or out of order;
+//! Multi-packet support: the compressed-segment decoder processes each
+//! packet independently per bit-plane (significance + refinement per
+//! IPN 42-155 §IV). Packets can arrive truncated or out of order;
 //! missing packets simply skip the corresponding bit-planes.
 //!
-//! ## Decode-side resource limits (round 174)
+//! ## Decode-side resource limits
 //!
 //! The wire format admits arbitrary `(width, height)` pairs in the
 //! 12-byte segment header (`u16 * u16`), which means a single tiny
 //! header can request up to ~4 GB of decoder allocation per plane —
-//! a DoS surface previously flagged by the cargo-fuzz harness. The
-//! [`DecodeLimits`] struct caps the per-segment and per-image pixel
-//! counts the decoder will agree to materialise. [`parse_icer`] and
-//! [`parse_icer_metadata`] apply [`DecodeLimits::default`] (64 MPx
-//! per segment, 256 MPx per image — well above the 1024x1024 / 2048
-//! x2048 Mars-rover Pancam / Hazcam fixtures and three orders of
-//! magnitude below the 4 GB wire-format ceiling). Callers that need
-//! to override the policy use [`parse_icer_with_limits`] /
-//! [`parse_icer_metadata_with_limits`].
+//! a DoS surface flagged by the cargo-fuzz harness. [`DecodeOptions`]
+//! caps the per-segment and per-image pixel counts and the decoded
+//! bytes the decoder will agree to materialise; every cap is checked
+//! on the framing before any plane or coefficient buffer exists and
+//! before any inverse DWT runs, failing with
+//! [`IcerError::LimitExceeded`].
 
 use crate::bitplane::{EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
-use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
+use crate::image::StreamKind;
+use crate::image::{IcerImage, IcerPixelFormat, Plane};
+#[allow(deprecated)]
+use crate::options::DecodeLimits;
+use crate::options::DecodeOptions;
 use crate::wavelet_int;
-
-/// Per-decode resource caps.
-///
-/// The wire format's 16-bit width / 16-bit height fields admit values
-/// up to `65535 * 65535 ≈ 4.29 GPx` per segment. Honouring that
-/// literally is a DoS surface — a 12-byte segment header could request
-/// a ~4 GB plane allocation plus the matching `i32` coefficient buffer
-/// (~16 GB). [`DecodeLimits`] is the application-supplied policy that
-/// bounds what the decoder will agree to materialise.
-///
-/// All caps are in **pixels**, not bytes. A Gray8 plane is one byte
-/// per pixel; the inverse-DWT coefficient buffer is four bytes
-/// (`i32`) per pixel; so a 64-MPx cap bounds peak allocation per
-/// segment to roughly `64 MB plane + 256 MB coefficients`.
-///
-/// The defaults are deliberately conservative-but-realistic for
-/// every published Mars-rover ICER deployment:
-///
-///   * Pancam delivery frames are 1024x1024 = 1 MPx.
-///   * Hazcam frames are 1024x1024 = 1 MPx.
-///   * Mastcam-Z (Mars 2020) frames are 1648x1200 ≈ 2 MPx.
-///   * HiRISE strips (the largest deep-space-imager target) cap out
-///     around 20k x 20k = 400 MPx, but those run through ICER-3D
-///     hyperspectral, not the 2-D path this crate covers.
-///
-/// 64 MPx per segment is two orders of magnitude above the actual
-/// rover Pancam / Hazcam frames; 256 MPx total bounds a worst-case
-/// multi-segment image at ~1 GB peak allocation. Callers with
-/// validated trusted inputs can lift the cap via
-/// [`DecodeLimits::unlimited`] or by constructing an explicit
-/// [`DecodeLimits`] with the desired values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DecodeLimits {
-    /// Maximum `width * height` (in pixels) any single segment is
-    /// allowed to request. A segment whose header asks for more
-    /// returns [`IcerError::Unsupported`] from the parse / decode
-    /// entry points (we treat oversized geometry as an
-    /// application-policy refusal, not a wire-format violation).
-    pub max_pixels_per_segment: u64,
-    /// Maximum total `width * height` (in pixels) the stitched
-    /// multi-segment image is allowed to request. Sum-of-segment-
-    /// pixel-counts checked before any plane allocation.
-    pub max_total_pixels: u64,
-}
-
-impl DecodeLimits {
-    /// Application-defined default: 64 MPx per segment, 256 MPx total.
-    /// See the type-level rationale for why these values were chosen.
-    pub const DEFAULT_MAX_PIXELS_PER_SEGMENT: u64 = 64 * 1024 * 1024;
-    pub const DEFAULT_MAX_TOTAL_PIXELS: u64 = 256 * 1024 * 1024;
-
-    /// No-cap policy. Use only when the input is trusted (e.g. produced
-    /// by this crate's own encoder in a controlled batch run). Equivalent
-    /// to round-131 behaviour — fuzz inputs can drive ~4 GB / plane.
-    pub const fn unlimited() -> Self {
-        Self {
-            max_pixels_per_segment: u64::MAX,
-            max_total_pixels: u64::MAX,
-        }
-    }
-}
-
-impl Default for DecodeLimits {
-    fn default() -> Self {
-        Self {
-            max_pixels_per_segment: Self::DEFAULT_MAX_PIXELS_PER_SEGMENT,
-            max_total_pixels: Self::DEFAULT_MAX_TOTAL_PIXELS,
-        }
-    }
-}
 
 /// Pixel-count of a segment, computed in `u64` to side-step any
 /// `usize * usize` overflow risk on 32-bit targets. Always finite for
@@ -115,28 +53,24 @@ fn segment_pixels(header: &SegmentHeader) -> u64 {
     header.width as u64 * header.height as u64
 }
 
-fn check_segment_pixels(header: &SegmentHeader, limits: &DecodeLimits) -> Result<()> {
-    let px = segment_pixels(header);
-    if px > limits.max_pixels_per_segment {
-        return Err(IcerError::Unsupported(format!(
-            "segment {} geometry {}x{} = {} pixels exceeds per-segment cap of {} pixels \
-             (see DecodeLimits::max_pixels_per_segment)",
-            header.segment_index, header.width, header.height, px, limits.max_pixels_per_segment
-        )));
-    }
-    Ok(())
-}
-
 /// The single-plane in-memory format for a given sample depth: the
 /// historical [`IcerPixelFormat::Gray8`] at depth 8, the deep-gray
 /// format above (depth is carried by the plane-container framing — the
 /// 12-byte segment header has no depth field).
 fn gray_format(depth: u8) -> IcerPixelFormat {
     if depth > 8 {
-        IcerPixelFormat::GrayDeep { bits: depth }
+        IcerPixelFormat::Gray16Le
     } else {
         IcerPixelFormat::Gray8
     }
+}
+
+/// A zero-filled single-plane gray image of the given depth
+/// (`Gray8` at depth 8, `Gray16Le` with `bit_depth = depth` deeper).
+fn zeros_gray(width: u32, height: u32, depth: u8) -> IcerImage {
+    let mut img = IcerImage::zeros(width, height, gray_format(depth));
+    img.bit_depth = depth;
+    img
 }
 
 /// Bytes per stored sample for a given depth (1, or 2 little-endian).
@@ -161,7 +95,7 @@ fn store_px(row: &mut [u8], x: usize, sb: usize, v: i32) {
 /// Fill rows `y_offset..y_offset + rows` of `plane` with the §III.A
 /// level-shift midpoint `2^(depth-1)` (the placeholder / missing-strip
 /// reconstruction value; 128 on the historical 8-bit path).
-fn fill_mid_rows(plane: &mut IcerPlane, y_offset: usize, rows: usize, width: usize, depth: u8) {
+fn fill_mid_rows(plane: &mut Plane, y_offset: usize, rows: usize, width: usize, depth: u8) {
     let sb = sample_bytes(depth);
     let mid = 1i32 << (depth - 1);
     for y in 0..rows {
@@ -176,9 +110,12 @@ fn fill_mid_rows(plane: &mut IcerPlane, y_offset: usize, rows: usize, width: usi
     }
 }
 
-/// Per-segment metadata returned by [`parse_icer_metadata`].
+/// Per-segment framing record — one per 2-D segment, as reported by
+/// [`crate::ImageInfo::segments`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SegmentMetadata {
+    /// The parsed 12-byte segment header.
     pub header: SegmentHeader,
     /// Number of packets the segment contains.
     pub packet_count: usize,
@@ -189,66 +126,80 @@ pub struct SegmentMetadata {
     pub byte_length: usize,
 }
 
-/// Whole-stream metadata report.
+impl SegmentMetadata {
+    /// Assemble a record.
+    pub fn new(
+        header: SegmentHeader,
+        packet_count: usize,
+        offset: usize,
+        byte_length: usize,
+    ) -> Self {
+        Self {
+            header,
+            packet_count,
+            offset,
+            byte_length,
+        }
+    }
+}
+
+/// Whole-stream metadata report of the deprecated
+/// [`parse_icer_metadata`]; the same records are
+/// [`crate::ImageInfo::segments`].
+#[deprecated(note = "use oxideav_icer::info(..).segments (IMAGE_CRATE_API)")]
 #[derive(Debug, Clone)]
 pub struct IcerMetadata {
+    /// Every segment in stream order (plane by plane for a container).
     pub segments: Vec<SegmentMetadata>,
 }
 
-/// Walk every segment in `bytes` and return per-segment metadata.
-/// Does not allocate or produce any decoded pixels.
-///
-/// Applies [`DecodeLimits::default`] for geometry validation. Use
-/// [`parse_icer_metadata_with_limits`] for explicit control.
-pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
-    parse_icer_metadata_with_limits(bytes, &DecodeLimits::default())
+/// Header-only description of a 2-D stream (bare segments or the
+/// plane container): the native layout, the stitched geometry and the
+/// per-segment records. Produced by [`walk_stream`] without decoding a
+/// pixel or allocating a plane.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamLayout {
+    pub format: IcerPixelFormat,
+    pub bit_depth: u8,
+    pub width: u32,
+    pub height: u32,
+    pub kind: StreamKind,
+    pub segments: Vec<SegmentMetadata>,
 }
 
-/// Walk every segment in `bytes` and return per-segment metadata,
-/// rejecting any segment whose geometry exceeds `limits`. Header-only
-/// walk — no plane allocation.
-pub fn parse_icer_metadata_with_limits(
+/// Header-only walk of one single-plane segment stream: every segment's
+/// framing record, the canonical width, the stitched height (sum of
+/// the row strips; the declared image for §V.B transform-domain
+/// streams) and the image pixel count — each segment and the running
+/// total checked against `opts` as they are met.
+fn walk_single_plane(
     bytes: &[u8],
-    limits: &DecodeLimits,
-) -> Result<IcerMetadata> {
-    // Colour container: walk each plane substream and concatenate the
-    // per-plane segment metadata. Segment `offset` values are rebased to
-    // the original container buffer so callers see absolute positions.
-    if crate::plane_container::is_container(bytes) {
-        let parsed = crate::plane_container::parse_container(bytes)?;
-        let mut segments = Vec::new();
-        let mut total_pixels: u64 = 0;
-        for i in 0..parsed.format.plane_count() {
-            let (base, _end) = parsed.plane_ranges[i];
-            let sub = parsed.plane_bytes(bytes, i);
-            let sub_meta = parse_icer_metadata_with_limits(sub, limits)?;
-            for s in &sub_meta.segments {
-                total_pixels = total_pixels
-                    .checked_add(segment_pixels(&s.header))
-                    .ok_or_else(|| IcerError::invalid("colour pixel-count overflow"))?;
-                if total_pixels > limits.max_total_pixels {
-                    return Err(IcerError::Unsupported(format!(
-                        "colour image pixel-count {} exceeds total cap of {} pixels \
-                         (see DecodeLimits::max_total_pixels)",
-                        total_pixels, limits.max_total_pixels
-                    )));
-                }
-            }
-            for mut s in sub_meta.segments {
-                s.offset += base;
-                segments.push(s);
-            }
-        }
-        return Ok(IcerMetadata { segments });
+    opts: &DecodeOptions,
+) -> Result<(u32, u32, u64, Vec<SegmentMetadata>)> {
+    if bytes.is_empty() {
+        return Err(IcerError::Truncated);
     }
-
     let mut segments = Vec::new();
     let mut total_pixels: u64 = 0;
     let mut cursor = 0;
     let mut transform_counted = false;
+    let mut width: u32 = 0;
+    let mut height: u64 = 0;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
-        check_segment_pixels(&walked.header, limits)?;
+        opts.check_segment(
+            walked.header.segment_index,
+            walked.header.width as u32,
+            walked.header.height as u32,
+        )?;
+        if segments.is_empty() {
+            width = walked.header.width as u32;
+        } else if walked.header.width as u32 != width {
+            return Err(IcerError::Unsupported(format!(
+                "multi-segment width mismatch: segment {} is {}, expected {}",
+                walked.header.segment_index, walked.header.width, width
+            )));
+        }
         // §V.B transform-domain segments all declare the full image
         // dimensions; count the image once against the total cap.
         let count_pixels = if walked.header.transform_segmented {
@@ -262,76 +213,172 @@ pub fn parse_icer_metadata_with_limits(
             total_pixels = total_pixels
                 .checked_add(segment_pixels(&walked.header))
                 .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
+            height += walked.header.height as u64;
         }
-        if total_pixels > limits.max_total_pixels {
-            return Err(IcerError::Unsupported(format!(
-                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
-                 (see DecodeLimits::max_total_pixels)",
-                total_pixels, limits.max_total_pixels
-            )));
-        }
+        opts.check_total_pixels(total_pixels, "multi-segment image")?;
         let byte_length = walked.consumed;
-        segments.push(SegmentMetadata {
-            header: walked.header,
-            packet_count: walked.packets.len(),
-            offset: cursor,
+        segments.push(SegmentMetadata::new(
+            walked.header,
+            walked.packets.len(),
+            cursor,
             byte_length,
-        });
+        ));
         cursor += byte_length;
     }
-    Ok(IcerMetadata { segments })
+    if segments.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+    let height =
+        u32::try_from(height).map_err(|_| IcerError::invalid("multi-segment height overflow"))?;
+    opts.check_width_height(width, height)?;
+    Ok((width, height, total_pixels, segments))
 }
 
-/// Decode the full ICER bytestream into an image.
+/// Walk the framing of a whole 2-D stream — bare segments or the plane
+/// container — applying every [`DecodeOptions`] cap (per segment,
+/// total pixels, decoded bytes, width / height) exactly as the decode
+/// path does, but without allocating a plane. Cube streams are not
+/// handled here (see [`crate::cube`]).
+pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLayout> {
+    if bytes.is_empty() {
+        return Err(IcerError::Truncated);
+    }
+    if crate::plane_container::is_container(bytes) {
+        // Colour / deep container: walk each plane substream and
+        // concatenate the per-plane segment records. Segment `offset`
+        // values are rebased to the original container buffer so
+        // callers see absolute positions.
+        let parsed = crate::plane_container::parse_container(bytes)?;
+        let mut segments = Vec::new();
+        let mut total_pixels: u64 = 0;
+        let mut geometry: Option<(u32, u32)> = None;
+        for i in 0..parsed.format.plane_count() {
+            let (base, _end) = parsed.plane_ranges[i];
+            let sub = parsed.plane_bytes(bytes, i);
+            let (w, h, px, sub_segments) = walk_single_plane(sub, opts)?;
+            match geometry {
+                None => geometry = Some((w, h)),
+                Some((w0, h0)) if (w0, h0) != (w, h) => {
+                    return Err(IcerError::Unsupported(format!(
+                        "colour plane {i} geometry {w}x{h} disagrees with plane 0 {w0}x{h0}"
+                    )))
+                }
+                _ => {}
+            }
+            total_pixels = total_pixels
+                .checked_add(px)
+                .ok_or_else(|| IcerError::invalid("colour pixel-count overflow"))?;
+            opts.check_total_pixels(total_pixels, "colour image")?;
+            for mut s in sub_segments {
+                s.offset += base;
+                segments.push(s);
+            }
+        }
+        let (width, height) = geometry.ok_or(IcerError::Truncated)?;
+        opts.check_bytes(total_pixels * parsed.format.sample_bytes() as u64)?;
+        return Ok(StreamLayout {
+            format: parsed.format,
+            bit_depth: parsed.bit_depth,
+            width,
+            height,
+            kind: StreamKind::PlaneContainer,
+            segments,
+        });
+    }
+    let (width, height, total_pixels, segments) = walk_single_plane(bytes, opts)?;
+    opts.check_bytes(total_pixels)?;
+    Ok(StreamLayout {
+        format: IcerPixelFormat::Gray8,
+        bit_depth: 8,
+        width,
+        height,
+        kind: StreamKind::Segments,
+        segments,
+    })
+}
+
+/// Walk every segment in `bytes` and return per-segment metadata under
+/// the default caps. Superseded by [`crate::info`], whose
+/// `segments` field carries the same records.
+#[deprecated(note = "use oxideav_icer::info (IMAGE_CRATE_API)")]
+#[allow(deprecated)]
+pub fn parse_icer_metadata(bytes: &[u8]) -> Result<IcerMetadata> {
+    Ok(IcerMetadata {
+        segments: walk_stream(bytes, &DecodeOptions::default())?.segments,
+    })
+}
+
+/// [`parse_icer_metadata`] under an explicit cap policy. Superseded by
+/// [`crate::info`] (whose limits are [`DecodeOptions::default`]) and
+/// the `_with` depth decoders.
+#[deprecated(note = "use oxideav_icer::info (IMAGE_CRATE_API)")]
+#[allow(deprecated)]
+pub fn parse_icer_metadata_with_limits(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<IcerMetadata> {
+    Ok(IcerMetadata {
+        segments: walk_stream(bytes, &DecodeOptions::from(limits))?.segments,
+    })
+}
+
+/// Decode the full 2-D ICER bytestream into an image under the default
+/// caps. Superseded by [`crate::decode`].
+#[deprecated(note = "use oxideav_icer::decode (IMAGE_CRATE_API)")]
+pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
+    decode_image(bytes, &DecodeOptions::default())
+}
+
+/// [`parse_icer`] under an explicit cap policy. Superseded by
+/// [`crate::decode_with`].
+#[deprecated(note = "use oxideav_icer::decode_with (IMAGE_CRATE_API)")]
+#[allow(deprecated)]
+pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+    decode_image(bytes, &DecodeOptions::from(limits))
+}
+
+/// Decode a 2-D ICER bytestream (bare segments or the plane container)
+/// into an image, rejecting any segment / total geometry that exceeds
+/// `opts` before allocating the plane or wavelet coefficient buffers.
 ///
 /// Multi-segment inputs are demuxed by stitching each segment's
 /// reconstructed strip (`segment_index` ascending) vertically. The
 /// per-segment width must agree with every other segment (no
-/// arbitrary tiling).
-///
-/// Applies [`DecodeLimits::default`] for geometry validation before
-/// any plane / coefficient allocation. Use [`parse_icer_with_limits`]
-/// for explicit control.
-pub fn parse_icer(bytes: &[u8]) -> Result<IcerImage> {
-    parse_icer_with_limits(bytes, &DecodeLimits::default())
-}
-
-/// Decode the full ICER bytestream into an image, rejecting any
-/// segment / total geometry that exceeds `limits` before allocating
-/// the plane or wavelet coefficient buffers.
-///
-/// This is the constructor [`parse_icer`] delegates into. Pass
-/// [`DecodeLimits::unlimited`] to recover the pre-round-174 behaviour
-/// (trusted-input batch processing).
-pub fn parse_icer_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+/// arbitrary tiling). The one implementation behind [`crate::decode`]
+/// / [`crate::decode_with`] and the framework `Decoder`.
+pub(crate) fn decode_image(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
 
-    // Colour images are framed as a multi-plane container (leading
-    // 0x0000 sentinel — see `crate::plane_container`). A single-plane
-    // Gray8 stream never starts with 0x0000, so the dispatch is
-    // unambiguous and every historical Gray8 stream falls through to the
-    // single-plane path below byte-for-byte unchanged.
+    // Colour / deep images are framed as a multi-plane container
+    // (leading 0x0000 sentinel — see `crate::plane_container`). A
+    // single-plane Gray8 stream never starts with 0x0000, so the
+    // dispatch is unambiguous and every historical Gray8 stream falls
+    // through to the single-plane path below byte-for-byte unchanged.
     if crate::plane_container::is_container(bytes) {
-        return parse_icer_multi_plane(bytes, limits);
+        return parse_icer_multi_plane(bytes, opts);
     }
 
-    parse_icer_single_plane(bytes, limits, 8)
+    parse_icer_single_plane(bytes, opts, 8)
 }
 
 /// Decode a multi-plane (colour) container: each plane substream is a full
 /// single-plane ICER bitstream, decoded independently and re-assembled
 /// into the declared [`IcerPixelFormat`].
-fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerImage> {
+fn parse_icer_multi_plane(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerImage> {
+    // Header-only pre-walk: the whole-image caps (total pixels across
+    // planes, decoded bytes) are enforced here, before the first
+    // plane's coefficient buffer exists.
+    walk_stream(bytes, opts)?;
     let parsed = crate::plane_container::parse_container(bytes)?;
     let n = parsed.format.plane_count();
-    let depth = parsed.format.bit_depth();
+    let depth = parsed.bit_depth;
 
     let mut plane_images: Vec<IcerImage> = Vec::with_capacity(n);
     for i in 0..n {
         let sub = parsed.plane_bytes(bytes, i);
-        plane_images.push(parse_icer_single_plane(sub, limits, depth)?);
+        plane_images.push(parse_icer_single_plane(sub, opts, depth)?);
     }
 
     // Every plane must agree on geometry — the container's planes are
@@ -348,6 +395,7 @@ fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIma
     }
 
     let mut out = IcerImage::zeros(w, h, parsed.format);
+    out.bit_depth = parsed.bit_depth;
     for (i, p) in plane_images.into_iter().enumerate() {
         // Each decoded plane image is Gray8 with a single plane; move it
         // into slot `i` of the colour image.
@@ -363,8 +411,8 @@ fn parse_icer_multi_plane(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerIma
 /// Decode a single-plane ICER bitstream at the given sample depth (8
 /// for a bare historical Gray8 stream; deeper when dispatched from the
 /// deep-gray plane container, which owns the depth field). This is the
-/// historical `parse_icer_with_limits` body.
-fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits, depth: u8) -> Result<IcerImage> {
+/// historical `parse_icer` body.
+fn parse_icer_single_plane(bytes: &[u8], opts: &DecodeOptions, depth: u8) -> Result<IcerImage> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -377,7 +425,11 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits, depth: u8) -> Re
     let mut transform_counted = false;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
-        check_segment_pixels(&walked.header, limits)?;
+        opts.check_segment(
+            walked.header.segment_index,
+            walked.header.width as u32,
+            walked.header.height as u32,
+        )?;
         // §V.B transform-domain segments each declare the FULL image
         // dimensions, so the image's pixel count enters the total cap
         // once, not once per segment.
@@ -393,13 +445,7 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits, depth: u8) -> Re
                 .checked_add(segment_pixels(&walked.header))
                 .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
         }
-        if total_pixels > limits.max_total_pixels {
-            return Err(IcerError::Unsupported(format!(
-                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
-                 (see DecodeLimits::max_total_pixels)",
-                total_pixels, limits.max_total_pixels
-            )));
-        }
+        opts.check_total_pixels(total_pixels, "multi-segment image")?;
         cursor += walked.consumed;
         walked_all.push(walked);
     }
@@ -440,11 +486,9 @@ fn parse_icer_single_plane(bytes: &[u8], limits: &DecodeLimits, depth: u8) -> Re
         return Err(IcerError::invalid("multi-segment height overflow"));
     }
 
-    let mut img = IcerImage::zeros(
-        canonical_width as u32,
-        total_height as u32,
-        gray_format(depth),
-    );
+    opts.check_width_height(canonical_width as u32, total_height as u32)?;
+    opts.check_bytes(total_pixels * sample_bytes(depth) as u64)?;
+    let mut img = zeros_gray(canonical_width as u32, total_height as u32, depth);
     let mut y_cursor = 0usize;
     for walked in &walked_all {
         let strip_h = walked.header.height as usize;
@@ -617,7 +661,7 @@ fn decode_transform_domain(
     // One shared inverse transform (§V.B: "the inverse wavelet
     // transform combines data from adjacent segments").
     crate::wavelet_int::inverse_2d_dyadic(&mut coeffs, w, h, levels, first.filter);
-    let mut img = IcerImage::zeros(w as u32, h as u32, gray_format(depth));
+    let mut img = zeros_gray(w as u32, h as u32, depth);
     let plane = &mut img.planes[0];
     let sb = sample_bytes(depth);
     let mid = 1i32 << (depth - 1);
@@ -634,7 +678,7 @@ fn decode_transform_domain(
 
 fn decode_segment_into(
     walked: &WalkedSegment<'_>,
-    plane: &mut IcerPlane,
+    plane: &mut Plane,
     y_offset: usize,
     canonical_width: usize,
     depth: u8,
@@ -677,7 +721,7 @@ fn decode_segment_into(
 
 fn decode_compressed_segment_into(
     walked: &WalkedSegment<'_>,
-    plane: &mut IcerPlane,
+    plane: &mut Plane,
     y_offset: usize,
     width: usize,
     height: usize,
@@ -820,27 +864,35 @@ pub struct LenientDecode {
 ///     up; the missing trailing-strip-shorter-than-strip_h case isn't
 ///     recoverable without out-of-band geometry coordination.
 ///
-/// Applies [`DecodeLimits::default`] for geometry validation. Use
-/// [`parse_icer_lenient_with_limits`] for explicit control.
+/// Applies [`DecodeOptions::default`] for geometry validation. Use
+/// [`parse_icer_lenient_with`] for explicit control.
 ///
 /// On a bytestream with **no** missing segments, the returned image
 /// is bit-identical to what [`parse_icer`] would return and
 /// `missing_count == 0`.
 pub fn parse_icer_lenient(bytes: &[u8]) -> Result<LenientDecode> {
-    parse_icer_lenient_with_limits(bytes, &DecodeLimits::default())
+    parse_icer_lenient_with(bytes, &DecodeOptions::default())
 }
 
-/// [`parse_icer_lenient`] with an explicit [`DecodeLimits`] policy.
+/// [`parse_icer_lenient`] with an explicit pre-contract
+/// [`DecodeLimits`] policy. Superseded by [`parse_icer_lenient_with`].
+#[deprecated(note = "use oxideav_icer::parse_icer_lenient_with(bytes, &DecodeOptions)")]
+#[allow(deprecated)]
+pub fn parse_icer_lenient_with_limits(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<LenientDecode> {
+    parse_icer_lenient_with(bytes, &DecodeOptions::from(limits))
+}
+
+/// [`parse_icer_lenient`] with an explicit [`DecodeOptions`] policy.
 ///
 /// For colour images, each plane substream is decoded leniently and
 /// re-assembled; the returned `received` / `missing_count` reflect the
 /// **luma** plane (plane 0), which is the canonical presence map for the
 /// colour image (the chroma planes are encoded with identical segment
 /// geometry, so their presence maps coincide on any well-formed stream).
-pub fn parse_icer_lenient_with_limits(
-    bytes: &[u8],
-    limits: &DecodeLimits,
-) -> Result<LenientDecode> {
+pub fn parse_icer_lenient_with(bytes: &[u8], opts: &DecodeOptions) -> Result<LenientDecode> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -851,11 +903,11 @@ pub fn parse_icer_lenient_with_limits(
     if crate::plane_container::is_container(bytes) {
         let parsed = crate::plane_container::parse_container(bytes)?;
         let n = parsed.format.plane_count();
-        let depth = parsed.format.bit_depth();
+        let depth = parsed.bit_depth;
         let mut plane_decodes: Vec<LenientDecode> = Vec::with_capacity(n);
         for i in 0..n {
             let sub = parsed.plane_bytes(bytes, i);
-            plane_decodes.push(parse_icer_lenient_single_plane(sub, limits, depth)?);
+            plane_decodes.push(parse_icer_lenient_single_plane(sub, opts, depth)?);
         }
         let w = plane_decodes[0].image.width;
         let h = plane_decodes[0].image.height;
@@ -870,6 +922,7 @@ pub fn parse_icer_lenient_with_limits(
         let received = plane_decodes[0].received.clone();
         let missing_count = plane_decodes[0].missing_count;
         let mut out = IcerImage::zeros(w, h, parsed.format);
+        out.bit_depth = parsed.bit_depth;
         for (i, d) in plane_decodes.into_iter().enumerate() {
             out.planes[i] = d
                 .image
@@ -885,22 +938,22 @@ pub fn parse_icer_lenient_with_limits(
         });
     }
 
-    parse_icer_lenient_single_plane(bytes, limits, 8)
+    parse_icer_lenient_single_plane(bytes, opts, 8)
 }
 
 /// Single-plane lenient decode at the given sample depth — the
-/// historical `parse_icer_lenient_with_limits` body (depth 8 for bare
+/// historical `parse_icer_lenient` body (depth 8 for bare
 /// streams; the deep-gray container carries deeper depths).
 fn parse_icer_lenient_single_plane(
     bytes: &[u8],
-    limits: &DecodeLimits,
+    opts: &DecodeOptions,
     depth: u8,
 ) -> Result<LenientDecode> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
 
-    // Walk every segment as in `parse_icer_with_limits` -- gather them
+    // Walk every segment as in `decode_image` -- gather them
     // first so the strip-height inference has the full set.
     let mut walked_all: Vec<WalkedSegment<'_>> = Vec::new();
     let mut cursor = 0usize;
@@ -908,7 +961,11 @@ fn parse_icer_lenient_single_plane(
     let mut transform_counted = false;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
-        check_segment_pixels(&walked.header, limits)?;
+        opts.check_segment(
+            walked.header.segment_index,
+            walked.header.width as u32,
+            walked.header.height as u32,
+        )?;
         // §V.B transform-domain segments each declare the full image
         // dimensions; count them once against the total cap.
         let count_pixels = if walked.header.transform_segmented {
@@ -923,13 +980,7 @@ fn parse_icer_lenient_single_plane(
                 .checked_add(segment_pixels(&walked.header))
                 .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
         }
-        if total_pixels > limits.max_total_pixels {
-            return Err(IcerError::Unsupported(format!(
-                "multi-segment image pixel-count {} exceeds total cap of {} pixels \
-                 (see DecodeLimits::max_total_pixels)",
-                total_pixels, limits.max_total_pixels
-            )));
-        }
+        opts.check_total_pixels(total_pixels, "multi-segment image")?;
         cursor += walked.consumed;
         walked_all.push(walked);
     }
@@ -1025,19 +1076,11 @@ fn parse_icer_lenient_single_plane(
     let recon_pixels = (canonical_width as u64)
         .checked_mul(total_height as u64)
         .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
-    if recon_pixels > limits.max_total_pixels {
-        return Err(IcerError::Unsupported(format!(
-            "lenient reconstruction geometry {canonical_width}x{total_height} = {recon_pixels} \
-             pixels exceeds total cap of {} pixels (see DecodeLimits::max_total_pixels)",
-            limits.max_total_pixels
-        )));
-    }
+    opts.check_total_pixels(recon_pixels, "lenient reconstruction geometry")?;
+    opts.check_width_height(canonical_width as u32, total_height as u32)?;
+    opts.check_bytes(recon_pixels * sample_bytes(depth) as u64)?;
 
-    let mut img = IcerImage::zeros(
-        canonical_width as u32,
-        total_height as u32,
-        gray_format(depth),
-    );
+    let mut img = zeros_gray(canonical_width as u32, total_height as u32, depth);
     let mut received = vec![false; expected_segment_count];
 
     // Place each received segment at its inferred y_offset.
@@ -1110,7 +1153,7 @@ pub fn decode_uncompressed_icer(walked: &WalkedSegment<'_>) -> Result<IcerImage>
     if concat.len() < w * h {
         return Err(IcerError::Truncated);
     }
-    let plane: &mut IcerPlane = &mut img.planes[0];
+    let plane: &mut Plane = &mut img.planes[0];
     for y in 0..h {
         let row_dst = &mut plane.data[y * plane.stride..y * plane.stride + w];
         let row_src = &concat[y * w..y * w + w];

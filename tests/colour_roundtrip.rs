@@ -8,8 +8,8 @@
 //! end-to-end behaviour and confirm the Gray8 wire form is unchanged.
 
 use oxideav_icer::{
-    encode_icer, is_container, parse_icer, parse_icer_lenient, parse_icer_metadata, EncodeOptions,
-    IcerImage, IcerPixelFormat,
+    decode, encode, info, is_container, parse_icer_lenient, EncodeOptions, IcerImage,
+    IcerPixelFormat,
 };
 
 /// Three planes with distinct, non-trivial content so the test would
@@ -33,12 +33,12 @@ fn colour_filter_q_roundtrip_is_bit_exact() {
     // bit-exactly through the colour container.
     let original = colour_image(16, 16);
     let opts = EncodeOptions::compressed(); // default filter Q
-    let bytes = encode_icer(&original, &opts).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
 
     assert!(is_container(&bytes), "colour stream must use the container");
 
-    let decoded = parse_icer(&bytes).unwrap();
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::Yuv444P);
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded.format, IcerPixelFormat::Yuv444P);
     assert_eq!(decoded.width, 16);
     assert_eq!(decoded.height, 16);
     assert_eq!(decoded.planes.len(), 3);
@@ -55,8 +55,8 @@ fn colour_planes_are_independent_not_aliased() {
     // The three planes carry different content; a decode that wrongly
     // aliased them (e.g. copying plane 0 into all slots) would fail.
     let original = colour_image(16, 16);
-    let bytes = encode_icer(&original, &EncodeOptions::compressed()).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&original, &EncodeOptions::compressed()).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_ne!(decoded.planes[0].data, decoded.planes[1].data);
     assert_ne!(decoded.planes[0].data, decoded.planes[2].data);
     assert_ne!(decoded.planes[1].data, decoded.planes[2].data);
@@ -66,9 +66,9 @@ fn colour_planes_are_independent_not_aliased() {
 fn colour_uncompressed_roundtrip_is_bit_exact() {
     let original = colour_image(12, 9);
     let opts = EncodeOptions::default(); // uncompressed §III.D path
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::Yuv444P);
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded.format, IcerPixelFormat::Yuv444P);
     for i in 0..3 {
         assert_eq!(decoded.planes[i].data, original.planes[i].data);
     }
@@ -83,10 +83,10 @@ fn gray8_stream_is_not_a_container() {
     for (i, b) in gray.planes[0].data.iter_mut().enumerate() {
         *b = (i & 0xFF) as u8;
     }
-    let bytes = encode_icer(&gray, &EncodeOptions::compressed()).unwrap();
+    let bytes = encode(&gray, &EncodeOptions::compressed()).unwrap();
     assert!(!is_container(&bytes), "Gray8 stream must stay un-framed");
-    let decoded = parse_icer(&bytes).unwrap();
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::Gray8);
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded.format, IcerPixelFormat::Gray8);
     assert_eq!(decoded.planes[0].data, gray.planes[0].data);
 }
 
@@ -95,12 +95,13 @@ fn colour_metadata_walks_every_plane() {
     // Multi-segment colour: each plane is split into 2 segments, so the
     // metadata walker should surface 3 planes * 2 segments = 6 segments.
     let original = colour_image(16, 32);
-    let opts = EncodeOptions {
-        segment_count: 2,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 2;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(
         meta.segments.len(),
         6,
@@ -116,14 +117,15 @@ fn colour_metadata_walks_every_plane() {
 fn colour_lenient_decode_reports_luma_presence() {
     // A fully-present colour stream decodes leniently with zero missing.
     let original = colour_image(16, 32);
-    let opts = EncodeOptions {
-        segment_count: 2,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 2;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
     let lenient = parse_icer_lenient(&bytes).unwrap();
     assert_eq!(lenient.missing_count, 0);
-    assert_eq!(lenient.image.pixel_format, IcerPixelFormat::Yuv444P);
+    assert_eq!(lenient.image.format, IcerPixelFormat::Yuv444P);
     for i in 0..3 {
         assert_eq!(lenient.image.planes[i].data, original.planes[i].data);
     }

@@ -3,7 +3,7 @@
 //!
 //! The unit tests in `src/bitplane.rs` pin the per-coefficient deadzone
 //! arithmetic at the packet level. These tests exercise the same
-//! reconstruction through the *public* `encode_icer` / `parse_icer`
+//! reconstruction through the *public* `encode` / `decode`
 //! budget path -- the path the deployed Mars-rover pipeline drives -- and
 //! lock the truncated-stream PSNR so a regression to the older
 //! strip-global single-`b` reconstruction would fail CI.
@@ -18,9 +18,7 @@
 //! mid-plane cuts below clear PSNR floors set ~1 dB above the strip-global
 //! result they previously produced.
 
-use oxideav_icer::{
-    encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
-};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
 
 /// A deterministic textured 64×64 fixture with structure across many
 /// bit planes so a budget cut falls mid-plane rather than on a clean
@@ -62,7 +60,7 @@ fn encode_at(img: &IcerImage, budget: u64) -> Vec<u8> {
     let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
     opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
-    encode_icer(img, &opts).expect("encode failed")
+    encode(img, &opts).expect("encode failed")
 }
 
 /// Mid-plane budget cuts clear PSNR floors set above the strip-global
@@ -95,7 +93,7 @@ fn mid_plane_truncation_clears_per_coefficient_floor() {
             "budget {budget}: output {} exceeds cap",
             bytes.len()
         );
-        let dec = parse_icer(&bytes).expect("decode failed");
+        let dec = decode(&bytes).expect("decode failed");
         let p = psnr(&img, &dec);
         eprintln!(
             "budget {budget}: {} bytes -> {p:.3} dB (floor {floor})",
@@ -116,7 +114,7 @@ fn truncated_psnr_is_monotone_in_budget() {
     let mut prev = 0.0f64;
     for budget in [512u64, 768, 1024, 1536, 2048, 3072, 4096] {
         let bytes = encode_at(&img, budget);
-        let dec = parse_icer(&bytes).expect("decode failed");
+        let dec = decode(&bytes).expect("decode failed");
         let p = psnr(&img, &dec);
         assert!(
             p >= prev - 0.1,
@@ -169,7 +167,7 @@ fn checkerboard_strict_truncation_clears_category_model_floor() {
     for &(budget, floor) in cases {
         let bytes = encode_at(&img, budget);
         assert!(bytes.len() as u64 <= budget);
-        let dec = parse_icer(&bytes).expect("decode failed");
+        let dec = decode(&bytes).expect("decode failed");
         let p = psnr(&img, &dec);
         eprintln!(
             "checkerboard strict b={budget}: {} bytes -> {p:.3} dB (floor {floor})",
@@ -211,8 +209,8 @@ fn same_subband_walk_shrinks_lossless_output() {
     opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
     for (name, img, ceiling) in [("ramp", &ramp, 1480usize), ("checker", &checker, 1680)] {
-        let bytes = encode_icer(img, &opts).expect("encode failed");
-        let dec = parse_icer(&bytes).expect("decode failed");
+        let bytes = encode(img, &opts).expect("encode failed");
+        let dec = decode(&bytes).expect("decode failed");
         assert_eq!(
             dec.planes[0].data, img.planes[0].data,
             "{name}: filter-Q lossless must be bit-exact"
@@ -239,8 +237,8 @@ fn untruncated_filter_q_is_bit_exact() {
     let mut opts = EncodeOptions::compressed();
     opts.filter = WaveletFilter::FilterQ;
     opts.wavelet_levels = 3;
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let dec = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let dec = decode(&bytes).expect("decode failed");
     assert_eq!(
         dec.planes[0].data, img.planes[0].data,
         "untruncated filter-Q decode must be bit-exact"

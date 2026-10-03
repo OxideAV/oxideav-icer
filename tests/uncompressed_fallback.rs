@@ -10,8 +10,7 @@
 //! path was emitted, so the choice is transparent on decode.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, EncodeOptions, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 fn fill<F>(w: u32, h: u32, mut f: F) -> IcerImage
@@ -54,12 +53,12 @@ fn fallback_picks_uncompressed_when_compressed_is_larger() {
     let img = noise_image(16, 16, 0xA5A5);
 
     let opts_no_fallback = EncodeOptions::compressed().with_byte_budget(u64::MAX); // disable any truncation effect
-    let bytes_compressed = encode_icer(&img, &opts_no_fallback).unwrap();
+    let bytes_compressed = encode(&img, &opts_no_fallback).unwrap();
 
     let opts_with_fallback = EncodeOptions::compressed()
         .with_byte_budget(u64::MAX)
         .with_uncompressed_fallback();
-    let bytes_fallback = encode_icer(&img, &opts_with_fallback).unwrap();
+    let bytes_fallback = encode(&img, &opts_with_fallback).unwrap();
 
     // The fallback can only equal or beat the compressed-only output.
     assert!(
@@ -80,7 +79,7 @@ fn fallback_picks_uncompressed_when_compressed_is_larger() {
 
     // The emitted segment header carries the uncompressed flag set,
     // so the decoder reconstructs via the §III.D path.
-    let meta = parse_icer_metadata(&bytes_fallback).unwrap();
+    let meta = info(&bytes_fallback).unwrap();
     assert_eq!(meta.segments.len(), 1);
     assert!(
         meta.segments[0].header.uncompressed,
@@ -96,8 +95,8 @@ fn fallback_keeps_compressed_when_compressed_is_smaller() {
     let img = ramp_image(64, 64);
 
     let opts = EncodeOptions::compressed().with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 1);
     assert!(
         !meta.segments[0].header.uncompressed,
@@ -107,7 +106,7 @@ fn fallback_keeps_compressed_when_compressed_is_smaller() {
     // And the decoder still reconstructs cleanly (filter Q is
     // bit-exact lossless, so the reconstructed pixels equal the
     // input).
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }
 
@@ -118,13 +117,13 @@ fn fallback_decode_roundtrip_on_noise() {
     let img = noise_image(32, 32, 0xCAFE);
 
     let opts = EncodeOptions::compressed().with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.width, img.width);
     assert_eq!(decoded.height, img.height);
     // Uncompressed is a literal byte copy of the input plane -- any
     // mismatch is a wire-format bug, not a quantisation effect.
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     assert!(meta.segments[0].header.uncompressed);
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }
@@ -159,8 +158,8 @@ fn fallback_is_per_segment_in_multi_segment_image() {
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 2;
     let opts = opts.with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 2);
 
     // Segment 0 = noise; segment 1 = ramp. Index order on encode is
@@ -182,10 +181,10 @@ fn fallback_no_op_when_forced_uncompressed() {
     // fallback flag on top is a no-op.
     let img = ramp_image(16, 16);
     let opts_force = EncodeOptions::default(); // uncompressed = true.
-    let bytes_force = encode_icer(&img, &opts_force).unwrap();
+    let bytes_force = encode(&img, &opts_force).unwrap();
 
     let opts_force_with_flag = EncodeOptions::default().with_uncompressed_fallback();
-    let bytes_force_with_flag = encode_icer(&img, &opts_force_with_flag).unwrap();
+    let bytes_force_with_flag = encode(&img, &opts_force_with_flag).unwrap();
     assert_eq!(bytes_force, bytes_force_with_flag);
 }
 
@@ -198,13 +197,13 @@ fn fallback_composes_with_filter_choice() {
     let mut opts = EncodeOptions::compressed();
     opts.filter = WaveletFilter::FilterA;
     let opts = opts.with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 1);
     // Noise tile under either filter -- the uncompressed candidate
     // beats both. The decoded plane equals the input plane because
     // §III.D is a literal byte copy on this path.
     assert!(meta.segments[0].header.uncompressed);
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }

@@ -86,10 +86,13 @@ use crate::bitplane3d::{
     decode_cube_bitplanes, decode_cube_bitplanes_into, encode_cube_bitplanes, CubeGeometry,
     CubePacket,
 };
-use crate::decoder::DecodeLimits;
 use crate::entropy::EntropyKind;
 use crate::error::{IcerError, Result};
 use crate::header::WaveletFilter;
+use crate::image::{IcerImage, IcerPixelFormat};
+#[allow(deprecated)]
+use crate::options::DecodeLimits;
+use crate::options::DecodeOptions;
 use crate::partition::{ll_dimensions, partition, SegmentRect};
 use crate::subband3d::stage_counts;
 use crate::wavelet3d::{forward_3d, inverse_3d};
@@ -138,6 +141,87 @@ impl IcerCube {
             bit_depth,
             samples: vec![0; width as usize * height as usize * bands as usize],
         }
+    }
+
+    /// One spectral band as a 2-D [`IcerImage`]: `Gray8` when
+    /// `bit_depth <= 8`, `Gray16Le` otherwise, with the cube's
+    /// `bit_depth` carried as the image's significant bits (samples are
+    /// the exact values, LSB-aligned). `Err(InvalidData)` when `band`
+    /// is out of range or the cube's geometry is inconsistent.
+    pub fn band_image(&self, band: u32) -> Result<IcerImage> {
+        self.validate()?;
+        if band >= self.bands {
+            return Err(IcerError::invalid(format!(
+                "band {band} out of range (cube has {} bands)",
+                self.bands
+            )));
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let plane_len = w * h;
+        let src = &self.samples[band as usize * plane_len..][..plane_len];
+        let format = if self.bit_depth > 8 {
+            IcerPixelFormat::Gray16Le
+        } else {
+            IcerPixelFormat::Gray8
+        };
+        let mut img = IcerImage::zeros(self.width, self.height, format);
+        let plane = &mut img.planes[0];
+        if format == IcerPixelFormat::Gray8 {
+            for (d, s) in plane.data.iter_mut().zip(src) {
+                *d = *s as u8;
+            }
+        } else {
+            for (d, s) in plane.data.chunks_exact_mut(2).zip(src) {
+                d.copy_from_slice(&s.to_le_bytes());
+            }
+        }
+        img.with_bit_depth(self.bit_depth)
+    }
+
+    /// Stack 2-D gray images (one per band, identical geometry and
+    /// `bit_depth`, `Gray8` or `Gray16Le`) into a cube — the inverse of
+    /// [`IcerCube::band_image`]. `Err(InvalidData)` on an empty slice,
+    /// a geometry / depth / layout mismatch, or a colour layout.
+    pub fn from_band_images(images: &[IcerImage]) -> Result<Self> {
+        let first = images
+            .first()
+            .ok_or_else(|| IcerError::invalid("cube needs at least one band image"))?;
+        let bands = u32::try_from(images.len())
+            .ok()
+            .filter(|&n| n <= u16::MAX as u32)
+            .ok_or_else(|| IcerError::unsupported("cube band count outside 1..=65535"))?;
+        let mut cube = IcerCube::zeros(first.width, first.height, bands, first.bit_depth);
+        let plane_len = first.width as usize * first.height as usize;
+        for (b, img) in images.iter().enumerate() {
+            img.validate()?;
+            if img.format.is_color() {
+                return Err(IcerError::invalid(format!(
+                    "band {b}: {:?} is not a gray layout",
+                    img.format
+                )));
+            }
+            if img.width != first.width || img.height != first.height {
+                return Err(IcerError::invalid(format!(
+                    "band {b} geometry {}x{} disagrees with band 0 {}x{}",
+                    img.width, img.height, first.width, first.height
+                )));
+            }
+            if img.bit_depth != first.bit_depth {
+                return Err(IcerError::invalid(format!(
+                    "band {b} bit depth {} disagrees with band 0 {}",
+                    img.bit_depth, first.bit_depth
+                )));
+            }
+            let dst = &mut cube.samples[b * plane_len..][..plane_len];
+            for y in 0..img.height {
+                for x in 0..img.width {
+                    dst[y as usize * img.width as usize + x as usize] = img.sample(0, x, y);
+                }
+            }
+        }
+        cube.validate()?;
+        Ok(cube)
     }
 
     fn validate(&self) -> Result<()> {
@@ -543,7 +627,7 @@ pub fn is_cube(bytes: &[u8]) -> bool {
     bytes.len() >= CUBE_MAGIC.len() && bytes[..CUBE_MAGIC.len()] == CUBE_MAGIC
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
@@ -574,17 +658,26 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Decode an ICER-3D cube stream with the default [`DecodeLimits`]
-/// policy (the cube's `width * height * bands` sample count is measured
-/// against the same per-segment / total caps the 2-D decoder applies to
-/// pixels).
+/// Decode an ICER-3D cube stream with the default [`DecodeOptions`]
+/// (the cube's `width * height * bands` sample count is measured
+/// against the same per-segment / total / byte caps the 2-D decoder
+/// applies to pixels).
 pub fn parse_icer3d(bytes: &[u8]) -> Result<IcerCube> {
-    parse_icer3d_with_limits(bytes, &DecodeLimits::default())
+    parse_icer3d_with(bytes, &DecodeOptions::default())
 }
 
-/// Decode an ICER-3D cube stream under an explicit resource-cap policy.
+/// Decode an ICER-3D cube stream under an explicit [`DecodeOptions`]
+/// policy.
+pub fn parse_icer3d_with(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerCube> {
+    Ok(parse_cube(bytes, opts, false)?.cube)
+}
+
+/// [`parse_icer3d`] under a pre-contract [`DecodeLimits`] policy.
+/// Superseded by [`parse_icer3d_with`].
+#[deprecated(note = "use oxideav_icer::parse_icer3d_with(bytes, &DecodeOptions)")]
+#[allow(deprecated)]
 pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<IcerCube> {
-    Ok(parse_cube(bytes, limits, false)?.cube)
+    parse_icer3d_with(bytes, &DecodeOptions::from(limits))
 }
 
 /// Report of a loss-tolerant ICER-3D decode (see
@@ -611,7 +704,7 @@ pub struct LenientCubeDecode {
 }
 
 /// Loss-tolerant decode of an ICER-3D cube stream (default
-/// [`DecodeLimits`]).
+/// [`DecodeOptions`]).
 ///
 /// IPN 42-164 §I: "because compression is progressive within each
 /// segment, when data loss does occur, any received data for the
@@ -620,25 +713,53 @@ pub struct LenientCubeDecode {
 /// [`parse_icer3d`] refuses a truncated stream outright; this entry
 /// point salvages every complete packet that arrived, in wire order,
 /// and reports what was recovered. Only the 17-byte fixed header (and
-/// the [`DecodeLimits`] policy) can still fail the decode — the
+/// the [`DecodeOptions`] policy) can still fail the decode — the
 /// geometry, filter, and segment layout are unrecoverable without it.
 pub fn parse_icer3d_lenient(bytes: &[u8]) -> Result<LenientCubeDecode> {
-    parse_cube(bytes, &DecodeLimits::default(), true)
+    parse_cube(bytes, &DecodeOptions::default(), true)
 }
 
-/// [`parse_icer3d_lenient`] under an explicit resource-cap policy.
+/// [`parse_icer3d_lenient`] under an explicit [`DecodeOptions`] policy.
+pub fn parse_icer3d_lenient_with(bytes: &[u8], opts: &DecodeOptions) -> Result<LenientCubeDecode> {
+    parse_cube(bytes, opts, true)
+}
+
+/// [`parse_icer3d_lenient`] under a pre-contract [`DecodeLimits`]
+/// policy. Superseded by [`parse_icer3d_lenient_with`].
+#[deprecated(note = "use oxideav_icer::parse_icer3d_lenient_with(bytes, &DecodeOptions)")]
+#[allow(deprecated)]
 pub fn parse_icer3d_lenient_with_limits(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<LenientCubeDecode> {
-    parse_cube(bytes, limits, true)
+    parse_cube(bytes, &DecodeOptions::from(limits), true)
 }
 
-/// Shared strict / lenient decode core. In strict mode every wire
-/// shortfall is an error; in lenient mode segment-level shortfalls
-/// degrade to partial reconstruction and only header-level problems
-/// error.
-fn parse_cube(bytes: &[u8], limits: &DecodeLimits, lenient: bool) -> Result<LenientCubeDecode> {
+/// The fixed 17-byte cube header, parsed and validated (geometry,
+/// depth, filter, levels, strip layout, flags) with every
+/// [`DecodeOptions`] cap applied — what [`crate::info`] reports for a
+/// cube without touching a packet.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CubeHeader {
+    pub width: usize,
+    pub height: usize,
+    pub bands: usize,
+    pub bit_depth: u8,
+    pub filter: WaveletFilter,
+    pub levels: u8,
+    pub seg_count: usize,
+    pub strip_h: usize,
+    pub transform_domain: bool,
+    pub kind: EntropyKind,
+}
+
+/// Parse + validate the cube header at the start of `bytes` under
+/// `opts`; returns the header and the reader positioned at the first
+/// segment.
+pub(crate) fn parse_cube_header<'a>(
+    bytes: &'a [u8],
+    opts: &DecodeOptions,
+) -> Result<(CubeHeader, Reader<'a>)> {
     let mut r = Reader { buf: bytes, pos: 0 };
     if r.take(CUBE_MAGIC.len())? != CUBE_MAGIC {
         return Err(IcerError::invalid("not an ICER-3D cube stream"));
@@ -706,17 +827,60 @@ fn parse_cube(bytes: &[u8], limits: &DecodeLimits, lenient: bool) -> Result<Leni
     // spans the full cube volume for allocation purposes — the same
     // policy shape as the 2-D §V.B path, whose segment headers carry
     // the full image dimensions).
-    let total = (width * height * bands) as u64;
+    let total = width as u64 * height as u64 * bands as u64;
     let per_seg = if transform_domain {
         total
     } else {
-        (width * strip_h * bands) as u64
+        width as u64 * strip_h as u64 * bands as u64
     };
-    if per_seg > limits.max_pixels_per_segment || total > limits.max_total_pixels {
-        return Err(IcerError::unsupported(format!(
-            "cube geometry {width}x{height}x{bands} exceeds the decode limits"
-        )));
+    opts.check_width_height(width as u32, height as u32)?;
+    if let Some(m) = opts.max_pixels_per_segment {
+        if per_seg > m {
+            return Err(IcerError::limit(format!(
+                "cube segment of {per_seg} samples ({width}x{strip_h}x{bands}) exceeds \
+                 per-segment cap of {m} (see DecodeOptions::max_pixels_per_segment)"
+            )));
+        }
     }
+    opts.check_total_pixels(total, "cube")?;
+    // The cube is materialised as `u16` samples whatever the depth.
+    opts.check_bytes(total * 2)?;
+
+    Ok((
+        CubeHeader {
+            width,
+            height,
+            bands,
+            bit_depth,
+            filter,
+            levels,
+            seg_count,
+            strip_h,
+            transform_domain,
+            kind,
+        },
+        r,
+    ))
+}
+
+/// Shared strict / lenient decode core. In strict mode every wire
+/// shortfall is an error; in lenient mode segment-level shortfalls
+/// degrade to partial reconstruction and only header-level problems
+/// error.
+fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<LenientCubeDecode> {
+    let (hdr, mut r) = parse_cube_header(bytes, opts)?;
+    let CubeHeader {
+        width,
+        height,
+        bands,
+        bit_depth,
+        filter,
+        levels,
+        seg_count,
+        strip_h,
+        transform_domain,
+        kind,
+    } = hdr;
 
     let shift = 1i32 << (bit_depth - 1);
     let ceil = if bit_depth == 16 {
@@ -1144,17 +1308,28 @@ mod tests {
     fn decode_limits_apply_to_cubes() {
         let cube = hyperspectral_fixture(16, 16, 8);
         let bytes = encode_icer3d(&cube, &CubeEncodeOptions::default()).unwrap();
-        let tight = DecodeLimits {
-            max_pixels_per_segment: 64,
-            max_total_pixels: 64,
-        };
+        let tight = DecodeOptions::new()
+            .with_max_pixels_per_segment(64u64)
+            .with_max_pixels(64u64);
         assert!(matches!(
-            parse_icer3d_with_limits(&bytes, &tight),
-            Err(IcerError::Unsupported(_))
+            parse_icer3d_with(&bytes, &tight),
+            Err(IcerError::LimitExceeded(_))
         ));
-        // Unlimited recovers the decode.
-        let ok = parse_icer3d_with_limits(&bytes, &DecodeLimits::unlimited()).unwrap();
+        // A byte cap below the u16 cube refuses too; unlimited recovers.
+        assert!(parse_icer3d_with(&bytes, &DecodeOptions::new().with_max_bytes(100u64)).is_err());
+        let ok = parse_icer3d_with(&bytes, &DecodeOptions::new().unlimited()).unwrap();
         assert_eq!(ok, cube);
+        // The deprecated DecodeLimits front converts to the same policy.
+        #[allow(deprecated)]
+        let legacy = parse_icer3d_with_limits(&bytes, &DecodeLimits::unlimited()).unwrap();
+        assert_eq!(legacy, cube);
+        // Band bridge: every band round-trips through a 2-D image.
+        let imgs: Vec<_> = (0..cube.bands)
+            .map(|b| cube.band_image(b).unwrap())
+            .collect();
+        assert_eq!(imgs[0].bit_depth, cube.bit_depth);
+        assert_eq!(IcerCube::from_band_images(&imgs).unwrap(), cube);
+        assert!(cube.band_image(cube.bands).is_err());
     }
 
     #[test]

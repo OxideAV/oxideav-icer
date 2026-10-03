@@ -29,21 +29,21 @@
 //! stronger high-pass prediction) and are deliberately conservative +
 //! documented so callers can audit them.
 
-use crate::encoder::{encode_icer, EncodeOptions};
+use crate::encoder::{encode_image, EncodeOptions};
 use crate::error::Result;
 use crate::header::WaveletFilter;
 use crate::image::{IcerImage, IcerPixelFormat};
 
 /// Bytes per stored sample of an image's pixel format (1, or 2
-/// little-endian for [`IcerPixelFormat::GrayDeep`]).
+/// little-endian for [`IcerPixelFormat::Gray16Le`]).
 fn fmt_sample_bytes(image: &IcerImage) -> usize {
-    image.pixel_format.sample_bytes()
+    image.format.sample_bytes()
 }
 
 /// Read the sample at `(x, y)` of `plane` (stored at `sb` bytes per
 /// sample), widened to `i32`.
 #[inline]
-fn plane_sample(plane: &crate::image::IcerPlane, sb: usize, x: usize, y: usize) -> i32 {
+fn plane_sample(plane: &crate::image::Plane, sb: usize, x: usize, y: usize) -> i32 {
     let off = y * plane.stride + x * sb;
     if sb == 2 {
         u16::from_le_bytes([plane.data[off], plane.data[off + 1]]) as i32
@@ -57,7 +57,7 @@ fn plane_sample(plane: &crate::image::IcerPlane, sb: usize, x: usize, y: usize) 
 /// "where b is the number of bits/pixel in the original image" (255 on
 /// the historical 8-bit path, 4095 for the paper's 12-bit test set).
 fn peak_value(image: &IcerImage) -> f64 {
-    ((1u32 << image.pixel_format.bit_depth()) - 1) as f64
+    ((1u32 << image.bit_depth) - 1) as f64
 }
 
 /// One-pass image statistics. Captures the metrics the filter-selection
@@ -85,7 +85,7 @@ impl ImageStats {
     /// Panics on `image.planes.is_empty()` -- callers should validate
     /// before calling.
     ///
-    /// Deep-sample ([`IcerPixelFormat::GrayDeep`]) images are scanned
+    /// Deep-sample ([`IcerPixelFormat::Gray16Le`]) images are scanned
     /// with each sample **down-shifted to the 8-bit domain**
     /// (`sample >> (bits - 8)`): every statistic keeps its documented
     /// `0..=255` range and the [`recommend_filter`] decision-tree
@@ -112,7 +112,7 @@ impl ImageStats {
         }
 
         let sb = fmt_sample_bytes(image);
-        let shift = image.pixel_format.bit_depth().saturating_sub(8);
+        let shift = image.bit_depth.saturating_sub(8);
         let px = |x: usize, y: usize| -> u8 { (plane_sample(plane, sb, x, y) >> shift) as u8 };
 
         let mut sum: f64 = 0.0;
@@ -363,7 +363,7 @@ pub fn pick_filter_by_rate_distortion(
         trial_opts.filter = candidate;
         // Disable auto_filter on the trial pass so we don't recurse.
         trial_opts.auto_filter = false;
-        match encode_icer(image, &trial_opts) {
+        match encode_image(image, &trial_opts) {
             Ok(bytes) => {
                 let len = bytes.len();
                 if best.map(|(_, bl)| len < bl).unwrap_or(true) {
@@ -397,8 +397,8 @@ pub fn analyze(image: &IcerImage) -> (ImageStats, WaveletFilter) {
 /// callers can fail fast.
 pub fn supported_for_analysis(image: &IcerImage) -> bool {
     matches!(
-        image.pixel_format,
-        IcerPixelFormat::Gray8 | IcerPixelFormat::GrayDeep { .. }
+        image.format,
+        IcerPixelFormat::Gray8 | IcerPixelFormat::Gray16Le
     ) && !image.planes.is_empty()
         && image.width > 0
         && image.height > 0
@@ -770,7 +770,7 @@ pub fn quality_search_bounds(
     clean_opts.rd_pruning = false;
     clean_opts.quality_target_psnr = None;
     clean_opts.auto_uncompressed_fallback = false;
-    let hi_bytes = crate::encoder::encode_icer(image, &clean_opts)?.len() as u64;
+    let hi_bytes = crate::encoder::encode_image(image, &clean_opts)?.len() as u64;
 
     // Lower bound: per-segment header overhead. A useful encode must
     // ship at least the headers of every segment.
@@ -831,7 +831,7 @@ pub fn encode_to_quality_target(
         // or below the floor. Return it directly.
         let mut clean = opts.clone();
         clean.quality_target_psnr = None;
-        return crate::encoder::encode_icer(image, &clean);
+        return crate::encoder::encode_image(image, &clean);
     }
 
     // Helper closure to encode + decode + compute PSNR at a given byte
@@ -850,8 +850,9 @@ pub fn encode_to_quality_target(
         // current API surface `with_quality_target` doesn't set
         // rd_pruning, so this branch is academic; we preserve the field
         // to leave room for future composition.
-        let bytes = crate::encoder::encode_icer(image, &trial_opts)?;
-        let decoded = crate::decoder::parse_icer(&bytes)?;
+        let bytes = crate::encoder::encode_image(image, &trial_opts)?;
+        let decoded =
+            crate::decoder::decode_image(&bytes, &crate::options::DecodeOptions::default())?;
         let p = psnr_db(image, &decoded);
         Ok((bytes, p))
     };

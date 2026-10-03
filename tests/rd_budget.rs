@@ -20,8 +20,7 @@
 //! 256×256 gradient fixture used by the round-4 quota tests.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, subband_weight_map, EncodeOptions, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    decode, encode, subband_weight_map, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 /// Build a 256×256 8-bit gray gradient image with both horizontal and
@@ -88,13 +87,13 @@ fn rd_budget_respects_hard_cap_and_decodes() {
     let mut prev_psnr = 0.0f64;
     for &budget in budgets {
         let opts = EncodeOptions::compressed().with_rd_budget(budget);
-        let encoded = encode_icer(&image, &opts).expect("encode failed");
+        let encoded = encode(&image, &opts).expect("encode failed");
         assert!(
             encoded.len() as u64 <= budget,
             "rd_budget={budget}: output {} bytes exceeds cap",
             encoded.len()
         );
-        let decoded = parse_icer(&encoded).expect("decode failed");
+        let decoded = decode(&encoded).expect("decode failed");
         assert_eq!(decoded.width, 256);
         assert_eq!(decoded.height, 256);
         let p = psnr(&image, &decoded);
@@ -119,8 +118,8 @@ fn rd_budget_respects_hard_cap_and_decodes() {
 fn rd_budget_is_deterministic() {
     let image = gradient_256x256();
     let opts = EncodeOptions::compressed().with_rd_budget(4096);
-    let bytes_a = encode_icer(&image, &opts).expect("encode 1");
-    let bytes_b = encode_icer(&image, &opts).expect("encode 2");
+    let bytes_a = encode(&image, &opts).expect("encode 1");
+    let bytes_b = encode(&image, &opts).expect("encode 2");
     assert_eq!(
         bytes_a, bytes_b,
         "R-D selection produced different bytes on two identical runs"
@@ -136,8 +135,8 @@ fn rd_budget_with_huge_cap_is_lossless_for_filter_q() {
     let image = gradient_256x256();
     let huge = 1024u64 * 1024; // 1 MiB ceiling
     let opts = EncodeOptions::compressed().with_rd_budget(huge);
-    let encoded = encode_icer(&image, &opts).expect("encode failed");
-    let decoded = parse_icer(&encoded).expect("decode failed");
+    let encoded = encode(&image, &opts).expect("encode failed");
+    let decoded = decode(&encoded).expect("decode failed");
     assert_eq!(
         decoded.planes[0].data, image.planes[0].data,
         "filter Q with R-D + huge budget must reconstruct bit-exactly"
@@ -214,13 +213,13 @@ fn rd_budget_matches_or_beats_strict_msb() {
             let strict_opts = EncodeOptions::compressed().with_byte_budget(budget);
             let rd_opts = EncodeOptions::compressed().with_rd_budget(budget);
 
-            let strict_bytes = encode_icer(image, &strict_opts).expect("strict encode");
-            let rd_bytes = encode_icer(image, &rd_opts).expect("rd encode");
+            let strict_bytes = encode(image, &strict_opts).expect("strict encode");
+            let rd_bytes = encode(image, &rd_opts).expect("rd encode");
             assert!(strict_bytes.len() as u64 <= budget);
             assert!(rd_bytes.len() as u64 <= budget);
 
-            let strict_dec = parse_icer(&strict_bytes).expect("strict decode");
-            let rd_dec = parse_icer(&rd_bytes).expect("rd decode");
+            let strict_dec = decode(&strict_bytes).expect("strict decode");
+            let rd_dec = decode(&rd_bytes).expect("rd decode");
 
             let strict_psnr = psnr(image, &strict_dec);
             let rd_psnr = psnr(image, &rd_dec);
@@ -321,16 +320,16 @@ fn weighted_rd_beats_strict_on_sparse_impulses() {
     let image = sparse_impulses_64x64();
     let mut best_delta = f64::NEG_INFINITY;
     for &budget in &[230u64, 250, 270] {
-        let strict = encode_icer(
+        let strict = encode(
             &image,
             &EncodeOptions::compressed().with_byte_budget(budget),
         )
         .expect("strict encode");
-        let rd = encode_icer(&image, &EncodeOptions::compressed().with_rd_budget(budget))
-            .expect("rd encode");
+        let rd =
+            encode(&image, &EncodeOptions::compressed().with_rd_budget(budget)).expect("rd encode");
         assert!(strict.len() as u64 <= budget && rd.len() as u64 <= budget);
-        let strict_psnr = psnr(&image, &parse_icer(&strict).unwrap());
-        let rd_psnr = psnr(&image, &parse_icer(&rd).unwrap());
+        let strict_psnr = psnr(&image, &decode(&strict).unwrap());
+        let rd_psnr = psnr(&image, &decode(&rd).unwrap());
         eprintln!("impulses64 b={budget}: strict={strict_psnr:.2} dB rd={rd_psnr:.2} dB");
         // R-D must never regress vs strict at any budget.
         assert!(

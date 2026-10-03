@@ -1,10 +1,9 @@
 //! End-to-end coverage for the IPN 42-155 §IV interleaved entropy coder
-//! wired through the full `encode_icer` / `parse_icer` pipeline (selected
+//! wired through the full `encode` / `decode` pipeline (selected
 //! via `EncodeOptions::with_interleaved_entropy`).
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, EncodeOptions, IcerImage, IcerPixelFormat,
-    SegmentHeader,
+    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, SegmentHeader,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {
@@ -39,8 +38,8 @@ fn interleaved_filter_q_is_bit_exact() {
     for (w, h) in [(16u32, 16u32), (31, 17), (64, 48), (5, 40)] {
         let original = ramp_image(w, h);
         let opts = EncodeOptions::compressed().with_interleaved_entropy(); // filter Q is the compressed() default
-        let bytes = encode_icer(&original, &opts).unwrap();
-        let decoded = parse_icer(&bytes).unwrap();
+        let bytes = encode(&original, &opts).unwrap();
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.width, w, "{w}x{h} width");
         assert_eq!(decoded.height, h, "{w}x{h} height");
         assert_eq!(
@@ -56,8 +55,8 @@ fn interleaved_filter_q_is_bit_exact() {
 fn interleaved_random_content_bit_exact() {
     let original = lcg_image(48, 48, 0xC0FFEE);
     let opts = EncodeOptions::compressed().with_interleaved_entropy();
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
 }
 
@@ -69,7 +68,7 @@ fn interleaved_random_content_bit_exact() {
 fn interleaved_flag_is_recorded_on_the_wire() {
     let original = ramp_image(32, 32);
 
-    let inter = encode_icer(
+    let inter = encode(
         &original,
         &EncodeOptions::compressed().with_interleaved_entropy(),
     )
@@ -80,7 +79,7 @@ fn interleaved_flag_is_recorded_on_the_wire() {
         "interleaved encode must set the wire flag"
     );
 
-    let arith = encode_icer(&original, &EncodeOptions::compressed()).unwrap();
+    let arith = encode(&original, &EncodeOptions::compressed()).unwrap();
     let (hdr_arith, _) = SegmentHeader::parse(&arith).unwrap();
     assert!(
         !hdr_arith.interleaved_entropy,
@@ -101,9 +100,9 @@ fn interleaved_multi_segment_bit_exact() {
     let original = ramp_image(40, 40);
     let mut opts = EncodeOptions::compressed().with_interleaved_entropy();
     opts.segment_count = 4;
-    let bytes = encode_icer(&original, &opts).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
 
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 4, "four segments enumerated");
     for seg in &meta.segments {
         assert!(
@@ -112,7 +111,7 @@ fn interleaved_multi_segment_bit_exact() {
         );
     }
 
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
 }
 
@@ -129,9 +128,9 @@ fn interleaved_colour_bit_exact() {
         }
     }
     let opts = EncodeOptions::compressed().with_interleaved_entropy();
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::Yuv444P);
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(decoded.format, IcerPixelFormat::Yuv444P);
     assert_eq!(decoded.planes.len(), 3);
     for (p, (d, o)) in decoded
         .planes
@@ -147,13 +146,13 @@ fn interleaved_colour_bit_exact() {
 /// garbage (header declares the interleaved backend, bodies are random)
 /// must never panic — it decodes *something* (a bounded reconstruction)
 /// or returns an error, but stays memory-safe. Guards the fuzz surface
-/// the new backend opens via `parse_icer`.
+/// the new backend opens via `decode`.
 #[test]
 fn interleaved_garbage_body_does_not_panic() {
     // Build a legitimate interleaved stream, then corrupt every body byte.
     let original = ramp_image(32, 32);
     let opts = EncodeOptions::compressed().with_interleaved_entropy();
-    let mut bytes = encode_icer(&original, &opts).unwrap();
+    let mut bytes = encode(&original, &opts).unwrap();
     // Corrupt the payload after the 12-byte segment header.
     let mut s = 0x1357u64;
     for b in bytes.iter_mut().skip(SegmentHeader::ENCODED_BYTES) {
@@ -161,7 +160,7 @@ fn interleaved_garbage_body_does_not_panic() {
         *b = (s >> 40) as u8;
     }
     // Must not panic; either decodes a (garbage) image or errors cleanly.
-    let _ = parse_icer(&bytes);
+    let _ = decode(&bytes);
 }
 
 /// On structured content the §IV interleaved coder compresses the
@@ -172,7 +171,7 @@ fn interleaved_garbage_body_does_not_panic() {
 fn interleaved_compresses_structured_content() {
     let original = ramp_image(64, 64);
     let raw_pixels = 64 * 64;
-    let bytes = encode_icer(
+    let bytes = encode(
         &original,
         &EncodeOptions::compressed().with_interleaved_entropy(),
     )
@@ -183,7 +182,7 @@ fn interleaved_compresses_structured_content() {
         bytes.len()
     );
     // And it round-trips losslessly.
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
 }
 
@@ -197,13 +196,13 @@ fn interleaved_budget_truncation_frames_geometry() {
     let opts = EncodeOptions::compressed()
         .with_interleaved_entropy()
         .with_byte_budget(400);
-    let bytes = encode_icer(&original, &opts).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
     assert!(
         bytes.len() <= 400,
         "hard cap honoured: {} bytes",
         bytes.len()
     );
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.width, 64);
     assert_eq!(decoded.height, 64);
 }

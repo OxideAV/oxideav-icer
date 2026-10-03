@@ -17,9 +17,7 @@
 //! misallocation these tests would fail against loses 9-16 dB at
 //! mid-range budgets on the fixtures below.
 
-use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, EncodeOptions, IcerImage, IcerPixelFormat,
-};
+use oxideav_icer::{decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat};
 
 /// Deterministic textured Gray8 fixture (same generator as the §V.B
 /// transform-segmentation suite).
@@ -89,8 +87,8 @@ fn ample_budget_is_byte_identical_to_unbudgeted() {
                 if priority {
                     opts = opts.with_priority_interleaving();
                 }
-                let free = encode_icer(&img, &opts).unwrap();
-                let capped = encode_icer(&img, &opts.clone().with_byte_budget(1 << 20)).unwrap();
+                let free = encode(&img, &opts).unwrap();
+                let capped = encode(&img, &opts.clone().with_byte_budget(1 << 20)).unwrap();
                 assert_eq!(
                     free, capped,
                     "ample budget must be byte-identical (transform={} ixec={} prio={})",
@@ -111,9 +109,9 @@ fn mid_budget_feeds_every_segment() {
         strip_opts(4).with_byte_budget(500),
         transform_opts(4).with_byte_budget(500),
     ] {
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(bytes.len() as u64 <= 500);
-        let meta = parse_icer_metadata(&bytes).unwrap();
+        let meta = info(&bytes).unwrap();
         assert_eq!(meta.segments.len(), 4);
         for s in &meta.segments {
             assert!(
@@ -150,9 +148,9 @@ fn budget_quality_monotone_and_clears_floor() {
             } else {
                 strip_opts(4)
             };
-            let bytes = encode_icer(&img, &base.with_byte_budget(budget)).unwrap();
+            let bytes = encode(&img, &base.with_byte_budget(budget)).unwrap();
             assert!(bytes.len() as u64 <= budget);
-            let dec = parse_icer(&bytes).unwrap();
+            let dec = decode(&bytes).unwrap();
             let p = psnr(&img, &dec);
             let floor = if transform {
                 transform_floor
@@ -184,9 +182,9 @@ fn soft_target_lands_near_target() {
         } else {
             strip_opts(4)
         };
-        let free_len = encode_icer(&img, &base).unwrap().len() as u64;
+        let free_len = encode(&img, &base).unwrap().len() as u64;
         for target in [400u64, 900, 1600] {
-            let bytes = encode_icer(&img, &base.clone().with_target_bytes(target)).unwrap();
+            let bytes = encode(&img, &base.clone().with_target_bytes(target)).unwrap();
             let len = bytes.len() as u64;
             assert!(
                 len >= target.min(free_len),
@@ -199,7 +197,7 @@ fn soft_target_lands_near_target() {
                 len < free_len || free_len <= target,
                 "target {target} (transform={transform}): output {len} ran to lossless {free_len}"
             );
-            let dec = parse_icer(&bytes).unwrap();
+            let dec = decode(&bytes).unwrap();
             assert_eq!((dec.width, dec.height), (64, 64));
         }
     }
@@ -222,7 +220,7 @@ fn quota_composes_with_other_modes() {
     for base in variants {
         let mut prev = 0.0f64;
         for budget in [600u64, 1200, 2400] {
-            let bytes = encode_icer(&img, &base.clone().with_byte_budget(budget)).unwrap();
+            let bytes = encode(&img, &base.clone().with_byte_budget(budget)).unwrap();
             assert!(
                 bytes.len() as u64 <= budget,
                 "budget {budget} exceeded: {} (transform={} prio={} ixec={} M={})",
@@ -232,7 +230,7 @@ fn quota_composes_with_other_modes() {
                 base.interleaved_entropy,
                 base.min_loss
             );
-            let dec = parse_icer(&bytes).unwrap();
+            let dec = decode(&bytes).unwrap();
             assert_eq!((dec.width, dec.height), (64, 64));
             let p = psnr(&img, &dec);
             assert!(
@@ -256,9 +254,9 @@ fn quota_composes_with_other_modes() {
 fn roi_priorities_keep_sequential_scheduling() {
     let img = textured(64, 64, 0x2015);
     let opts = strip_opts(4).with_center_roi().with_byte_budget(900);
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(bytes.len() as u64 <= 900);
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 4);
     // Centre strips (ranks 0/1) must carry packets; with a 900-byte
     // budget the whole-segment greedy scheduler cannot fit all four,

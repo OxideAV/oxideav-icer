@@ -23,24 +23,24 @@
 use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket, ScanFilter};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
-use crate::image::{IcerImage, IcerPixelFormat, IcerPlane};
+use crate::image::{IcerImage, IcerPixelFormat, Plane};
 use crate::wavelet_int;
 
 /// A borrowed sample plane paired with its bit depth — the unit every
 /// single-plane encode path reads pixels through. Depth 8 reads one
-/// byte per sample; deeper formats ([`IcerPixelFormat::GrayDeep`])
+/// byte per sample; deeper formats ([`IcerPixelFormat::Gray16Le`])
 /// read little-endian `u16` pairs. The §III.A level shift and the
 /// §III.D raw-pixel body both derive from the depth, so threading the
 /// pair keeps every path (row strips, §V.B transform-domain, quota,
 /// R-D, fallback) depth-agnostic.
 #[derive(Clone, Copy)]
 pub(crate) struct PlaneView<'a> {
-    plane: &'a IcerPlane,
+    plane: &'a Plane,
     depth: u8,
 }
 
 impl<'a> PlaneView<'a> {
-    pub(crate) fn new(plane: &'a IcerPlane, depth: u8) -> Self {
+    pub(crate) fn new(plane: &'a Plane, depth: u8) -> Self {
         debug_assert!((8..=16).contains(&depth));
         Self { plane, depth }
     }
@@ -90,16 +90,34 @@ impl<'a> PlaneView<'a> {
     }
 }
 
-/// Encoder options.
+/// Encoder options for [`crate::encode`] / [`crate::encode_rgb8`] /
+/// [`crate::encode_rgba8`] / [`crate::encode_to`].
+///
+/// `EncodeOptions::default()` is the IPN 42-155 §III.D **uncompressed**
+/// path (raw samples through the segment framing — the baseline every
+/// round trip is byte-exact on); [`EncodeOptions::compressed`] turns on
+/// the wavelet + bit-plane + entropy pipeline (lossless with every
+/// filter unless a quota / quality goal truncates it). Every behaviour
+/// variant is a **field** with a `with_*` builder, never a function
+/// suffix; the struct is `#[non_exhaustive]`, so start from
+/// [`EncodeOptions::new`] / [`EncodeOptions::compressed`] and build.
 ///
 /// Note: this type is `Clone` (not `Copy`) because the
 /// [`Self::segment_priorities`] field carries an owned `Vec<u16>` when
-/// region-of-interest prioritisation is in use (round 6).
+/// region-of-interest prioritisation is in use.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodeOptions {
+    /// 16-bit segment sync prefix written to every segment header
+    /// (IPN 42-155 §IV leaves the literal value to the implementation;
+    /// the default is `0xACED`). Must be non-zero.
     pub sync_prefix: u16,
+    /// Reversible integer wavelet filter (IPN 42-155 §II.A Table 1);
+    /// default [`WaveletFilter::FilterQ`].
     pub filter: WaveletFilter,
+    /// Dyadic decomposition levels `D`, `1..=6` (§III.A); default 3.
     pub wavelet_levels: u8,
+    /// Bit-planes coded per subband, `1..=32` (§III.B); default 8.
     pub bit_plane_count: u8,
     /// Force the uncompressed-segment path (IPN 42-155 §III.D). When
     /// `false` the encoder runs the wavelet + bit-plane pipeline.
@@ -455,6 +473,11 @@ impl Default for EncodeOptions {
 }
 
 impl EncodeOptions {
+    /// The defaults (uncompressed §III.D path; see the type docs).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Convenience constructor: compressed-mode encoder with default
     /// filter `Q` + 3 dyadic levels.
     pub fn compressed() -> Self {
@@ -462,6 +485,59 @@ impl EncodeOptions {
             uncompressed: false,
             ..Self::default()
         }
+    }
+
+    /// Set [`Self::uncompressed`] (`false` selects the wavelet +
+    /// bit-plane pipeline).
+    #[must_use]
+    pub fn with_uncompressed(mut self, uncompressed: bool) -> Self {
+        self.uncompressed = uncompressed;
+        self
+    }
+
+    /// Set [`Self::sync_prefix`].
+    #[must_use]
+    pub fn with_sync_prefix(mut self, sync_prefix: u16) -> Self {
+        self.sync_prefix = sync_prefix;
+        self
+    }
+
+    /// Set [`Self::filter`] (clears the automatic filter selection).
+    #[must_use]
+    pub fn with_filter(mut self, filter: WaveletFilter) -> Self {
+        self.filter = filter;
+        self.auto_filter = false;
+        self.auto_filter_rd = false;
+        self
+    }
+
+    /// Set [`Self::wavelet_levels`].
+    #[must_use]
+    pub fn with_wavelet_levels(mut self, levels: u8) -> Self {
+        self.wavelet_levels = levels;
+        self
+    }
+
+    /// Set [`Self::bit_plane_count`].
+    #[must_use]
+    pub fn with_bit_plane_count(mut self, count: u8) -> Self {
+        self.bit_plane_count = count;
+        self
+    }
+
+    /// Set [`Self::segment_count`] (clears [`Self::auto_segments`]).
+    #[must_use]
+    pub fn with_segment_count(mut self, count: u16) -> Self {
+        self.segment_count = count;
+        self.auto_segments = None;
+        self
+    }
+
+    /// Set [`Self::rd_pruning`].
+    #[must_use]
+    pub fn with_rd_pruning(mut self, on: bool) -> Self {
+        self.rd_pruning = on;
+        self
     }
 
     /// Enable IPN 42-155 §V.C automatic segment-count selection for
@@ -704,15 +780,29 @@ impl EncodeOptions {
 /// runs one ICER instance per component), concatenated behind the small
 /// [`crate::plane_container`] header. The decoder
 /// ([`crate::decoder::parse_icer`]) dispatches on the leading sentinel.
+#[deprecated(note = "use oxideav_icer::encode (IMAGE_CRATE_API)")]
 pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    match image.pixel_format {
+    encode_image(image, opts)
+}
+
+/// The one encoder implementation behind [`crate::encode`] /
+/// [`crate::encode_to`] / [`crate::encode_rgb8`] / [`crate::encode_rgba8`]
+/// and the framework `Encoder`: validates the image geometry
+/// ([`IcerImage::validate`]) and dispatches on the layout — a bare
+/// segment stream for `Gray8`, the deep plane container for `Gray16Le`,
+/// three independent component streams behind the plane container for
+/// `Yuv444P` / `Gbrp8`. `color` and `metadata` cannot be carried and are
+/// ignored.
+pub(crate) fn encode_image(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
+    image.validate()?;
+    match image.format {
         IcerPixelFormat::Gray8 => encode_icer_single_plane(image, opts),
-        IcerPixelFormat::Yuv444P => encode_icer_multi_plane(image, opts),
-        IcerPixelFormat::GrayDeep { bits } => encode_icer_deep(image, bits, opts),
+        IcerPixelFormat::Yuv444P | IcerPixelFormat::Gbrp8 => encode_icer_multi_plane(image, opts),
+        IcerPixelFormat::Gray16Le => encode_icer_deep(image, image.bit_depth, opts),
     }
 }
 
-/// Encode a deep-sample ([`IcerPixelFormat::GrayDeep`]) grayscale image:
+/// Encode a deep-sample ([`IcerPixelFormat::Gray16Le`]) grayscale image:
 /// one single-plane segment stream whose coefficients span the deeper
 /// range, wrapped in the [`crate::plane_container`] deep-gray framing
 /// (format tag 2) that carries the bit depth the 12-byte segment header
@@ -762,7 +852,7 @@ fn encode_icer_deep(image: &IcerImage, bits: u8, opts: &EncodeOptions) -> Result
         body_opts.target_bytes = Some(t.saturating_sub(overhead));
     }
     let inner = encode_single_plane_body(image, &body_opts)?;
-    crate::plane_container::encode_container(image.pixel_format, &[inner])
+    crate::plane_container::encode_container(image.format, bits, &[inner])
 }
 
 /// Resolve [`EncodeOptions::auto_filter`] /
@@ -856,11 +946,11 @@ fn reject_quality_target_conflicts(opts: &EncodeOptions) -> Result<()> {
 /// behind the container header. This mirrors the deployed §III colour
 /// scheme: independent ICER instances sharing outer image metadata.
 fn encode_icer_multi_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    let n = image.pixel_format.plane_count();
+    let n = image.format.plane_count();
     if image.planes.len() != n {
         return Err(IcerError::invalid(format!(
             "image declares {:?} ({n} planes) but carries {}",
-            image.pixel_format,
+            image.format,
             image.planes.len()
         )));
     }
@@ -872,19 +962,21 @@ fn encode_icer_multi_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Ve
         let plane_image = IcerImage {
             width: image.width,
             height: image.height,
-            pixel_format: IcerPixelFormat::Gray8,
+            format: IcerPixelFormat::Gray8,
             planes: vec![plane.clone()],
-            pts: image.pts,
+            color: image.color,
+            metadata: crate::image::Metadata::default(),
+            bit_depth: 8,
         };
         plane_streams.push(encode_icer_single_plane(&plane_image, opts)?);
     }
-    crate::plane_container::encode_container(image.pixel_format, &plane_streams)
+    crate::plane_container::encode_container(image.format, 8, &plane_streams)
 }
 
 /// Encode a single-plane (Gray8) image. This is the historical
 /// `encode_icer` body; the wire form it produces is unchanged.
 fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
-    if image.pixel_format != IcerPixelFormat::Gray8 {
+    if image.format != IcerPixelFormat::Gray8 {
         return Err(IcerError::Unsupported(
             "single-plane encoder requires Gray8".into(),
         ));
@@ -925,7 +1017,7 @@ fn encode_single_plane_body(image: &IcerImage, opts: &EncodeOptions) -> Result<V
         .planes
         .first()
         .ok_or_else(|| IcerError::invalid("image has no planes"))?;
-    let view = PlaneView::new(plane, image.pixel_format.bit_depth());
+    let view = PlaneView::new(plane, image.bit_depth);
     let w = image.width as usize;
     let h = image.height as usize;
     if w == 0 || h == 0 {

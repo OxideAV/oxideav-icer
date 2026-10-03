@@ -7,10 +7,7 @@
 //! allowing); if all but `k` planes of a subband are encoded its pixels
 //! are in effect quantised with step `2^k` (§VI.A / §III.A).
 
-use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, walk_segment, EncodeOptions, IcerImage,
-    IcerPixelFormat,
-};
+use oxideav_icer::{decode, encode, info, walk_segment, EncodeOptions, IcerImage, IcerPixelFormat};
 
 fn textured(w: usize, h: usize, seed: u64) -> IcerImage {
     let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
@@ -48,8 +45,8 @@ fn mse(a: &IcerImage, b: &IcerImage) -> f64 {
 #[test]
 fn m0_is_wire_identical() {
     let img = textured(64, 64, 0x111);
-    let plain = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-    let m0 = encode_icer(&img, &EncodeOptions::compressed().with_min_loss(0)).unwrap();
+    let plain = encode(&img, &EncodeOptions::compressed()).unwrap();
+    let m0 = encode(&img, &EncodeOptions::compressed().with_min_loss(0)).unwrap();
     assert_eq!(plain, m0);
 }
 
@@ -62,8 +59,8 @@ fn min_loss_is_monotone_in_bytes_and_mse() {
     let mut last_mse = -1.0f64;
     for m in 0..=8u8 {
         let opts = EncodeOptions::compressed().with_min_loss(m);
-        let bytes = encode_icer(&img, &opts).unwrap();
-        let dec = parse_icer(&bytes).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
+        let dec = decode(&bytes).unwrap();
         let e = mse(&img, &dec);
         if m == 0 {
             assert_eq!(dec.planes[0].data, img.planes[0].data, "M = 0 is lossless");
@@ -81,8 +78,8 @@ fn min_loss_is_monotone_in_bytes_and_mse() {
         last_mse = e;
     }
     // The knob is real: M = 8 must be materially smaller than lossless.
-    let lossless = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-    let m8 = encode_icer(&img, &EncodeOptions::compressed().with_min_loss(8)).unwrap();
+    let lossless = encode(&img, &EncodeOptions::compressed()).unwrap();
+    let m8 = encode(&img, &EncodeOptions::compressed().with_min_loss(8)).unwrap();
     assert!(
         m8.len() * 2 < lossless.len(),
         "M = 8 ({}) should be well under half of lossless ({})",
@@ -96,7 +93,7 @@ fn min_loss_is_monotone_in_bytes_and_mse() {
 #[test]
 fn min_loss_is_on_every_packet_header() {
     let img = textured(32, 32, 0x333);
-    let bytes = encode_icer(&img, &EncodeOptions::compressed().with_min_loss(3)).unwrap();
+    let bytes = encode(&img, &EncodeOptions::compressed().with_min_loss(3)).unwrap();
     let walked = walk_segment(&bytes).unwrap();
     assert!(!walked.packets.is_empty());
     for p in &walked.packets {
@@ -111,8 +108,8 @@ fn min_loss_is_on_every_packet_header() {
 #[test]
 fn saturating_m_encodes_almost_nothing() {
     let img = textured(64, 64, 0x444);
-    let lossless = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-    let m_big = encode_icer(&img, &EncodeOptions::compressed().with_min_loss(11)).unwrap();
+    let lossless = encode(&img, &EncodeOptions::compressed()).unwrap();
+    let m_big = encode(&img, &EncodeOptions::compressed().with_min_loss(11)).unwrap();
     assert!(
         m_big.len() * 10 < lossless.len(),
         "M = B + D = 11 must encode almost nothing ({} vs {})",
@@ -120,7 +117,7 @@ fn saturating_m_encodes_almost_nothing() {
         lossless.len()
     );
     // And it still decodes cleanly to the full geometry.
-    let dec = parse_icer(&m_big).unwrap();
+    let dec = decode(&m_big).unwrap();
     assert_eq!((dec.width, dec.height), (64, 64));
 }
 
@@ -132,10 +129,10 @@ fn min_loss_composes_with_row_strips() {
     for m in [1u8, 3, 5] {
         let mut opts = EncodeOptions::compressed().with_min_loss(m);
         opts.segment_count = 4;
-        let bytes = encode_icer(&img, &opts).unwrap();
-        let dec = parse_icer(&bytes).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
+        let dec = decode(&bytes).unwrap();
         assert_eq!((dec.width, dec.height), (64, 64), "M = {m}");
-        let meta = parse_icer_metadata(&bytes).unwrap();
+        let meta = info(&bytes).unwrap();
         assert_eq!(meta.segments.len(), 4);
     }
 }
@@ -147,16 +144,16 @@ fn min_loss_composes_with_transform_segments() {
     let img = textured(64, 64, 0x666);
     let mut base = EncodeOptions::compressed().with_transform_domain_segments();
     base.segment_count = 4;
-    let m0 = encode_icer(&img, &base).unwrap();
-    let dec0 = parse_icer(&m0).unwrap();
+    let m0 = encode(&img, &base).unwrap();
+    let dec0 = decode(&m0).unwrap();
     assert_eq!(dec0.planes[0].data, img.planes[0].data);
 
     let mut last_bytes = usize::MAX;
     let mut last_mse = -1.0f64;
     for m in [0u8, 2, 4, 6] {
         let opts = base.clone().with_min_loss(m);
-        let bytes = encode_icer(&img, &opts).unwrap();
-        let dec = parse_icer(&bytes).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
+        let dec = decode(&bytes).unwrap();
         let e = mse(&img, &dec);
         assert!(bytes.len() <= last_bytes, "M = {m} transform bytes");
         assert!(e >= last_mse - 1e-9, "M = {m} transform MSE");
@@ -172,10 +169,10 @@ fn min_loss_composes_with_interleaved_backend() {
     let opts = EncodeOptions::compressed()
         .with_interleaved_entropy()
         .with_min_loss(3);
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert_eq!((dec.width, dec.height), (48, 48));
-    let plain = encode_icer(
+    let plain = encode(
         &img,
         &EncodeOptions::compressed().with_interleaved_entropy(),
     )
@@ -193,9 +190,9 @@ fn min_loss_composes_with_byte_budget() {
         let opts = EncodeOptions::compressed()
             .with_min_loss(2)
             .with_byte_budget(budget);
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(bytes.len() as u64 <= budget);
-        let dec = parse_icer(&bytes).unwrap();
+        let dec = decode(&bytes).unwrap();
         assert_eq!((dec.width, dec.height), (64, 64));
     }
 }
@@ -205,14 +202,15 @@ fn min_loss_composes_with_byte_budget() {
 fn min_loss_rejects_uncompressed_and_rd() {
     let img = textured(32, 32, 0x999);
     // Forced-uncompressed path has no bit planes.
-    let opts = EncodeOptions {
-        min_loss: 1,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.min_loss = 1;
+        o
     };
-    assert!(encode_icer(&img, &opts).is_err());
+    assert!(encode(&img, &opts).is_err());
     // R-D packet selection is a separate rate-control mode.
     let opts = EncodeOptions::compressed()
         .with_min_loss(1)
         .with_rd_budget(500);
-    assert!(encode_icer(&img, &opts).is_err());
+    assert!(encode(&img, &opts).is_err());
 }

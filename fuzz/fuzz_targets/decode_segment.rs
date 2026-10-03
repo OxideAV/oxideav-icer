@@ -7,10 +7,10 @@
 //! 1. [`oxideav_icer::walk_segment`] — single-segment framing parse;
 //!    surfaces header + packet boundaries without running the entropy
 //!    stage.
-//! 2. [`oxideav_icer::parse_icer_metadata`] — multi-segment walk
+//! 2. [`oxideav_icer::info`] — multi-segment walk
 //!    returning only header-level metadata for every segment in the
 //!    stream.
-//! 3. [`oxideav_icer::parse_icer`] — full decode (framing + arithmetic
+//! 3. [`oxideav_icer::decode`] — full decode (framing + arithmetic
 //!    coder + inverse wavelet + multi-segment stitch).
 //!
 //! The contract under test is that every entry point *returns* — a
@@ -22,7 +22,7 @@
 //! discarded.
 //!
 //! **Geometry budget.** A single 12-byte segment header can legitimately
-//! declare a geometry up to the [`DecodeLimits`] cap (64 MPx per segment
+//! declare a geometry up to the [`DecodeOptions`] cap (64 MPx per segment
 //! by default), and a *valid* compressed segment at that geometry runs
 //! the inverse DWT + bit-plane scan over the full coefficient buffer
 //! regardless of how few packet body bytes survive (this is the
@@ -32,28 +32,27 @@
 //! as a `slow-unit` and counts toward the run's wall-clock budget,
 //! drowning out the framing/entropy exploration the target is for.
 //!
-//! The harness uses a tight per-run [`DecodeLimits`] (1 MPx / segment,
+//! The harness uses a tight per-run [`DecodeOptions`] (1 MPx / segment,
 //! 4 MPx total) for the full-decode layer so each iteration stays in the
 //! millisecond range while still exercising the allocator, the inverse
 //! DWT, the arithmetic coder and the multi-segment stitch. The framing
-//! layers (`walk_segment`, `parse_icer_metadata`) are header-only and
+//! layers (`walk_segment`, `info`) are header-only and
 //! cheap at any geometry, so they keep the default-limits public entry
 //! points for coverage of the geometry-validation refusal path.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_icer::{
-    parse_icer3d_with_limits, parse_icer_lenient_with_limits, parse_icer_metadata,
-    parse_icer_with_limits, walk_segment, DecodeLimits,
+    parse_icer3d_with, parse_icer_lenient_with, info,
+    decode_with, walk_segment, DecodeOptions,
 };
 
 /// Per-iteration geometry budget. Far below the public 64 MPx default so
 /// a single crafted header cannot make one iteration dominate the run's
 /// wall-clock budget, but well above any geometry a realistic seed/corpus
 /// entry needs to drive the full decode path.
-const FUZZ_LIMITS: DecodeLimits = DecodeLimits {
-    max_pixels_per_segment: 1 << 20, // 1 MPx
-    max_total_pixels: 1 << 22,       // 4 MPx across all segments
-};
+fn fuzz_limits() -> DecodeOptions {
+    DecodeOptions::new().with_max_pixels_per_segment(1u64 << 20).with_max_pixels(1u64 << 22)
+}
 
 fuzz_target!(|data: &[u8]| {
     // Layer 1: pure framing on the first segment. Exercises
@@ -65,7 +64,7 @@ fuzz_target!(|data: &[u8]| {
     // (no pixel buffers materialised), so it is cheap at any geometry and
     // keeps coverage of the default-limits geometry-validation refusal
     // path the public API enforces.
-    let _ = parse_icer_metadata(data);
+    let _ = info(data);
 
     // Layer 3: full decode under the tight per-run geometry budget.
     // Drives the arithmetic coder + inverse wavelet + plane
@@ -73,14 +72,14 @@ fuzz_target!(|data: &[u8]| {
     // iteration in the millisecond range while still catching
     // attacker-controlled allocation sizing bugs and entropy-stage
     // panics.
-    let _ = parse_icer_with_limits(data, &FUZZ_LIMITS);
-    let _ = parse_icer_lenient_with_limits(data, &FUZZ_LIMITS);
+    let _ = decode_with(data, &fuzz_limits());
+    let _ = parse_icer_lenient_with(data, &fuzz_limits());
 
     // Layer 4: the ICER-3D cube decoder (IPN 42-164) under the same
     // tight budget — its 0x0000 + 0xC3 magic never collides with the
     // 2-D layers, so this costs nothing on non-cube inputs while giving
     // the cube framing parser + 3-D inverse DWT + spectral-context
     // bit-plane decoder full corpus coverage.
-    let _ = parse_icer3d_with_limits(data, &FUZZ_LIMITS);
-    let _ = oxideav_icer::parse_icer3d_lenient_with_limits(data, &FUZZ_LIMITS);
+    let _ = parse_icer3d_with(data, &fuzz_limits());
+    let _ = oxideav_icer::parse_icer3d_lenient_with(data, &fuzz_limits());
 });

@@ -2,8 +2,8 @@
 //!
 //! The round-199 `encode_roundtrip` cargo-fuzz target builds an
 //! `IcerImage` and an `EncodeOptions` from arbitrary fuzz bytes, calls
-//! [`encode_icer`], and self-roundtrips through both
-//! [`parse_icer`] and [`parse_icer_lenient`]. The full fuzz harness runs
+//! [`encode`], and self-roundtrips through both
+//! [`decode`] and [`parse_icer_lenient`]. The full fuzz harness runs
 //! daily off the cron in `.github/workflows/fuzz.yml`; this test runs
 //! the *same* extraction + drive logic on a small bank of hand-picked
 //! seed inputs every push so a regression in the encoder's
@@ -17,8 +17,7 @@
 //! (1x1, 1x128, 128x1).
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_lenient, EncodeOptions, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    decode, encode, parse_icer_lenient, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 const MAX_DIM: u32 = 128;
@@ -78,11 +77,16 @@ fn drive(data: &[u8]) -> bool {
     let deep = (data[2] & 0x10) != 0;
     let deep_bits = 9 + (data[2] >> 5);
     let pixel_format = if deep {
-        IcerPixelFormat::GrayDeep { bits: deep_bits }
+        IcerPixelFormat::Gray16Le
     } else {
         IcerPixelFormat::Gray8
     };
     let mut img = IcerImage::zeros(width, height, pixel_format);
+    if deep {
+        img = img
+            .with_bit_depth(deep_bits)
+            .expect("9..=16 is the deep range");
+    }
     if deep {
         let plane = &mut img.planes[0];
         if !pixel_src.is_empty() {
@@ -147,29 +151,28 @@ fn drive(data: &[u8]) -> bool {
         None
     };
 
-    let opts = EncodeOptions {
-        sync_prefix: 0xACED,
-        filter,
-        wavelet_levels,
-        bit_plane_count,
-        uncompressed,
-        segment_count,
-        byte_budget,
-        target_bytes,
-        auto_filter,
-        auto_filter_rd,
-        segment_priorities,
-        rd_pruning,
-        auto_uncompressed_fallback,
-        quality_target_psnr: None,
-        interleaved_entropy,
-        transform_segments: false,
-        min_loss: 0,
-        priority_interleaving,
-        auto_segments,
-    };
+    let mut opts = EncodeOptions::new();
+    opts.sync_prefix = 0xACED;
+    opts.filter = filter;
+    opts.wavelet_levels = wavelet_levels;
+    opts.bit_plane_count = bit_plane_count;
+    opts.uncompressed = uncompressed;
+    opts.segment_count = segment_count;
+    opts.byte_budget = byte_budget;
+    opts.target_bytes = target_bytes;
+    opts.auto_filter = auto_filter;
+    opts.auto_filter_rd = auto_filter_rd;
+    opts.segment_priorities = segment_priorities;
+    opts.rd_pruning = rd_pruning;
+    opts.auto_uncompressed_fallback = auto_uncompressed_fallback;
+    opts.quality_target_psnr = None;
+    opts.interleaved_entropy = interleaved_entropy;
+    opts.transform_segments = false;
+    opts.min_loss = 0;
+    opts.priority_interleaving = priority_interleaving;
+    opts.auto_segments = auto_segments;
 
-    let encoded = match encode_icer(&img, &opts) {
+    let encoded = match encode(&img, &opts) {
         Ok(b) => b,
         Err(_) => return true,
     };
@@ -201,12 +204,13 @@ fn drive(data: &[u8]) -> bool {
         );
     }
 
-    let decoded = parse_icer(&encoded).expect("strict decode of self-encoded stream failed");
+    let decoded = decode(&encoded).expect("strict decode of self-encoded stream failed");
     assert_eq!(decoded.width, width, "strict-decode width mismatch");
     assert_eq!(decoded.height, height, "strict-decode height mismatch");
     assert_eq!(
-        decoded.pixel_format, pixel_format,
-        "strict-decode pixel format flipped"
+        (decoded.format, decoded.bit_depth),
+        (pixel_format, img.bit_depth),
+        "strict-decode pixel format / depth flipped"
     );
 
     let _ = parse_icer_lenient(&encoded);

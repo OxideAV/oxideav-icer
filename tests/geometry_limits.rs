@@ -1,4 +1,4 @@
-//! A tight `DecodeLimits` bounds decode *compute*, not just allocation.
+//! A tight `DecodeOptions` bounds decode *compute*, not just allocation.
 //!
 //! Regression for a Fuzz-discovered slow-unit (denial-of-service surface):
 //! a 12-byte segment header can declare a multi-megapixel geometry that
@@ -6,18 +6,16 @@
 //! of inverse-DWT + bit-plane work — even when only a handful of packet
 //! body bytes follow (the progressive-truncation feature makes a tiny body
 //! legitimate). The two crash inputs declared ~34 MPx (4160×8240) and took
-//! 24–59 s through `parse_icer` / `parse_icer_lenient`.
+//! 24–59 s through `decode` / `parse_icer_lenient`.
 //!
-//! `parse_icer_with_limits` / `parse_icer_lenient_with_limits` let a
+//! `decode_with` / `parse_icer_lenient_with` let a
 //! caller bound the geometry the decoder will materialise *before* any
 //! pixel buffer is allocated or any DWT runs. A tight limit therefore
 //! turns the 50-second decode into a sub-millisecond refusal, which is the
 //! mechanism the `decode_segment` fuzz harness now uses so a single
 //! crafted header cannot dominate a fuzzing run's wall-clock budget.
 
-use oxideav_icer::{
-    parse_icer_lenient_with_limits, parse_icer_with_limits, DecodeLimits, IcerError,
-};
+use oxideav_icer::{decode_with, parse_icer_lenient_with, DecodeOptions, IcerError};
 use std::time::Instant;
 
 /// Build a 12-byte compressed-segment header declaring `width × height`,
@@ -40,18 +38,17 @@ fn giant_header(width: u16, height: u16, levels: u8, bit_planes: u8) -> Vec<u8> 
 #[test]
 fn tight_limits_reject_giant_geometry_fast() {
     let header = giant_header(4160, 8240, 6, 9);
-    let limits = DecodeLimits {
-        max_pixels_per_segment: 1 << 20, // 1 MPx
-        max_total_pixels: 1 << 22,
-    };
+    let limits = DecodeOptions::new()
+        .with_max_pixels_per_segment(1u64 << 20) // 1 MPx
+        .with_max_pixels(1u64 << 22);
 
     let t = Instant::now();
-    let strict = parse_icer_with_limits(&header, &limits);
-    let lenient = parse_icer_lenient_with_limits(&header, &limits);
+    let strict = decode_with(&header, &limits);
+    let lenient = parse_icer_lenient_with(&header, &limits);
     let dt = t.elapsed();
 
     assert!(
-        matches!(strict, Err(IcerError::Unsupported(_))),
+        matches!(strict, Err(IcerError::LimitExceeded(_))),
         "strict decode should refuse oversized geometry, got {strict:?}"
     );
     assert!(
@@ -70,13 +67,12 @@ fn tight_limits_reject_giant_geometry_fast() {
 fn tight_limits_admit_sub_cap_geometry() {
     // 512×512 = 256 KPx, comfortably under the 1 MPx tight cap.
     let header = giant_header(512, 512, 3, 4);
-    let limits = DecodeLimits {
-        max_pixels_per_segment: 1 << 20,
-        max_total_pixels: 1 << 22,
-    };
+    let limits = DecodeOptions::new()
+        .with_max_pixels_per_segment(1u64 << 20)
+        .with_max_pixels(1u64 << 22);
     // Zero-body compressed segment reconstructs as flat-128; the point is
     // that it is admitted (Ok) rather than refused.
-    let decoded = parse_icer_with_limits(&header, &limits).expect("sub-cap geometry must decode");
+    let decoded = decode_with(&header, &limits).expect("sub-cap geometry must decode");
     assert_eq!(decoded.width, 512);
     assert_eq!(decoded.height, 512);
 }

@@ -73,22 +73,58 @@
 //! context-pattern tables) the choice is documented + flagged as an
 //! interop risk for round 2.
 //!
-//! ## Standalone vs registry-integrated
+//! ## Standalone use (`IMAGE_CRATE_API`)
 //!
-//! With the default `registry` Cargo feature on, the crate exposes
-//! [`oxideav_core::Decoder`] / [`oxideav_core::Encoder`] trait impls
-//! plus a [`registry::register`] entry point against `oxideav-core`.
-//! With the feature off the crate ships only the standalone
-//! [`parse_icer`] / [`parse_icer_metadata`] / [`encode_icer`] API
-//! plus the local [`IcerImage`] / [`IcerError`] types, with no
-//! `oxideav-core` dep in the tree. Image-library consumers should
-//! depend on `oxideav-icer` with `default-features = false`.
+//! The crate exposes the OxideAV image-crate contract at its root —
+//! [`probe`], [`info`], [`decode`] / [`decode_with`] / [`decode_rgb8`] /
+//! [`decode_rgba8`] / [`decode_all`] / [`decode_from`], [`encode`] /
+//! [`encode_rgb8`] / [`encode_rgba8`] / [`encode_to`] / [`encode_all`] —
+//! around [`IcerImage`] (native layout, one [`Plane`] per component,
+//! [`ColorInfo`], [`Metadata`], the significant `bit_depth`),
+//! [`RgbImage`] / [`RgbaImage`], [`ImageInfo`], [`Frame`],
+//! [`DecodeOptions`], [`EncodeOptions`], [`PixelFormat`] (=
+//! [`IcerPixelFormat`], names mirroring `oxideav_core::PixelFormat`) and
+//! [`Error`] (= [`IcerError`]). It builds with `default-features = false`
+//! and no `oxideav-core`.
+//!
+//! ```
+//! let rgb = vec![0u8; 4 * 3 * 3];
+//! let bytes = oxideav_icer::encode_rgb8(4, 3, &rgb, &Default::default())?;
+//! assert!(oxideav_icer::probe(&bytes));
+//! let info = oxideav_icer::info(&bytes)?;                 // framing only
+//! assert_eq!((info.width, info.height, info.frames), (4, 3, 1));
+//! let img = oxideav_icer::decode(&bytes)?;                // IcerImage, native Gbrp8
+//! let rgba: Vec<u8> = img.to_rgba8();                     // 4 × width bytes per row
+//! let opts = oxideav_icer::EncodeOptions::compressed().with_segment_count(1);
+//! let out = oxideav_icer::encode_rgba8(img.width(), img.height(), &rgba, &opts)?;
+//! assert_eq!(oxideav_icer::decode_rgb8(&out)?.data, rgb);  // lossless
+//! # Ok::<(), oxideav_icer::Error>(())
+//! ```
+//!
+//! Native layouts: `Gray8` (bare segment stream), `Gray16Le` (exact
+//! `9..=16`-bit samples in little-endian words behind the deep plane
+//! container), `Yuv444P` and `Gbrp8` (three independent component
+//! streams). An ICER-3D cube decodes band by band through
+//! [`decode_all`]. The depth APIs — the segment walker, the wavelet /
+//! context / entropy stages, [`parse_icer_lenient`], the cube pipeline
+//! ([`encode_icer3d`] / [`parse_icer3d`]), the analysis helpers — keep
+//! their names.
+//!
+//! ## Framework use
+//!
+//! The default `registry` Cargo feature pulls in `oxideav-core` and
+//! exposes [`register`] (`RuntimeContext`), [`register_codecs`] /
+//! [`register_containers`], the [`make_decoder`] / [`make_encoder`]
+//! factories, and the frame bridge (`From<IcerImage> for VideoFrame`,
+//! `IcerImage::from_video_frame`). The trait-side `Decoder` / `Encoder`
+//! are thin adapters over the standalone functions.
 
 #![cfg_attr(not(feature = "registry"), allow(dead_code))]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::manual_div_ceil)]
 
 pub mod analyze;
+pub mod api;
 pub mod arith;
 pub mod bitplane;
 pub mod bitplane3d;
@@ -102,6 +138,7 @@ pub mod error;
 pub mod header;
 pub mod image;
 pub mod ixec;
+pub mod options;
 pub mod partition;
 pub mod plane_container;
 pub mod priority;
@@ -117,7 +154,20 @@ pub mod wavelet_int;
 /// the convention used by every other codec in the workspace.
 pub const CODEC_ID_STR: &str = "icer";
 
-// Standalone public surface — works whether or not `registry` is on.
+// ---- the contract surface (IMAGE_CRATE_API) ---------------------------------
+pub use api::{
+    decode, decode_all, decode_all_with, decode_from, decode_rgb8, decode_rgba8, decode_with,
+    encode, encode_all, encode_rgb8, encode_rgba8, encode_to, info, info_with, probe,
+};
+pub use encoder::EncodeOptions;
+pub use error::{Error, IcerError, Result};
+pub use image::{
+    ColorInfo, ColorRange, Frame, IcerImage, IcerPixelFormat, ImageInfo, Metadata, PixelFormat,
+    Plane, RgbImage, RgbaImage, StreamKind,
+};
+pub use options::DecodeOptions;
+
+// ---- depth APIs (keep their names) -------------------------------------------
 pub use analyze::{
     analyze, encode_to_quality_target, pick_filter_by_rate_distortion, psnr_db,
     quality_search_bounds, recommend_filter, recommend_segment_count, region_mae, ssim,
@@ -132,22 +182,18 @@ pub use context::{
     significance_context_subband, significance_context_table6, significance_context_table7,
 };
 pub use cube::{
-    encode_icer3d, is_cube, parse_icer3d, parse_icer3d_lenient, parse_icer3d_lenient_with_limits,
-    parse_icer3d_with_limits, CubeEncodeOptions, IcerCube, LenientCubeDecode,
+    encode_icer3d, is_cube, parse_icer3d, parse_icer3d_lenient, parse_icer3d_lenient_with,
+    parse_icer3d_with, CubeEncodeOptions, IcerCube, LenientCubeDecode,
 };
 pub use decoder::{
-    decode_uncompressed_icer, parse_icer, parse_icer_lenient, parse_icer_lenient_with_limits,
-    parse_icer_metadata, parse_icer_metadata_with_limits, parse_icer_with_limits, DecodeLimits,
-    IcerMetadata, LenientDecode, SegmentMetadata,
+    decode_uncompressed_icer, parse_icer_lenient, parse_icer_lenient_with, LenientDecode,
+    SegmentMetadata,
 };
-pub use encoder::{encode_icer, EncodeOptions};
 pub use entropy::EntropyKind;
-pub use error::{IcerError, Result};
 pub use header::{
     walk_segment, BitPlanePass, PacketHeader, SegmentHeader, WalkedPacket, WalkedSegment,
     WaveletFilter,
 };
-pub use image::{IcerImage, IcerPixelFormat, IcerPlane};
 pub use ixec::{
     bin_for_probability, bins, Bin, ComponentCode, InterleavedDecoder, InterleavedEncoder,
     IxecDecoder, IxecEncoder, BUFFER_WORDS,
@@ -169,8 +215,27 @@ pub use wavelet_int::{
     abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range,
 };
 
-// Registry-gated public surface.
+// ---- deprecated pre-contract entry points (one release) ----------------------
+#[allow(deprecated)]
+pub use cube::{parse_icer3d_lenient_with_limits, parse_icer3d_with_limits};
+#[allow(deprecated)]
+pub use decoder::{
+    parse_icer, parse_icer_lenient_with_limits, parse_icer_metadata,
+    parse_icer_metadata_with_limits, parse_icer_with_limits, IcerMetadata,
+};
+#[allow(deprecated)]
+pub use encoder::encode_icer;
+#[allow(deprecated)]
+pub use image::IcerPlane;
+#[allow(deprecated)]
+pub use options::DecodeLimits;
+
+// ---- registry-gated public surface -------------------------------------------
+#[cfg(feature = "registry")]
+#[doc(hidden)]
+pub use registry::__oxideav_entry;
 #[cfg(feature = "registry")]
 pub use registry::{
-    __oxideav_entry, register, register_codecs, register_containers, IcerDecoder, IcerEncoder,
+    from_core_pixel_format, make_decoder, make_encoder, register, register_codecs,
+    register_containers, to_core_pixel_format, IcerDecoder, IcerEncoder,
 };

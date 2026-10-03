@@ -9,8 +9,8 @@
 //! encoded.
 
 use oxideav_icer::{
-    encode_icer, ll_dimensions, parse_icer, parse_icer_lenient, parse_icer_metadata, partition,
-    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    decode, encode, info, ll_dimensions, parse_icer_lenient, partition, EncodeOptions, IcerImage,
+    IcerPixelFormat, WaveletFilter,
 };
 
 /// Deterministic textured Gray8 fixture.
@@ -56,10 +56,10 @@ fn lossless_roundtrip_filter_q() {
             if interleaved {
                 opts = opts.with_interleaved_entropy();
             }
-            let bytes = encode_icer(&img, &opts)
+            let bytes = encode(&img, &opts)
                 .unwrap_or_else(|e| panic!("{w}x{h}/{segs} L{levels} encode: {e}"));
-            let dec = parse_icer(&bytes)
-                .unwrap_or_else(|e| panic!("{w}x{h}/{segs} L{levels} decode: {e}"));
+            let dec =
+                decode(&bytes).unwrap_or_else(|e| panic!("{w}x{h}/{segs} L{levels} decode: {e}"));
             assert_eq!(dec.width as usize, w);
             assert_eq!(dec.height as usize, h);
             assert_eq!(
@@ -81,9 +81,9 @@ fn colour_roundtrip() {
         img.planes[p] = plane.planes[0].clone();
     }
     let opts = opts_transform(4);
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
-    assert_eq!(dec.pixel_format, IcerPixelFormat::Yuv444P);
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
+    assert_eq!(dec.format, IcerPixelFormat::Yuv444P);
     for p in 0..3 {
         assert_eq!(dec.planes[p].data, img.planes[p].data, "plane {p}");
     }
@@ -97,13 +97,13 @@ fn budget_respects_cap_and_geometry() {
     let img = textured(64, 64, 0xB4D9);
     for budget in [100u64, 300, 700, 1500] {
         let opts = opts_transform(4).with_byte_budget(budget);
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(
             bytes.len() as u64 <= budget,
             "budget {budget}: emitted {}",
             bytes.len()
         );
-        let dec = parse_icer(&bytes).unwrap();
+        let dec = decode(&bytes).unwrap();
         assert_eq!((dec.width, dec.height), (64, 64), "budget {budget}");
     }
 }
@@ -125,8 +125,8 @@ fn budget_quality_is_monotone() {
     let mut last = f64::INFINITY;
     for budget in [200u64, 500, 1000, 2000, 4000, 8000] {
         let opts = opts_transform(4).with_byte_budget(budget);
-        let bytes = encode_icer(&img, &opts).unwrap();
-        let dec = parse_icer(&bytes).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
+        let dec = decode(&bytes).unwrap();
         let e = mae(&dec);
         assert!(
             e <= last + 1e-9,
@@ -158,11 +158,11 @@ fn lenient_missing_segment_is_contained() {
     let img = textured(w, h, 0x10CA);
     let mut opts = opts_transform(segs as u16);
     opts.wavelet_levels = levels;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let full = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let full = decode(&bytes).unwrap();
     assert_eq!(full.planes[0].data, img.planes[0].data);
 
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), segs);
     // The §V.D partition the decoder recomputes, in image coordinates.
     let (w_ll, h_ll) = ll_dimensions(w, h, levels);
@@ -179,10 +179,7 @@ fn lenient_missing_segment_is_contained() {
         cut.extend_from_slice(&bytes[seg.offset + seg.byte_length..]);
 
         // Strict decode refuses the incomplete §V.D set.
-        assert!(
-            parse_icer(&cut).is_err(),
-            "strict must reject gap {drop_idx}"
-        );
+        assert!(decode(&cut).is_err(), "strict must reject gap {drop_idx}");
 
         let lenient = parse_icer_lenient(&cut).unwrap();
         assert_eq!(lenient.missing_count, 1);
@@ -231,14 +228,14 @@ fn lenient_missing_segment_is_contained() {
 #[test]
 fn mixed_mode_stream_is_rejected() {
     let img = textured(32, 32, 0x3113);
-    let transform = encode_icer(&img, &opts_transform(2)).unwrap();
-    let strip = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let transform = encode(&img, &opts_transform(2)).unwrap();
+    let strip = encode(&img, &EncodeOptions::compressed()).unwrap();
     let mut mixed = transform.clone();
     mixed.extend_from_slice(&strip);
-    assert!(parse_icer(&mixed).is_err());
+    assert!(decode(&mixed).is_err());
     let mut mixed2 = strip;
     mixed2.extend_from_slice(&transform);
-    assert!(parse_icer(&mixed2).is_err());
+    assert!(decode(&mixed2).is_err());
 }
 
 /// §V.D eq (9): the segment count must not exceed the LL pixel count.
@@ -248,7 +245,7 @@ fn eq9_violation_is_refused_at_encode() {
     let img = textured(16, 16, 0xE9);
     let mut opts = opts_transform(5);
     opts.wavelet_levels = 3;
-    assert!(encode_icer(&img, &opts).is_err());
+    assert!(encode(&img, &opts).is_err());
 }
 
 /// ROI segment priorities compose with the §V.B path: the emission
@@ -260,24 +257,24 @@ fn roi_priorities_compose() {
     // 4 segments; prioritise segment 3 first.
     let mut opts = opts_transform(4).with_segment_priorities(vec![1, 2, 3, 0]);
     opts.wavelet_levels = 3;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert_eq!(dec.planes[0].data, img.planes[0].data);
 
     // Tight budget: segment 3 (rank 0) must be a real segment while
     // rank-3 segment 0 degrades to a placeholder.
     let bytes_full_one = {
         let o = opts_transform(1);
-        encode_icer(&img, &o).unwrap().len() as u64
+        encode(&img, &o).unwrap().len() as u64
     };
     let tight = bytes_full_one / 3;
     let mut opts = opts_transform(4)
         .with_segment_priorities(vec![1, 2, 3, 0])
         .with_byte_budget(tight);
     opts.wavelet_levels = 3;
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(bytes.len() as u64 <= tight);
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     let len_of = |idx: u16| {
         meta.segments
             .iter()
@@ -298,7 +295,7 @@ fn roi_priorities_compose() {
         len_of(0)
     );
     // Geometry framed regardless.
-    let dec = parse_icer(&bytes).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert_eq!((dec.width, dec.height), (64, 64));
 }
 
@@ -306,8 +303,8 @@ fn roi_priorities_compose() {
 #[test]
 fn metadata_reports_transform_parameters() {
     let img = textured(48, 32, 0x77);
-    let bytes = encode_icer(&img, &opts_transform(3)).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&img, &opts_transform(3)).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 3);
     for (i, s) in meta.segments.iter().enumerate() {
         assert!(s.header.transform_segmented);
@@ -326,8 +323,8 @@ fn filter_a_bit_exact() {
     let img = textured(64, 64, 0xF17A);
     let mut opts = opts_transform(4);
     opts.filter = WaveletFilter::FilterA;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert_eq!(
         dec.planes[0].data, img.planes[0].data,
         "filter-A transform-domain full-quality decode must be bit-exact (§II.A)"

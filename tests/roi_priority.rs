@@ -19,9 +19,7 @@
 //!   * Invalid priority vectors (wrong length, out-of-range entry,
 //!     duplicate rank) are rejected at encode time.
 
-use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, EncodeOptions, IcerImage, IcerPixelFormat,
-};
+use oxideav_icer::{decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat};
 
 /// Build a 256x128 8-bit gray image whose top, middle, and bottom
 /// strips have distinctive content. The middle strip carries a
@@ -55,9 +53,10 @@ fn with_center_roi_orders_segments_outward() {
     // priorities[seg_idx]: seg 2 -> 0, seg 1 -> 1, seg 3 -> 2,
     //                      seg 0 -> 3, seg 4 -> 4.
     let opts = EncodeOptions::compressed();
-    let opts = EncodeOptions {
-        segment_count: 5,
-        ..opts
+    let opts = {
+        let mut o = opts;
+        o.segment_count = 5;
+        o
     }
     .with_center_roi();
     assert_eq!(
@@ -71,9 +70,10 @@ fn with_center_roi_orders_segments_outward_even() {
     // segment_count = 4 -> mid = (4-1)/2 = 1
     // priorities[seg_idx]: seg 1 -> 0, seg 0 -> 1, seg 2 -> 2, seg 3 -> 3.
     let opts = EncodeOptions::compressed();
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..opts
+    let opts = {
+        let mut o = opts;
+        o.segment_count = 4;
+        o
     }
     .with_center_roi();
     assert_eq!(
@@ -96,38 +96,41 @@ fn permuted_emission_roundtrips_bit_exact_filter_q() {
     let image = striped_test_image(64, 64);
 
     // Baseline: index-order emission.
-    let opts_baseline = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts_baseline = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     };
-    let encoded_baseline = encode_icer(&image, &opts_baseline).expect("baseline encode");
-    let decoded_baseline = parse_icer(&encoded_baseline).expect("baseline decode");
+    let encoded_baseline = encode(&image, &opts_baseline).expect("baseline encode");
+    let decoded_baseline = decode(&encoded_baseline).expect("baseline decode");
     assert_eq!(
         decoded_baseline.planes[0].data, image.planes[0].data,
         "baseline (index-order) must be bit-exact for filter Q"
     );
 
     // Centre-out priorities.
-    let opts_centre = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts_centre = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_center_roi();
-    let encoded_centre = encode_icer(&image, &opts_centre).expect("centre encode");
-    let decoded_centre = parse_icer(&encoded_centre).expect("centre decode");
+    let encoded_centre = encode(&image, &opts_centre).expect("centre encode");
+    let decoded_centre = decode(&encoded_centre).expect("centre decode");
     assert_eq!(
         decoded_centre.planes[0].data, image.planes[0].data,
         "centre-priority emission must be bit-exact for filter Q"
     );
 
     // Reverse priorities (priority vector [3, 2, 1, 0] -> segment 3 first).
-    let opts_reverse = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts_reverse = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_segment_priorities(vec![3, 2, 1, 0]);
-    let encoded_reverse = encode_icer(&image, &opts_reverse).expect("reverse encode");
-    let decoded_reverse = parse_icer(&encoded_reverse).expect("reverse decode");
+    let encoded_reverse = encode(&image, &opts_reverse).expect("reverse encode");
+    let decoded_reverse = decode(&encoded_reverse).expect("reverse decode");
     assert_eq!(
         decoded_reverse.planes[0].data, image.planes[0].data,
         "reverse-priority emission must be bit-exact for filter Q"
@@ -139,14 +142,15 @@ fn permuted_emission_writes_segments_in_priority_order() {
     // Verify the on-the-wire ordering: with priorities [3, 2, 1, 0],
     // the first segment in the byte stream should carry segment_index = 3.
     let image = striped_test_image(64, 64);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_segment_priorities(vec![3, 2, 1, 0]);
-    let encoded = encode_icer(&image, &opts).expect("encode");
+    let encoded = encode(&image, &opts).expect("encode");
 
-    let meta = parse_icer_metadata(&encoded).expect("metadata parse");
+    let meta = info(&encoded).expect("metadata parse");
     assert_eq!(meta.segments.len(), 4, "expected 4 segments");
 
     let on_wire_indices: Vec<u16> = meta
@@ -180,13 +184,14 @@ fn center_roi_preserves_centre_under_tight_budget() {
     // encode is ~875 B on this fixture (measured); 900 keeps exactly
     // segment 1 and drops the rest to placeholders.
     let budget = 900u64;
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_center_roi()
     .with_byte_budget(budget);
-    let encoded = encode_icer(&image, &opts).expect("encode");
+    let encoded = encode(&image, &opts).expect("encode");
     assert!(
         encoded.len() as u64 <= budget,
         "encoded {} bytes exceeds budget {}",
@@ -194,12 +199,12 @@ fn center_roi_preserves_centre_under_tight_budget() {
         budget
     );
 
-    let decoded = parse_icer(&encoded).expect("decode");
+    let decoded = decode(&encoded).expect("decode");
     assert_eq!(decoded.width, w);
     assert_eq!(decoded.height, h);
 
     // Recover which segment_index values made it into the stream.
-    let meta = parse_icer_metadata(&encoded).expect("metadata");
+    let meta = info(&encoded).expect("metadata");
     let kept: std::collections::BTreeSet<u16> = meta
         .segments
         .iter()
@@ -257,12 +262,13 @@ fn center_roi_preserves_centre_under_tight_budget() {
 #[test]
 fn invalid_priorities_wrong_length_rejected() {
     let image = striped_test_image(16, 16);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_segment_priorities(vec![0, 1, 2]); // length 3 != segment_count 4
-    let err = encode_icer(&image, &opts).expect_err("should reject wrong-length priorities");
+    let err = encode(&image, &opts).expect_err("should reject wrong-length priorities");
     let msg = format!("{err}");
     assert!(
         msg.contains("segment_priorities length"),
@@ -273,12 +279,13 @@ fn invalid_priorities_wrong_length_rejected() {
 #[test]
 fn invalid_priorities_out_of_range_rejected() {
     let image = striped_test_image(16, 16);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_segment_priorities(vec![0, 1, 2, 7]); // 7 >= 4
-    let err = encode_icer(&image, &opts).expect_err("should reject out-of-range priority");
+    let err = encode(&image, &opts).expect_err("should reject out-of-range priority");
     let msg = format!("{err}");
     assert!(
         msg.contains("out of range"),
@@ -289,12 +296,13 @@ fn invalid_priorities_out_of_range_rejected() {
 #[test]
 fn invalid_priorities_duplicate_rank_rejected() {
     let image = striped_test_image(16, 16);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_segment_priorities(vec![0, 0, 1, 2]); // rank 0 twice
-    let err = encode_icer(&image, &opts).expect_err("should reject duplicate priority");
+    let err = encode(&image, &opts).expect_err("should reject duplicate priority");
     let msg = format!("{err}");
     assert!(
         msg.contains("more than once"),
@@ -306,16 +314,17 @@ fn invalid_priorities_duplicate_rank_rejected() {
 fn priorities_compose_with_uncompressed_path() {
     // Uncompressed multi-segment with priorities should still round-trip.
     let image = striped_test_image(32, 16);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        uncompressed: true,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.segment_count = 4;
+        o.uncompressed = true;
+        o
     }
     .with_segment_priorities(vec![3, 2, 1, 0]);
-    let encoded = encode_icer(&image, &opts).expect("encode");
+    let encoded = encode(&image, &opts).expect("encode");
 
     // Wire-order should be segment indices [3, 2, 1, 0].
-    let meta = parse_icer_metadata(&encoded).expect("metadata");
+    let meta = info(&encoded).expect("metadata");
     let on_wire: Vec<u16> = meta
         .segments
         .iter()
@@ -324,6 +333,6 @@ fn priorities_compose_with_uncompressed_path() {
     assert_eq!(on_wire, vec![3, 2, 1, 0]);
 
     // Decoder stitches by index, so output must match input.
-    let decoded = parse_icer(&encoded).expect("decode");
+    let decoded = decode(&encoded).expect("decode");
     assert_eq!(decoded.planes[0].data, image.planes[0].data);
 }

@@ -16,32 +16,15 @@
 //! placeholder strip at the correct row offset (flat-128) so geometry is
 //! always preserved.
 
-use oxideav_icer::{
-    encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
-};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
 
 fn base_opts() -> EncodeOptions {
-    EncodeOptions {
-        sync_prefix: 0xACED,
-        filter: WaveletFilter::FilterB,
-        wavelet_levels: 1,
-        bit_plane_count: 1,
-        uncompressed: false,
-        segment_count: 16,
-        byte_budget: None,
-        target_bytes: None,
-        auto_filter: false,
-        auto_filter_rd: false,
-        segment_priorities: None,
-        rd_pruning: false,
-        auto_uncompressed_fallback: false,
-        quality_target_psnr: None,
-        interleaved_entropy: false,
-        transform_segments: false,
-        min_loss: 0,
-        priority_interleaving: false,
-        auto_segments: None,
-    }
+    EncodeOptions::compressed()
+        .with_sync_prefix(0xACED)
+        .with_filter(WaveletFilter::FilterB)
+        .with_wavelet_levels(1)
+        .with_bit_plane_count(1)
+        .with_segment_count(16)
 }
 
 /// The exact Fuzz crash input: 128x64 flat-black, FilterB, 1 level, 16
@@ -53,15 +36,15 @@ fn tight_budget_preserves_geometry_fuzz_repro() {
     let mut opts = base_opts();
     opts.byte_budget = Some(38);
 
-    let encoded = encode_icer(&img, &opts).expect("encode");
-    let decoded = parse_icer(&encoded).expect("strict decode of self-encoded stream");
+    let encoded = encode(&img, &opts).expect("encode");
+    let decoded = decode(&encoded).expect("strict decode of self-encoded stream");
 
     assert_eq!(decoded.width, w, "width must be preserved");
     assert_eq!(
         decoded.height, h,
         "height must be preserved even when every strip is dropped to a placeholder"
     );
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::Gray8);
+    assert_eq!(decoded.format, IcerPixelFormat::Gray8);
 }
 
 /// Sweep a range of budgets from "frame-only" up to "fits everything":
@@ -86,10 +69,10 @@ fn budget_sweep_always_preserves_geometry() {
         opts.segment_count = seg_count;
         opts.byte_budget = Some(budget);
 
-        let encoded = encode_icer(&img, &opts)
+        let encoded = encode(&img, &opts)
             .unwrap_or_else(|e| panic!("encode failed at budget {budget}: {e:?}"));
-        let decoded = parse_icer(&encoded)
-            .unwrap_or_else(|e| panic!("decode failed at budget {budget}: {e:?}"));
+        let decoded =
+            decode(&encoded).unwrap_or_else(|e| panic!("decode failed at budget {budget}: {e:?}"));
         assert_eq!(decoded.width, w, "width at budget {budget}");
         assert_eq!(decoded.height, h, "height at budget {budget}");
 
@@ -118,8 +101,8 @@ fn unbudgeted_multi_segment_unchanged() {
     opts.bit_plane_count = 8;
     opts.segment_count = 8;
 
-    let encoded = encode_icer(&img, &opts).expect("encode");
-    let decoded = parse_icer(&encoded).expect("decode");
+    let encoded = encode(&img, &opts).expect("encode");
+    let decoded = decode(&encoded).expect("decode");
     assert_eq!(decoded.width, w);
     assert_eq!(decoded.height, h);
 }
@@ -139,18 +122,19 @@ fn single_segment_uncompressed_respects_budget() {
     for (i, p) in img.planes[0].data.iter_mut().enumerate() {
         *p = (i % 251) as u8;
     }
-    let opts = EncodeOptions {
-        segment_count: 1,
-        byte_budget: Some(1537),
-        ..EncodeOptions::default() // default = uncompressed forced
+    let opts = {
+        let mut o = EncodeOptions::default(); // default = uncompressed forced
+        o.segment_count = 1;
+        o.byte_budget = Some(1537);
+        o
     };
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     assert!(
         bytes.len() as u64 <= 1537,
         "budget blown: {} bytes",
         bytes.len()
     );
-    let decoded = parse_icer(&bytes).expect("decode placeholder stream");
+    let decoded = decode(&bytes).expect("decode placeholder stream");
     assert_eq!(decoded.width, w);
     assert_eq!(decoded.height, h);
     assert!(
@@ -159,13 +143,14 @@ fn single_segment_uncompressed_respects_budget() {
     );
 
     // A budget that does fit keeps the exact uncompressed emission.
-    let roomy = EncodeOptions {
-        segment_count: 1,
-        byte_budget: Some(20_000),
-        ..EncodeOptions::default()
+    let roomy = {
+        let mut o = EncodeOptions::default();
+        o.segment_count = 1;
+        o.byte_budget = Some(20_000);
+        o
     };
-    let full = encode_icer(&img, &roomy).expect("encode roomy");
+    let full = encode(&img, &roomy).expect("encode roomy");
     assert!(full.len() > 16_000);
-    let decoded = parse_icer(&full).expect("decode full");
+    let decoded = decode(&full).expect("decode full");
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }

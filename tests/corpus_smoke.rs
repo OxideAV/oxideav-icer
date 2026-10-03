@@ -7,15 +7,15 @@
 //! input fails CI immediately instead of waiting for the cron.
 
 use oxideav_icer::{
-    parse_icer3d_with_limits, parse_icer_lenient_with_limits, parse_icer_metadata,
-    parse_icer_with_limits, walk_segment, DecodeLimits,
+    decode_with, info, parse_icer3d_with, parse_icer_lenient_with, walk_segment, DecodeOptions,
 };
 
 /// Same tight per-iteration geometry budget the fuzz target uses.
-const FUZZ_LIMITS: DecodeLimits = DecodeLimits {
-    max_pixels_per_segment: 1 << 20,
-    max_total_pixels: 1 << 22,
-};
+fn fuzz_limits() -> DecodeOptions {
+    DecodeOptions::new()
+        .with_max_pixels_per_segment(1u64 << 20)
+        .with_max_pixels(1u64 << 22)
+}
 
 #[test]
 fn decode_segment_corpus_is_panic_free() {
@@ -28,11 +28,11 @@ fn decode_segment_corpus_is_panic_free() {
         }
         let data = std::fs::read(&path).expect("read corpus entry");
         let _ = walk_segment(&data);
-        let _ = parse_icer_metadata(&data);
-        let _ = parse_icer_with_limits(&data, &FUZZ_LIMITS);
-        let _ = parse_icer_lenient_with_limits(&data, &FUZZ_LIMITS);
-        let _ = parse_icer3d_with_limits(&data, &FUZZ_LIMITS);
-        let _ = oxideav_icer::parse_icer3d_lenient_with_limits(&data, &FUZZ_LIMITS);
+        let _ = info(&data);
+        let _ = decode_with(&data, &fuzz_limits());
+        let _ = parse_icer_lenient_with(&data, &fuzz_limits());
+        let _ = parse_icer3d_with(&data, &fuzz_limits());
+        let _ = oxideav_icer::parse_icer3d_lenient_with(&data, &fuzz_limits());
         driven += 1;
     }
     // The corpus ships with the crate; a checkout that lost it should

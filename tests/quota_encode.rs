@@ -7,7 +7,7 @@
 //! `EncodeOptions::with_byte_budget` and `EncodeOptions::with_target_bytes`
 //! builder methods.
 
-use oxideav_icer::{encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat};
 
 /// Build a 256x256 8-bit gray gradient image where pixel (x, y) =
 /// ((x + y * 256 / 255) & 0xFF), producing a smooth diagonal ramp.
@@ -66,7 +66,7 @@ fn budget_respected_and_decodable() {
 
     for &budget in budgets {
         let opts = EncodeOptions::compressed().with_byte_budget(budget);
-        let encoded = encode_icer(&image, &opts).expect("encode failed");
+        let encoded = encode(&image, &opts).expect("encode failed");
 
         assert!(
             encoded.len() as u64 <= budget,
@@ -74,7 +74,7 @@ fn budget_respected_and_decodable() {
             encoded.len()
         );
 
-        let decoded = parse_icer(&encoded).expect("decode failed");
+        let decoded = decode(&encoded).expect("decode failed");
         assert_eq!(decoded.width, 256, "budget={budget}: width mismatch");
         assert_eq!(decoded.height, 256, "budget={budget}: height mismatch");
 
@@ -122,12 +122,12 @@ fn budget_psnr_thresholds() {
 
     for &(budget, min_psnr) in cases {
         let opts = EncodeOptions::compressed().with_byte_budget(budget);
-        let encoded = encode_icer(&image, &opts).expect("encode failed");
+        let encoded = encode(&image, &opts).expect("encode failed");
         assert!(
             encoded.len() as u64 <= budget,
             "budget={budget}: output exceeds budget"
         );
-        let decoded = parse_icer(&encoded).expect("decode failed");
+        let decoded = decode(&encoded).expect("decode failed");
         let p = psnr(&image, &decoded);
         // PSNR may be f64::INFINITY for a lossless round-trip; treat
         // that as passing any finite threshold.
@@ -155,7 +155,7 @@ fn soft_target_with_hard_cap() {
         .with_target_bytes(8192)
         .with_byte_budget(10_000);
 
-    let encoded = encode_icer(&image, &opts).expect("encode failed");
+    let encoded = encode(&image, &opts).expect("encode failed");
     let len = encoded.len();
 
     // Hard cap: must not exceed 10 000 bytes.
@@ -171,7 +171,7 @@ fn soft_target_with_hard_cap() {
         "output {len} bytes too small (soft target not working?)"
     );
 
-    let decoded = parse_icer(&encoded).expect("decode failed");
+    let decoded = decode(&encoded).expect("decode failed");
     assert_eq!(decoded.width, 256);
     assert_eq!(decoded.height, 256);
     let p = psnr(&image, &decoded);
@@ -186,7 +186,7 @@ fn soft_target_only() {
     let image = gradient_256x256();
     let opts = EncodeOptions::compressed().with_target_bytes(4096);
 
-    let encoded = encode_icer(&image, &opts).expect("encode failed");
+    let encoded = encode(&image, &opts).expect("encode failed");
     let len = encoded.len();
 
     // The encoder finishes the current bit-plane pair after crossing
@@ -198,7 +198,7 @@ fn soft_target_only() {
         "output {len} bytes is more than 2× the soft target 4096"
     );
 
-    let decoded = parse_icer(&encoded).expect("decode failed");
+    let decoded = decode(&encoded).expect("decode failed");
     let p = psnr(&image, &decoded);
     eprintln!("soft_target_only: {len} bytes, PSNR={p:.2} dB");
     assert!(p >= 12.0, "soft_target_only PSNR {p:.2} dB too low");
@@ -216,7 +216,7 @@ fn budget_header_only_decodes() {
     let image = gradient_256x256();
     // 12 bytes = segment header only; no packets can fit.
     let opts = EncodeOptions::compressed().with_byte_budget(12);
-    let encoded = encode_icer(&image, &opts).expect("encode should succeed even with tiny budget");
+    let encoded = encode(&image, &opts).expect("encode should succeed even with tiny budget");
 
     // Only the segment header should be emitted.
     assert_eq!(
@@ -228,7 +228,7 @@ fn budget_header_only_decodes() {
     // The decoder sees a valid segment header with segment_length=0 and
     // no packets. It should decode to a flat (all-zero coefficient)
     // image that clamps to 128 after the inverse level-shift.
-    let decoded = parse_icer(&encoded).expect("decode should succeed");
+    let decoded = decode(&encoded).expect("decode should succeed");
     assert_eq!(decoded.width, 256);
     assert_eq!(decoded.height, 256);
     // All pixels should be 128 (level-shifted zero coefficients).
@@ -246,8 +246,8 @@ fn budget_header_only_decodes() {
 fn no_budget_full_roundtrip() {
     let image = gradient_256x256();
     let opts = EncodeOptions::compressed();
-    let encoded = encode_icer(&image, &opts).expect("encode failed");
-    let decoded = parse_icer(&encoded).expect("decode failed");
+    let encoded = encode(&image, &opts).expect("encode failed");
+    let decoded = decode(&encoded).expect("decode failed");
     // Filter Q (integer 5/3) must be lossless.
     assert_eq!(
         decoded.planes[0].data, image.planes[0].data,
@@ -278,7 +278,7 @@ fn textured_64x64() -> IcerImage {
 }
 
 /// End-to-end check that the §III.A deadzone mid-bin reconstruction
-/// point is wired through `parse_icer`: a byte-budget-truncated stream
+/// point is wired through `decode`: a byte-budget-truncated stream
 /// still decodes to a sensible image, and the *full*-budget filter-Q
 /// path stays bit-exact (the b = 0 case where the mid-bin offset is
 /// zero, so the lossless guarantee is preserved).
@@ -290,9 +290,9 @@ fn deadzone_reconstruction_end_to_end() {
     // so the surviving significant coefficients are reconstructed via
     // the §III.A mid-bin point rather than the bin lower edge.
     let opts = EncodeOptions::compressed().with_byte_budget(512);
-    let encoded = encode_icer(&image, &opts).expect("budgeted encode failed");
+    let encoded = encode(&image, &opts).expect("budgeted encode failed");
     assert!(encoded.len() <= 512, "budget respected");
-    let decoded = parse_icer(&encoded).expect("truncated decode failed");
+    let decoded = decode(&encoded).expect("truncated decode failed");
     assert_eq!(decoded.width, 64);
     assert_eq!(decoded.height, 64);
     // The truncated reconstruction must be a real approximation, not the
@@ -308,8 +308,8 @@ fn deadzone_reconstruction_end_to_end() {
     // Full budget: filter Q is lossless and b = 0 keeps the mid-bin
     // offset at zero, so the round-trip is bit-exact -- the deadzone
     // change does not perturb the untruncated path.
-    let full = encode_icer(&image, &EncodeOptions::compressed()).expect("full encode failed");
-    let full_dec = parse_icer(&full).expect("full decode failed");
+    let full = encode(&image, &EncodeOptions::compressed()).expect("full encode failed");
+    let full_dec = decode(&full).expect("full decode failed");
     assert_eq!(
         full_dec.planes[0].data, image.planes[0].data,
         "untruncated filter-Q decode stays bit-exact"

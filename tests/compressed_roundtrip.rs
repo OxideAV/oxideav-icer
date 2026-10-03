@@ -2,8 +2,7 @@
 //! decode pipeline plus the multi-segment demuxer.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, EncodeOptions, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {
@@ -34,8 +33,8 @@ fn smooth_image(w: u32, h: u32) -> IcerImage {
 fn compressed_roundtrip_smooth_image_is_bit_exact() {
     let original = smooth_image(16, 16);
     let opts = EncodeOptions::compressed();
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.width, 16);
     assert_eq!(decoded.height, 16);
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
@@ -46,15 +45,16 @@ fn compressed_roundtrip_ramp_image_filter_q_is_bit_exact() {
     // Filter Q (integer 5/3) is reversible — the round-trip must be
     // bit-exact even for a non-trivial image.
     let original = ramp_image(8, 8);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(
         decoded.planes[0].data, original.planes[0].data,
         "filter Q lossless round-trip must be bit-exact"
@@ -65,8 +65,8 @@ fn compressed_roundtrip_ramp_image_filter_q_is_bit_exact() {
 fn compressed_segment_metadata_marks_compressed_flag() {
     let original = smooth_image(16, 16);
     let opts = EncodeOptions::compressed();
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 1);
     assert!(!meta.segments[0].header.uncompressed);
 }
@@ -77,15 +77,16 @@ fn compressed_roundtrip_filter_a_is_bit_exact() {
     // transforms: a full-quality round-trip must be bit-exact, exactly
     // like filter Q.
     let original = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 12,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 12;
+        o.uncompressed = false;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(
         decoded.planes[0].data, original.planes[0].data,
         "filter A lossless round-trip must be bit-exact (§II.A)"
@@ -96,14 +97,15 @@ fn compressed_roundtrip_filter_a_is_bit_exact() {
 fn multi_segment_roundtrip_uncompressed() {
     // Build a 32x32 image and encode as 4 horizontal-strip segments.
     let original = ramp_image(32, 32);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.segment_count = 4;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 4, "should produce 4 segments");
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.width, 32);
     assert_eq!(decoded.height, 32);
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
@@ -112,27 +114,29 @@ fn multi_segment_roundtrip_uncompressed() {
 #[test]
 fn multi_segment_roundtrip_compressed() {
     let original = smooth_image(32, 32);
-    let opts = EncodeOptions {
-        segment_count: 2,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.segment_count = 2;
+        o.uncompressed = false;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 2);
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes[0].data, original.planes[0].data);
 }
 
 #[test]
 fn multi_segment_indices_are_sequential() {
     let original = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.segment_count = 4;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     for (i, s) in meta.segments.iter().enumerate() {
         assert_eq!(
             s.header.segment_index as usize, i,
@@ -148,8 +152,8 @@ fn compressed_payload_smaller_than_uncompressed_for_smooth_image() {
     // a friendly image. For pure constant-grey, the entropy stage
     // should produce far fewer bytes than the raw 256-byte payload.
     let img = smooth_image(16, 16);
-    let unc = encode_icer(&img, &EncodeOptions::default()).unwrap();
-    let cmp = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let unc = encode(&img, &EncodeOptions::default()).unwrap();
+    let cmp = encode(&img, &EncodeOptions::compressed()).unwrap();
     assert!(
         cmp.len() < unc.len(),
         "compressed {} bytes should beat uncompressed {} bytes on a constant image",
@@ -163,15 +167,16 @@ fn compressed_roundtrip_filter_q_multi_packet_metadata() {
     // Verify that the multi-packet encoder produces more than one packet
     // per segment when using filter Q (one pair per bit-plane).
     let original = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: 2,
-        bit_plane_count: 4,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 4;
+        o.uncompressed = false;
+        o
     };
-    let bytes = encode_icer(&original, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&original, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 1);
     // Each bit-plane produces 2 packets (significance + refinement).
     // With q=4 bit-planes minimum, we expect at least 8 packets.
@@ -198,15 +203,16 @@ fn compressed_roundtrip_all_filters_bit_exact() {
             WaveletFilter::FilterE,
             WaveletFilter::FilterF,
         ] {
-            let opts = EncodeOptions {
-                filter,
-                wavelet_levels: 2,
-                bit_plane_count: 10,
-                uncompressed: false,
-                ..EncodeOptions::default()
+            let opts = {
+                let mut o = EncodeOptions::default();
+                o.filter = filter;
+                o.wavelet_levels = 2;
+                o.bit_plane_count = 10;
+                o.uncompressed = false;
+                o
             };
-            let bytes = encode_icer(&original, &opts).unwrap();
-            let decoded = parse_icer(&bytes).unwrap();
+            let bytes = encode(&original, &opts).unwrap();
+            let decoded = decode(&bytes).unwrap();
             assert_eq!(
                 decoded.planes[0].data, original.planes[0].data,
                 "filter {filter:?} lossless round-trip must be bit-exact (§II.A)"
@@ -221,16 +227,17 @@ fn multi_segment_compressed_all_filters() {
     // filter; Q and F bracket the Table 1 parameter range.
     for filter in [WaveletFilter::FilterQ, WaveletFilter::FilterF] {
         let original = ramp_image(16, 16);
-        let opts = EncodeOptions {
-            filter,
-            wavelet_levels: 2,
-            bit_plane_count: 8,
-            uncompressed: false,
-            segment_count: 2,
-            ..EncodeOptions::default()
+        let opts = {
+            let mut o = EncodeOptions::default();
+            o.filter = filter;
+            o.wavelet_levels = 2;
+            o.bit_plane_count = 8;
+            o.uncompressed = false;
+            o.segment_count = 2;
+            o
         };
-        let bytes = encode_icer(&original, &opts).unwrap();
-        let decoded = parse_icer(&bytes).unwrap();
+        let bytes = encode(&original, &opts).unwrap();
+        let decoded = decode(&bytes).unwrap();
         assert_eq!(
             decoded.planes[0].data, original.planes[0].data,
             "filter {filter:?} multi-segment round-trip must be bit-exact"

@@ -10,8 +10,8 @@
 //!      than the worst candidate it considered.
 
 use oxideav_icer::{
-    analyze, encode_icer, parse_icer, pick_filter_by_rate_distortion, recommend_filter,
-    EncodeOptions, IcerImage, IcerPixelFormat, ImageStats, WaveletFilter, DEFAULT_RD_CANDIDATES,
+    analyze, decode, encode, pick_filter_by_rate_distortion, recommend_filter, EncodeOptions,
+    IcerImage, IcerPixelFormat, ImageStats, WaveletFilter, DEFAULT_RD_CANDIDATES,
 };
 
 fn flat_image(w: u32, h: u32, value: u8) -> IcerImage {
@@ -76,8 +76,8 @@ fn auto_filter_picks_q_on_flat_image() {
     // pick filter Q (reversible). End-to-end roundtrip must be lossless.
     let img = flat_image(32, 32, 128);
     let opts = EncodeOptions::compressed().with_auto_filter();
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     // Filter Q is the only reversible option -- a flat image should
     // roundtrip bit-exactly.
     assert_eq!(
@@ -92,8 +92,8 @@ fn auto_filter_picks_q_on_smooth_gradient() {
     // bucket -> heuristic picks Q -> lossless roundtrip.
     let img = ramp_image(32, 32);
     let opts = EncodeOptions::compressed().with_auto_filter();
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     assert_eq!(
         decoded.planes[0].data, img.planes[0].data,
         "auto-mode on smooth ramp must be lossless via filter Q"
@@ -113,8 +113,8 @@ fn auto_filter_picks_filter_a_on_checkerboard() {
     );
 
     let opts = EncodeOptions::compressed().with_auto_filter();
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     // Filter A is a §II.A reversible integer transform: the
     // full-quality round-trip is bit-exact under it too.
     assert_eq!(
@@ -129,14 +129,15 @@ fn auto_filter_overrides_explicit_filter_setting() {
     // caller specified explicitly. We set filter F then enable auto on
     // a flat image -> auto must pick Q, lossless output.
     let img = flat_image(16, 16, 100);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterF,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterF;
+        o.uncompressed = false;
+        o
     }
     .with_auto_filter();
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     assert_eq!(
         decoded.planes[0].data, img.planes[0].data,
         "auto-mode should override explicit filter F in favour of Q on flat input"
@@ -148,13 +149,14 @@ fn auto_filter_disabled_uses_caller_filter() {
     // Sanity check: with auto_filter off, the explicit filter setting
     // is honoured exactly as before.
     let img = flat_image(16, 16, 100);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterF,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterF;
+        o.uncompressed = false;
+        o
     };
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     assert_eq!(
         decoded.planes[0].data, img.planes[0].data,
         "explicit filter F round-trip must be bit-exact"
@@ -174,24 +176,26 @@ fn auto_filter_rd_picks_smallest_output() {
     let img = ramp_image(32, 32);
 
     // Measure each candidate individually.
-    let q_opts = EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let q_opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.uncompressed = false;
+        o
     };
-    let q_bytes = encode_icer(&img, &q_opts).expect("Q encode failed");
+    let q_bytes = encode(&img, &q_opts).expect("Q encode failed");
 
-    let a_opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let a_opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.uncompressed = false;
+        o
     };
-    let a_bytes = encode_icer(&img, &a_opts).expect("A encode failed");
+    let a_bytes = encode(&img, &a_opts).expect("A encode failed");
 
     let min_individual = q_bytes.len().min(a_bytes.len());
 
     let rd_opts = EncodeOptions::compressed().with_auto_filter_rd();
-    let rd_bytes = encode_icer(&img, &rd_opts).expect("RD encode failed");
+    let rd_bytes = encode(&img, &rd_opts).expect("RD encode failed");
 
     assert!(
         rd_bytes.len() <= min_individual,
@@ -201,7 +205,7 @@ fn auto_filter_rd_picks_smallest_output() {
     );
 
     // RD must still produce a decodable stream.
-    let _decoded = parse_icer(&rd_bytes).expect("RD decode failed");
+    let _decoded = decode(&rd_bytes).expect("RD decode failed");
 }
 
 #[test]
@@ -211,8 +215,12 @@ fn pick_filter_by_rate_distortion_returns_smallest() {
     let (filter, bytes) =
         pick_filter_by_rate_distortion(&img, &opts, DEFAULT_RD_CANDIDATES).expect("RD failed");
     // Verify the returned byte count matches a fresh encode with that filter.
-    let trial_opts = EncodeOptions { filter, ..opts };
-    let fresh = encode_icer(&img, &trial_opts).expect("fresh encode failed");
+    let trial_opts = {
+        let mut o = opts;
+        o.filter = filter;
+        o
+    };
+    let fresh = encode(&img, &trial_opts).expect("fresh encode failed");
     assert_eq!(
         fresh.len(),
         bytes,
@@ -236,13 +244,13 @@ fn auto_filter_with_byte_budget_respects_cap() {
     let opts = EncodeOptions::compressed()
         .with_auto_filter()
         .with_byte_budget(2048);
-    let bytes = encode_icer(&img, &opts).expect("encode failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
     assert!(
         bytes.len() <= 2048,
         "auto+budget output {} exceeds cap 2048",
         bytes.len()
     );
-    let decoded = parse_icer(&bytes).expect("decode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     let _ = psnr(&img, &decoded);
 }
 

@@ -1,18 +1,17 @@
-//! Tests for the round-174 [`DecodeLimits`] geometry cap.
+//! Tests for the round-174 [`DecodeOptions`] geometry cap.
 //!
 //! The wire-format 12-byte segment header can declare a width / height
 //! of up to `u16 * u16 ≈ 4.29 GPx`, which the cargo-fuzz harness
 //! (round 131) flagged as a DoS surface: a 12-byte input could request
 //! a ~4 GB plane plus ~16 GB of coefficients before the decoder did any
-//! real work. Round 174 adds [`DecodeLimits`] with conservative
+//! real work. Round 174 adds [`DecodeOptions`] with conservative
 //! application-level defaults (64 MPx per segment, 256 MPx total) and
-//! the [`parse_icer_with_limits`] / [`parse_icer_metadata_with_limits`]
+//! the [`decode_with`] / [`info_with`]
 //! escape hatches for trusted-input batch processing.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_metadata, parse_icer_metadata_with_limits,
-    parse_icer_with_limits, DecodeLimits, EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
-    SegmentHeader, WaveletFilter,
+    decode, decode_with, encode, info, info_with, DecodeOptions, EncodeOptions, IcerError,
+    IcerImage, IcerPixelFormat, SegmentHeader, WaveletFilter,
 };
 
 /// Build a 12-byte segment header that declares oversized geometry but
@@ -51,8 +50,8 @@ fn default_limits_accept_rover_sized_input() {
         }
     }
     let opts = EncodeOptions::compressed();
-    let bytes = encode_icer(&img, &opts).expect("encode");
-    let decoded = parse_icer(&bytes).expect("decode under default limits");
+    let bytes = encode(&img, &opts).expect("encode");
+    let decoded = decode(&bytes).expect("decode under default limits");
     assert_eq!(decoded.width, 64);
     assert_eq!(decoded.height, 48);
     // Filter Q is lossless: bit-exact round-trip.
@@ -62,20 +61,20 @@ fn default_limits_accept_rover_sized_input() {
 #[test]
 fn default_limits_reject_4gb_synthetic_header() {
     // A 12-byte synthetic header declaring 65535x65535 ≈ 4.29 GPx
-    // would, pre-round-174, force `parse_icer` to allocate a 4 GB
+    // would, pre-round-174, force `decode` to allocate a 4 GB
     // plane + 16 GB of coefficient buffers before discovering the
     // body was empty. Under default limits the metadata walk MUST
-    // reject this with `Unsupported` before any allocation.
+    // reject this with `LimitExceeded` before any allocation.
     let bytes = synth_header(65535, 65535, false);
-    let err = parse_icer(&bytes).expect_err("must reject");
+    let err = decode(&bytes).expect_err("must reject");
     assert!(
-        matches!(err, IcerError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
+        matches!(err, IcerError::LimitExceeded(_)),
+        "expected LimitExceeded, got {err:?}"
     );
-    let err = parse_icer_metadata(&bytes).expect_err("metadata must reject");
+    let err = info(&bytes).expect_err("metadata must reject");
     assert!(
-        matches!(err, IcerError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
+        matches!(err, IcerError::LimitExceeded(_)),
+        "expected LimitExceeded, got {err:?}"
     );
 }
 
@@ -86,8 +85,8 @@ fn parse_icer_metadata_with_limits_unlimited_walks_giant_header() {
     // performs no plane allocation, so honouring giant geometry on a
     // header-only walk is safe under explicit caller consent.
     let bytes = synth_header(65535, 65535, false);
-    let meta = parse_icer_metadata_with_limits(&bytes, &DecodeLimits::unlimited())
-        .expect("unlimited metadata walk");
+    let meta =
+        info_with(&bytes, &DecodeOptions::new().unlimited()).expect("unlimited metadata walk");
     assert_eq!(meta.segments.len(), 1);
     assert_eq!(meta.segments[0].header.width, 65535);
     assert_eq!(meta.segments[0].header.height, 65535);
@@ -99,27 +98,25 @@ fn parse_icer_with_limits_honours_explicit_per_segment_cap() {
     // that's too small for it (1023 pixels). Even though the input is
     // well within the wire-format range, the explicit policy says
     // "don't agree to allocate this", so the call must fail with
-    // `Unsupported` (a deliberate application-policy refusal, not a
+    // `LimitExceeded` (a deliberate application-policy refusal, not a
     // wire-format violation).
     let img = IcerImage::zeros(32, 32, IcerPixelFormat::Gray8);
-    let bytes = encode_icer(&img, &EncodeOptions::compressed()).expect("encode");
+    let bytes = encode(&img, &EncodeOptions::compressed()).expect("encode");
 
-    let strict = DecodeLimits {
-        max_pixels_per_segment: 1023,
-        max_total_pixels: 1024 * 1024,
-    };
-    let err = parse_icer_with_limits(&bytes, &strict).expect_err("must reject");
+    let strict = DecodeOptions::new()
+        .with_max_pixels_per_segment(1023)
+        .with_max_pixels(1024 * 1024);
+    let err = decode_with(&bytes, &strict).expect_err("must reject");
     assert!(
-        matches!(err, IcerError::Unsupported(ref m) if m.contains("per-segment")),
-        "expected per-segment Unsupported, got {err:?}"
+        matches!(err, IcerError::LimitExceeded(ref m) if m.contains("per-segment")),
+        "expected per-segment LimitExceeded, got {err:?}"
     );
 
     // Same input under a cap that just-fits decodes cleanly.
-    let permissive = DecodeLimits {
-        max_pixels_per_segment: 32 * 32,
-        max_total_pixels: 32 * 32,
-    };
-    let decoded = parse_icer_with_limits(&bytes, &permissive).expect("decode just-fits");
+    let permissive = DecodeOptions::new()
+        .with_max_pixels_per_segment(32 * 32)
+        .with_max_pixels(32 * 32);
+    let decoded = decode_with(&bytes, &permissive).expect("decode just-fits");
     assert_eq!(decoded.width, 32);
     assert_eq!(decoded.height, 32);
 }
@@ -138,24 +135,22 @@ fn parse_icer_with_limits_honours_multi_segment_total_cap() {
     }
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode 4-segment");
+    let bytes = encode(&img, &opts).expect("encode 4-segment");
 
-    let strict_total = DecodeLimits {
-        max_pixels_per_segment: 1 << 20,
-        max_total_pixels: 47,
-    };
-    let err = parse_icer_with_limits(&bytes, &strict_total).expect_err("must reject");
+    let strict_total = DecodeOptions::new()
+        .with_max_pixels_per_segment(1 << 20)
+        .with_max_pixels(47);
+    let err = decode_with(&bytes, &strict_total).expect_err("must reject");
     assert!(
-        matches!(err, IcerError::Unsupported(ref m) if m.contains("total")),
-        "expected total-cap Unsupported, got {err:?}"
+        matches!(err, IcerError::LimitExceeded(ref m) if m.contains("total")),
+        "expected total-cap LimitExceeded, got {err:?}"
     );
 
     // Total cap that just-fits the 48 px aggregate decodes cleanly.
-    let fits_total = DecodeLimits {
-        max_pixels_per_segment: 1 << 20,
-        max_total_pixels: 48,
-    };
-    let decoded = parse_icer_with_limits(&bytes, &fits_total).expect("decode just-fits total");
+    let fits_total = DecodeOptions::new()
+        .with_max_pixels_per_segment(1 << 20)
+        .with_max_pixels(48);
+    let decoded = decode_with(&bytes, &fits_total).expect("decode just-fits total");
     assert_eq!(decoded.width, 4);
     assert_eq!(decoded.height, 12);
     // Filter Q is lossless: bit-exact round-trip across the 4-segment split.
@@ -168,17 +163,22 @@ fn decode_limits_default_constants_match_documented_values() {
     // the total cap as 256 MPx. Guard the constants so a future tweak
     // forces an explicit README + CHANGELOG update.
     assert_eq!(
-        DecodeLimits::DEFAULT_MAX_PIXELS_PER_SEGMENT,
+        DecodeOptions::DEFAULT_MAX_PIXELS_PER_SEGMENT,
         64 * 1024 * 1024
     );
-    assert_eq!(DecodeLimits::DEFAULT_MAX_TOTAL_PIXELS, 256 * 1024 * 1024);
-    let d = DecodeLimits::default();
+    assert_eq!(DecodeOptions::DEFAULT_MAX_PIXELS, 256 * 1024 * 1024);
+    assert_eq!(DecodeOptions::DEFAULT_MAX_BYTES, 1 << 30);
+    let d = DecodeOptions::default();
     assert_eq!(
         d.max_pixels_per_segment,
-        DecodeLimits::DEFAULT_MAX_PIXELS_PER_SEGMENT
+        Some(DecodeOptions::DEFAULT_MAX_PIXELS_PER_SEGMENT)
     );
-    assert_eq!(d.max_total_pixels, DecodeLimits::DEFAULT_MAX_TOTAL_PIXELS);
-    let u = DecodeLimits::unlimited();
-    assert_eq!(u.max_pixels_per_segment, u64::MAX);
-    assert_eq!(u.max_total_pixels, u64::MAX);
+    assert_eq!(d.max_pixels, Some(DecodeOptions::DEFAULT_MAX_PIXELS));
+    assert_eq!(d.max_bytes, Some(DecodeOptions::DEFAULT_MAX_BYTES));
+    assert_eq!((d.max_width, d.max_height), (None, None));
+    assert!(!d.strict);
+    let u = DecodeOptions::new().unlimited();
+    assert_eq!(u.max_pixels_per_segment, None);
+    assert_eq!(u.max_pixels, None);
+    assert_eq!(u.max_bytes, None);
 }

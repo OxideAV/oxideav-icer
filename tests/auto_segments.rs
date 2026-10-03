@@ -11,8 +11,8 @@
 //! loss-tolerant truncated-stream path.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_lenient, recommend_segment_count, walk_segment,
-    ChannelReliability, EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
+    decode, encode, parse_icer_lenient, recommend_segment_count, walk_segment, ChannelReliability,
+    EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {
@@ -27,7 +27,7 @@ fn ramp_image(w: u32, h: u32) -> IcerImage {
 }
 
 fn deep_image(w: u32, h: u32, bits: u8) -> IcerImage {
-    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::GrayDeep { bits });
+    let mut img = IcerImage::zeros_deep(w, h, bits).unwrap();
     let mask = (1u32 << bits) - 1;
     for y in 0..h {
         for x in 0..w {
@@ -165,10 +165,10 @@ fn never_exceeds_the_mer_cap() {
 fn auto_segments_row_strip_roundtrip_bit_exact() {
     let img = ramp_image(96, 64);
     let opts = EncodeOptions::compressed().with_auto_segments(ChannelReliability::Typical);
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     // 96*64 = 6144 px -> Typical base 4; walk the wire and confirm.
     assert_eq!(segment_byte_ranges(&bytes).len(), 4);
-    let decoded = parse_icer(&bytes).expect("decode");
+    let decoded = decode(&bytes).expect("decode");
     assert_eq!(
         decoded.planes[0].data, img.planes[0].data,
         "filter Q is lossless"
@@ -181,9 +181,9 @@ fn auto_segments_transform_domain_roundtrip_bit_exact() {
     let opts = EncodeOptions::compressed()
         .with_transform_domain_segments()
         .with_auto_segments(ChannelReliability::Typical);
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     assert_eq!(segment_byte_ranges(&bytes).len(), 4);
-    let decoded = parse_icer(&bytes).expect("decode");
+    let decoded = decode(&bytes).expect("decode");
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }
 
@@ -191,9 +191,12 @@ fn auto_segments_transform_domain_roundtrip_bit_exact() {
 fn auto_segments_deep_sample_roundtrip_bit_exact() {
     let img = deep_image(64, 64, 12);
     let opts = EncodeOptions::compressed().with_auto_segments(ChannelReliability::Typical);
-    let bytes = encode_icer(&img, &opts).expect("encode");
-    let decoded = parse_icer(&bytes).expect("decode");
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits: 12 });
+    let bytes = encode(&img, &opts).expect("encode");
+    let decoded = decode(&bytes).expect("decode");
+    assert_eq!(
+        (decoded.format, decoded.bit_depth),
+        (IcerPixelFormat::Gray16Le, 12)
+    );
     assert_eq!(decoded.planes[0].data, img.planes[0].data);
 }
 
@@ -203,7 +206,7 @@ fn auto_segments_respects_byte_budget() {
     let opts = EncodeOptions::compressed()
         .with_auto_segments(ChannelReliability::Lossy)
         .with_byte_budget(20_000);
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     assert!(
         bytes.len() as u64 <= 20_000,
         "hard cap holds: {}",
@@ -212,7 +215,7 @@ fn auto_segments_respects_byte_budget() {
     // base 10, byte-volume bounds keep it at 10; placeholders keep the
     // full frame geometry on the wire.
     assert_eq!(segment_byte_ranges(&bytes).len(), 10);
-    let decoded = parse_icer(&bytes).expect("decode");
+    let decoded = decode(&bytes).expect("decode");
     assert_eq!(decoded.width, 256);
     assert_eq!(decoded.height, 256);
 }
@@ -223,7 +226,7 @@ fn auto_segments_truncated_stream_decodes_leniently() {
     // on a segment boundary and salvage the delivered prefix.
     let img = ramp_image(128, 128);
     let opts = EncodeOptions::compressed().with_auto_segments(ChannelReliability::Typical);
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let ranges = segment_byte_ranges(&bytes);
     assert_eq!(ranges.len(), 4);
     let cut = ranges[1].end; // keep segments 0 and 1
@@ -249,7 +252,7 @@ fn auto_segments_rejects_roi_priorities() {
     let mut opts = EncodeOptions::compressed().with_auto_segments(ChannelReliability::Typical);
     opts.segment_count = 4;
     let opts = opts.with_center_roi();
-    match encode_icer(&img, &opts) {
+    match encode(&img, &opts) {
         Err(IcerError::Unsupported(_)) => {}
         other => panic!("expected Unsupported, got {other:?}"),
     }
@@ -260,7 +263,7 @@ fn auto_segments_overrides_explicit_count() {
     let img = ramp_image(96, 64);
     let mut opts = EncodeOptions::compressed().with_auto_segments(ChannelReliability::Typical);
     opts.segment_count = 9;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     assert_eq!(
         segment_byte_ranges(&bytes).len(),
         4,

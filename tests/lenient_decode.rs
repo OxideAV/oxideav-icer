@@ -11,8 +11,8 @@
 //! that behaviour.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_lenient, parse_icer_lenient_with_limits, DecodeLimits,
-    EncodeOptions, IcerError, IcerImage, IcerPixelFormat, SegmentHeader, WaveletFilter,
+    decode, encode, parse_icer_lenient, parse_icer_lenient_with, DecodeOptions, EncodeOptions,
+    IcerError, IcerImage, IcerPixelFormat, SegmentHeader, WaveletFilter,
 };
 
 fn fill<F>(w: u32, h: u32, mut f: F) -> IcerImage
@@ -65,13 +65,13 @@ fn drop_segment(bytes: &[u8], seg_index_to_drop: u16) -> Vec<u8> {
 #[test]
 fn lenient_no_loss_matches_strict_parse() {
     // With every segment received, parse_icer_lenient must produce a
-    // bit-identical image to parse_icer and report zero missing.
+    // bit-identical image to decode and report zero missing.
     let img = ramp_image(16, 12);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
 
-    let strict = parse_icer(&bytes).expect("strict parse");
+    let strict = decode(&bytes).expect("strict parse");
     let lenient = parse_icer_lenient(&bytes).expect("lenient parse");
 
     assert_eq!(lenient.missing_count, 0, "no segments should be missing");
@@ -90,11 +90,11 @@ fn lenient_drops_middle_segment_to_flat_128() {
     let img = ramp_image(16, 16); // 4 strips of 4 rows each.
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let lossy = drop_segment(&bytes, 2);
 
     // Strict parse must reject the gap.
-    let strict_err = parse_icer(&lossy).expect_err("strict must reject gap");
+    let strict_err = decode(&lossy).expect_err("strict must reject gap");
     let strict_msg = format!("{strict_err}");
     assert!(
         strict_msg.contains("non-contiguous") || strict_msg.contains("contiguous"),
@@ -153,7 +153,7 @@ fn lenient_drops_trailing_segment_truncates_image() {
     let img = ramp_image(16, 16); // 4 strips of 4 rows each.
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let lossy = drop_segment(&bytes, 3);
 
     let lenient = parse_icer_lenient(&lossy).expect("lenient parse");
@@ -171,7 +171,7 @@ fn lenient_requires_segment_zero() {
     let img = ramp_image(16, 16);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let lossy = drop_segment(&bytes, 0);
 
     let err = parse_icer_lenient(&lossy).expect_err("no segment 0 must fail");
@@ -189,7 +189,7 @@ fn lenient_rejects_width_mismatch() {
     let img = ramp_image(16, 8); // 2 strips of 4 rows.
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 2;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
 
     let ranges = segment_byte_ranges(&bytes);
     assert_eq!(ranges.len(), 2);
@@ -228,14 +228,13 @@ fn lenient_respects_decode_limits() {
     let img = ramp_image(16, 16);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
 
     // 8 pixels per segment cap rejects any segment (each one is 16x4 = 64 px).
-    let tight = DecodeLimits {
-        max_pixels_per_segment: 8,
-        max_total_pixels: u64::MAX,
-    };
-    let err = parse_icer_lenient_with_limits(&bytes, &tight)
+    let tight = DecodeOptions::new()
+        .with_max_pixels_per_segment(8)
+        .with_max_pixels(u64::MAX);
+    let err = parse_icer_lenient_with(&bytes, &tight)
         .expect_err("tight limits must reject the first segment");
     let msg = format!("{err}");
     assert!(
@@ -244,7 +243,7 @@ fn lenient_respects_decode_limits() {
     );
 
     // Default limits accept it.
-    let ok = parse_icer_lenient_with_limits(&bytes, &DecodeLimits::default()).expect("default ok");
+    let ok = parse_icer_lenient_with(&bytes, &DecodeOptions::default()).expect("default ok");
     assert_eq!(ok.missing_count, 0);
 }
 
@@ -252,12 +251,13 @@ fn lenient_respects_decode_limits() {
 fn lenient_uncompressed_path_also_supported() {
     // Multi-segment uncompressed encode + drop a middle segment.
     let img = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        uncompressed: true,
-        segment_count: 4,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.uncompressed = true;
+        o.segment_count = 4;
+        o
     };
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let lossy = drop_segment(&bytes, 1);
 
     let lenient = parse_icer_lenient(&lossy).expect("lenient parse uncompressed");
@@ -299,12 +299,13 @@ fn lenient_uncompressed_path_also_supported() {
 fn lenient_filter_a_round_trip() {
     // Filter-A path: drop a middle segment from a filter-A encoding.
     let img = ramp_image(16, 12);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        segment_count: 3,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.filter = WaveletFilter::FilterA;
+        o.segment_count = 3;
+        o
     };
-    let bytes = encode_icer(&img, &opts).expect("encode");
+    let bytes = encode(&img, &opts).expect("encode");
     let lossy = drop_segment(&bytes, 1);
 
     let lenient = parse_icer_lenient(&lossy).expect("lenient parse filter A");
@@ -340,8 +341,8 @@ fn lenient_rejects_duplicate_segment_indices() {
     // and the total height from the shorter duplicate (8 rows), then
     // write the 40-row strip past the 8-row plane. Both orderings and
     // the equal-height duplicate must now be refused, never panic.
-    let tall = encode_icer(&ramp_image(32, 40), &EncodeOptions::compressed()).expect("encode 40");
-    let short = encode_icer(&ramp_image(32, 8), &EncodeOptions::compressed()).expect("encode 8");
+    let tall = encode(&ramp_image(32, 40), &EncodeOptions::compressed()).expect("encode 40");
+    let short = encode(&ramp_image(32, 8), &EncodeOptions::compressed()).expect("encode 8");
 
     for (a, b) in [(&tall, &short), (&short, &tall), (&tall, &tall)] {
         let mut concat = a.clone();
@@ -352,7 +353,7 @@ fn lenient_rejects_duplicate_segment_indices() {
             "unexpected error kind: {err:?}"
         );
         // The strict decoder already refuses via its contiguity check.
-        assert!(parse_icer(&concat).is_err());
+        assert!(decode(&concat).is_err());
     }
 }
 
@@ -365,11 +366,11 @@ fn lenient_caps_reconstruction_geometry_not_just_received_pixels() {
     // segments at a huge segment_index gap used to buy a multi-GB
     // placeholder allocation that the received-pixel sum never
     // counted. The reconstruction geometry itself must honour
-    // `DecodeLimits::max_total_pixels`.
+    // `DecodeOptions::max_total_pixels`.
     let bytes = {
         let mut opts = EncodeOptions::compressed();
         opts.segment_count = 2;
-        encode_icer(&ramp_image(32, 8), &opts).expect("encode")
+        encode(&ramp_image(32, 8), &opts).expect("encode")
     };
     let ranges = segment_byte_ranges(&bytes);
     assert_eq!(ranges.len(), 2);
@@ -380,21 +381,19 @@ fn lenient_caps_reconstruction_geometry_not_just_received_pixels() {
     gapped[hdr + 10] = 0xFF;
     gapped[hdr + 11] = 0xFF;
 
-    let tight = DecodeLimits {
-        max_pixels_per_segment: 1 << 20,
-        max_total_pixels: 1 << 22,
-    };
-    let err = parse_icer_lenient_with_limits(&gapped, &tight)
+    let tight = DecodeOptions::new()
+        .with_max_pixels_per_segment(1 << 20)
+        .with_max_pixels(1 << 22);
+    let err = parse_icer_lenient_with(&gapped, &tight)
         .expect_err("65534-strip gap must be refused under the cap");
     match err {
-        IcerError::Unsupported(msg) => assert!(
-            msg.contains("max_total_pixels"),
-            "unexpected refusal: {msg}"
-        ),
-        other => panic!("expected Unsupported, got {other:?}"),
+        IcerError::LimitExceeded(msg) => {
+            assert!(msg.contains("max_pixels"), "unexpected refusal: {msg}")
+        }
+        other => panic!("expected LimitExceeded, got {other:?}"),
     }
 
     // An in-cap gap still decodes leniently (the feature under test).
     let dropped = drop_segment(&bytes, 1);
-    assert!(parse_icer_lenient_with_limits(&dropped, &tight).is_ok());
+    assert!(parse_icer_lenient_with(&dropped, &tight).is_ok());
 }

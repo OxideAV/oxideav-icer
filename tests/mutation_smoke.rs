@@ -10,19 +10,20 @@
 //! failures.
 
 use oxideav_icer::{
-    encode_icer, encode_icer3d, parse_icer3d_with_limits, parse_icer_lenient_with_limits,
-    parse_icer_metadata, parse_icer_with_limits, walk_segment, CubeEncodeOptions, DecodeLimits,
-    EncodeOptions, IcerCube, IcerImage, IcerPixelFormat,
+    decode_with, encode, encode_icer3d, info, parse_icer3d_with, parse_icer_lenient_with,
+    walk_segment, CubeEncodeOptions, DecodeOptions, EncodeOptions, IcerCube, IcerImage,
+    IcerPixelFormat,
 };
 
 // Tight geometry caps: the seeds are 32x32, so valid decodes always
 // fit, while a mutated width/height byte cannot buy a quarter-MPx
 // inverse DWT per iteration (the sweeps run tens of thousands of
 // decode attempts).
-const LIMITS: DecodeLimits = DecodeLimits {
-    max_pixels_per_segment: 1 << 13,
-    max_total_pixels: 1 << 15,
-};
+fn limits() -> DecodeOptions {
+    DecodeOptions::new()
+        .with_max_pixels_per_segment(1u64 << 13)
+        .with_max_pixels(1u64 << 15)
+}
 
 fn textured(w: usize, h: usize, seed: u64) -> IcerImage {
     let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);
@@ -43,11 +44,11 @@ fn textured(w: usize, h: usize, seed: u64) -> IcerImage {
 
 fn drive(bytes: &[u8]) {
     let _ = walk_segment(bytes);
-    let _ = parse_icer_metadata(bytes);
-    let _ = parse_icer_with_limits(bytes, &LIMITS);
-    let _ = parse_icer_lenient_with_limits(bytes, &LIMITS);
-    let _ = parse_icer3d_with_limits(bytes, &LIMITS);
-    let _ = oxideav_icer::parse_icer3d_lenient_with_limits(bytes, &LIMITS);
+    let _ = info(bytes);
+    let _ = decode_with(bytes, &limits());
+    let _ = parse_icer_lenient_with(bytes, &limits());
+    let _ = parse_icer3d_with(bytes, &limits());
+    let _ = oxideav_icer::parse_icer3d_lenient_with(bytes, &limits());
 }
 
 fn seeds() -> Vec<Vec<u8>> {
@@ -55,11 +56,11 @@ fn seeds() -> Vec<Vec<u8>> {
     let mut tf = EncodeOptions::compressed().with_transform_domain_segments();
     tf.segment_count = 4;
     tf.wavelet_levels = 2;
-    let mut out = vec![encode_icer(&img, &tf).unwrap()];
-    out.push(encode_icer(&img, &tf.clone().with_byte_budget(200)).unwrap());
-    out.push(encode_icer(&img, &EncodeOptions::compressed().with_min_loss(3)).unwrap());
+    let mut out = vec![encode(&img, &tf).unwrap()];
+    out.push(encode(&img, &tf.clone().with_byte_budget(200)).unwrap());
+    out.push(encode(&img, &EncodeOptions::compressed().with_min_loss(3)).unwrap());
     out.push(
-        encode_icer(
+        encode(
             &img,
             &tf.clone().with_min_loss(2).with_interleaved_entropy(),
         )
@@ -69,14 +70,14 @@ fn seeds() -> Vec<Vec<u8>> {
     // interleaved-entropy, and composed with §V.B transform-domain
     // segments — the three wire shapes the priority flag admits.
     out.push(
-        encode_icer(
+        encode(
             &img,
             &EncodeOptions::compressed().with_priority_interleaving(),
         )
         .unwrap(),
     );
     out.push(
-        encode_icer(
+        encode(
             &img,
             &EncodeOptions::compressed()
                 .with_priority_interleaving()
@@ -85,20 +86,20 @@ fn seeds() -> Vec<Vec<u8>> {
         )
         .unwrap(),
     );
-    out.push(encode_icer(&img, &tf.with_priority_interleaving()).unwrap());
+    out.push(encode(&img, &tf.with_priority_interleaving()).unwrap());
     // Deep-sample (tag 2) container wire forms: compressed, §V.B
     // transform-domain, and §III.D raw — the depth-byte decode paths.
-    let mut deep = IcerImage::zeros(24, 20, IcerPixelFormat::GrayDeep { bits: 12 });
+    let mut deep = IcerImage::zeros_deep(24, 20, 12).unwrap();
     for y in 0..20u32 {
         for x in 0..24u32 {
             deep.set_sample(0, x, y, ((x * 97 + y * 57 + (x ^ y) * 31) % 4096) as u16);
         }
     }
-    out.push(encode_icer(&deep, &EncodeOptions::compressed()).unwrap());
+    out.push(encode(&deep, &EncodeOptions::compressed()).unwrap());
     let mut deep_tf = EncodeOptions::compressed().with_transform_domain_segments();
     deep_tf.segment_count = 4;
-    out.push(encode_icer(&deep, &deep_tf).unwrap());
-    out.push(encode_icer(&deep, &EncodeOptions::default()).unwrap());
+    out.push(encode(&deep, &deep_tf).unwrap());
+    out.push(encode(&deep, &EncodeOptions::default()).unwrap());
     // ICER-3D cube wire forms: §V.D transform-domain segments (r414),
     // plain and quota-truncated — the flags-bit-1 decode paths.
     let mut cube = IcerCube::zeros(16, 16, 4, 10);

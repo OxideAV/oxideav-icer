@@ -28,8 +28,8 @@
 //!   `IcerError::Unsupported`.
 
 use oxideav_icer::{
-    analyze::psnr_db, encode_icer, parse_icer, EncodeOptions, IcerError, IcerImage,
-    IcerPixelFormat, WaveletFilter,
+    analyze::psnr_db, decode, encode, EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
+    WaveletFilter,
 };
 
 /// Build a deterministic diagonal-ramp image, identical to the one used
@@ -63,8 +63,8 @@ fn quality_target_lossless_filter_q_collapses_to_floor() {
     // trial.
     let img = flat_image(32, 32, 128);
     let opts = EncodeOptions::compressed().with_quality_target(40.0);
-    let bytes = encode_icer(&img, &opts).expect("encode_icer failed");
-    let decoded = parse_icer(&bytes).expect("parse_icer failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     let p = psnr_db(&img, &decoded);
     assert!(
         p.is_infinite() || p >= 40.0,
@@ -84,16 +84,17 @@ fn quality_target_returns_target_meeting_psnr() {
     // whose decoded PSNR meets the target.
     let img = ramp_image(32, 32);
     let target = 25.0f32;
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
     .with_quality_target(target);
-    let bytes = encode_icer(&img, &opts).expect("encode_icer failed");
-    let decoded = parse_icer(&bytes).expect("parse_icer failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     let p = psnr_db(&img, &decoded);
     assert!(
         p >= target,
@@ -109,24 +110,26 @@ fn quality_target_monotone_in_target_db() {
     let img = ramp_image(32, 32);
     let lo_target = 20.0f32;
     let hi_target = 35.0f32;
-    let lo_opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let lo_opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
     .with_quality_target(lo_target);
-    let hi_opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let hi_opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
     .with_quality_target(hi_target);
-    let lo_bytes = encode_icer(&img, &lo_opts).expect("lo encode failed");
-    let hi_bytes = encode_icer(&img, &hi_opts).expect("hi encode failed");
+    let lo_bytes = encode(&img, &lo_opts).expect("lo encode failed");
+    let hi_bytes = encode(&img, &hi_opts).expect("hi encode failed");
     assert!(
         hi_bytes.len() >= lo_bytes.len(),
         "monotonicity violated: lo {} bytes > hi {} bytes (targets {lo_target} / {hi_target})",
@@ -134,8 +137,8 @@ fn quality_target_monotone_in_target_db() {
         hi_bytes.len()
     );
     // Sanity-check the achieved PSNRs satisfy the targets.
-    let lo_dec = parse_icer(&lo_bytes).expect("lo decode failed");
-    let hi_dec = parse_icer(&hi_bytes).expect("hi decode failed");
+    let lo_dec = decode(&lo_bytes).expect("lo decode failed");
+    let hi_dec = decode(&hi_bytes).expect("hi decode failed");
     let lo_psnr = psnr_db(&img, &lo_dec);
     let hi_psnr = psnr_db(&img, &hi_dec);
     assert!(
@@ -153,16 +156,17 @@ fn quality_target_above_filter_ceiling_returns_best_effort() {
     // 9999 dB is unreachable; the encoder must return the unbudgeted
     // encode as the best effort rather than erroring or looping.
     let img = ramp_image(16, 16);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    let opts = {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
     .with_quality_target(9999.0);
-    let bytes = encode_icer(&img, &opts).expect("encode_icer should not error");
-    let decoded = parse_icer(&bytes).expect("parse_icer failed");
+    let bytes = encode(&img, &opts).expect("encode should not error");
+    let decoded = decode(&bytes).expect("decode failed");
     let p = psnr_db(&img, &decoded);
     // The achieved PSNR is whatever the unbudgeted filter A encode
     // can produce; record it for documentation but don't gate on a
@@ -182,7 +186,7 @@ fn quality_target_conflicts_with_byte_budget() {
     let opts = EncodeOptions::compressed()
         .with_byte_budget(1024)
         .with_quality_target(30.0);
-    let err = encode_icer(&img, &opts).expect_err("should have rejected the combination");
+    let err = encode(&img, &opts).expect_err("should have rejected the combination");
     match err {
         IcerError::Unsupported(msg) => {
             assert!(
@@ -200,7 +204,7 @@ fn quality_target_conflicts_with_target_bytes() {
     let opts = EncodeOptions::compressed()
         .with_target_bytes(1024)
         .with_quality_target(30.0);
-    let err = encode_icer(&img, &opts).expect_err("should have rejected the combination");
+    let err = encode(&img, &opts).expect_err("should have rejected the combination");
     match err {
         IcerError::Unsupported(msg) => {
             assert!(
@@ -218,7 +222,7 @@ fn quality_target_conflicts_with_rd_pruning() {
     let opts = EncodeOptions::compressed()
         .with_rd_budget(1024)
         .with_quality_target(30.0);
-    let err = encode_icer(&img, &opts).expect_err("should have rejected the combination");
+    let err = encode(&img, &opts).expect_err("should have rejected the combination");
     match err {
         IcerError::Unsupported(msg) => {
             // The byte_budget guard fires first (with_rd_budget also
@@ -240,8 +244,8 @@ fn quality_target_uncompressed_short_circuits() {
     // the search short-circuits and the regular encode runs.
     let img = ramp_image(16, 16);
     let opts = EncodeOptions::default().with_quality_target(50.0);
-    let bytes = encode_icer(&img, &opts).expect("encode_icer failed");
-    let decoded = parse_icer(&bytes).expect("parse_icer failed");
+    let bytes = encode(&img, &opts).expect("encode failed");
+    let decoded = decode(&bytes).expect("decode failed");
     let p = psnr_db(&img, &decoded);
     assert!(
         p.is_infinite(),

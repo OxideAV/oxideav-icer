@@ -15,8 +15,8 @@
 //! no wavelet / entropy machinery involved.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, region_mae, ssim, DistortionReport, EncodeOptions, IcerImage,
-    IcerPixelFormat, WaveletFilter,
+    decode, encode, region_mae, ssim, DistortionReport, EncodeOptions, IcerImage, IcerPixelFormat,
+    WaveletFilter,
 };
 
 /// Diagonal ramp identical to the round-trip tests' fixtures.
@@ -176,12 +176,13 @@ fn ssim_lossless_roundtrip_is_perfect() {
     // Filter Q (reversible integer 5/3) round-trips bit-exactly, so the
     // decoded image is identical to the original and SSIM is 1.0.
     let img = ramp_image(48, 48);
-    let opts = EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.filter = WaveletFilter::FilterQ;
+        o
     };
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     let s = ssim(&img, &decoded).unwrap();
     assert!(
         (s - 1.0).abs() < 1e-9,
@@ -204,9 +205,9 @@ fn ssim_drops_under_tight_byte_budget() {
         }
     }
     let opts = EncodeOptions::compressed().with_byte_budget(120);
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(bytes.len() <= 120);
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     let s = ssim(&img, &decoded).unwrap();
     assert!(
         s < 1.0 && s > -1.0,
@@ -232,15 +233,16 @@ fn region_mae_centre_beats_periphery_under_roi_budget() {
         }
     }
 
-    let opts = EncodeOptions {
-        segment_count: 4,
-        ..EncodeOptions::compressed()
+    let opts = {
+        let mut o = EncodeOptions::compressed();
+        o.segment_count = 4;
+        o
     }
     .with_byte_budget(260)
     .with_center_roi();
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(bytes.len() <= 260);
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
 
     // Centre band: middle 64 rows (32..96). Periphery: top + bottom 32.
     let centre = region_mae(&img, &decoded, 0, 32, w, 64).unwrap();

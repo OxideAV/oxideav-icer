@@ -12,7 +12,7 @@
 //! run the test, paste the printed table back.
 
 use oxideav_icer::{
-    encode_icer, encode_icer3d, parse_icer, parse_icer3d, ChannelReliability, CubeEncodeOptions,
+    decode, encode, encode_icer3d, parse_icer3d, ChannelReliability, CubeEncodeOptions,
     EncodeOptions, IcerCube, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
@@ -37,7 +37,7 @@ fn textured(w: u32, h: u32) -> IcerImage {
 }
 
 fn deep_textured(w: u32, h: u32, bits: u8) -> IcerImage {
-    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::GrayDeep { bits });
+    let mut img = IcerImage::zeros_deep(w, h, bits).unwrap();
     let mask = (1u32 << bits) - 1;
     for y in 0..h {
         for x in 0..w {
@@ -76,7 +76,7 @@ fn cube_fixture(w: u32, h: u32, bands: u32) -> IcerCube {
 }
 
 fn decoded_digest(bytes: &[u8]) -> u64 {
-    let img = parse_icer(bytes).expect("decode");
+    let img = decode(bytes).expect("decode");
     let mut acc: Vec<u8> = Vec::new();
     for plane in &img.planes {
         acc.extend_from_slice(&plane.data);
@@ -98,7 +98,7 @@ fn cases() -> Vec<(&'static str, u64, u64)> {
     let img = textured(96, 80);
     let mut out = Vec::new();
     let mut push2d = |name: &'static str, opts: &EncodeOptions| {
-        let bytes = encode_icer(&img, opts).expect(name);
+        let bytes = encode(&img, opts).expect(name);
         out.push((name, fnv1a(&bytes), decoded_digest(&bytes)));
     };
 
@@ -143,11 +143,11 @@ fn cases() -> Vec<(&'static str, u64, u64)> {
     );
 
     let deep = deep_textured(96, 80, 12);
-    let bytes = encode_icer(&deep, &EncodeOptions::compressed()).expect("deep12");
+    let bytes = encode(&deep, &EncodeOptions::compressed()).expect("deep12");
     out.push(("deep12_filter_q", fnv1a(&bytes), decoded_digest(&bytes)));
 
     let colour = colour_textured(64, 48);
-    let bytes = encode_icer(&colour, &EncodeOptions::compressed()).expect("yuv444");
+    let bytes = encode(&colour, &EncodeOptions::compressed()).expect("yuv444");
     out.push(("yuv444_filter_q", fnv1a(&bytes), decoded_digest(&bytes)));
 
     let cube = cube_fixture(32, 32, 8);

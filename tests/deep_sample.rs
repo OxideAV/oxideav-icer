@@ -10,8 +10,8 @@
 //! input can never overflow the `i32` coefficient words.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, parse_icer_lenient, parse_icer_metadata, parse_icer_with_limits,
-    psnr_db, DecodeLimits, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    decode, decode_with, encode, info, parse_icer_lenient, psnr_db, DecodeOptions, EncodeOptions,
+    IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 const ALL_FILTERS: [WaveletFilter; 7] = [
@@ -26,7 +26,7 @@ const ALL_FILTERS: [WaveletFilter; 7] = [
 
 /// Deterministic textured fixture spanning the full `bits`-bit range.
 fn textured_deep(w: u32, h: u32, bits: u8) -> IcerImage {
-    let mut img = IcerImage::zeros(w, h, IcerPixelFormat::GrayDeep { bits });
+    let mut img = IcerImage::zeros_deep(w, h, bits).unwrap();
     let max = (1u32 << bits) - 1;
     for y in 0..h {
         for x in 0..w {
@@ -44,14 +44,14 @@ fn deep_wire_is_container_framed_and_gray8_wire_is_unchanged() {
     // an 8-bit encode stays a bare segment stream (non-zero sync
     // prefix) — the byte-compatibility invariant.
     let deep = textured_deep(16, 16, 12);
-    let bytes = encode_icer(&deep, &EncodeOptions::compressed()).unwrap();
+    let bytes = encode(&deep, &EncodeOptions::compressed()).unwrap();
     assert_eq!(&bytes[0..2], &[0x00, 0x00], "deep stream must be framed");
     assert_eq!(bytes[2], 2, "deep container format tag");
     assert_eq!(bytes[3], 1, "deep container plane count");
     assert_eq!(bytes[4], 12, "deep container bit depth");
 
     let gray = IcerImage::zeros(16, 16, IcerPixelFormat::Gray8);
-    let gray_bytes = encode_icer(&gray, &EncodeOptions::compressed()).unwrap();
+    let gray_bytes = encode(&gray, &EncodeOptions::compressed()).unwrap();
     assert_ne!(&gray_bytes[0..2], &[0x00, 0x00], "Gray8 stays bare");
 }
 
@@ -63,9 +63,12 @@ fn lossless_roundtrip_12bit_all_filters() {
     for filter in ALL_FILTERS {
         let mut opts = EncodeOptions::compressed();
         opts.filter = filter;
-        let bytes = encode_icer(&img, &opts).unwrap();
-        let decoded = parse_icer(&bytes).unwrap();
-        assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits: 12 });
+        let bytes = encode(&img, &opts).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            (decoded.format, decoded.bit_depth),
+            (IcerPixelFormat::Gray16Le, 12)
+        );
         assert_eq!(decoded.planes, img.planes, "filter {filter:?} not lossless");
     }
 }
@@ -76,9 +79,12 @@ fn lossless_roundtrip_depth_sweep() {
     // bit-exactly under filter Q.
     for bits in 9u8..=16 {
         let img = textured_deep(24, 20, bits);
-        let bytes = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-        let decoded = parse_icer(&bytes).unwrap();
-        assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits });
+        let bytes = encode(&img, &EncodeOptions::compressed()).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(
+            (decoded.format, decoded.bit_depth),
+            (IcerPixelFormat::Gray16Le, bits)
+        );
         assert_eq!(decoded.planes, img.planes, "depth {bits} not lossless");
     }
 }
@@ -86,11 +92,18 @@ fn lossless_roundtrip_depth_sweep() {
 #[test]
 fn invalid_deep_depths_are_rejected() {
     // Depth 8 must ride the bare Gray8 wire form; deeper than 16
-    // exceeds the sample word. Both refuse at encode time.
+    // exceeds the sample word. The constructor refuses both, and an
+    // image whose public `bit_depth` was forced out of range afterwards
+    // is refused at encode time (`IcerImage::validate` runs first).
     for bits in [0u8, 8, 17, 255] {
-        let img = IcerImage::zeros(8, 8, IcerPixelFormat::GrayDeep { bits });
         assert!(
-            encode_icer(&img, &EncodeOptions::compressed()).is_err(),
+            IcerImage::zeros_deep(8, 8, bits).is_err(),
+            "bits {bits} must be rejected by the constructor"
+        );
+        let mut img = IcerImage::zeros(8, 8, IcerPixelFormat::Gray16Le);
+        img.bit_depth = bits;
+        assert!(
+            encode(&img, &EncodeOptions::compressed()).is_err(),
             "bits {bits} must be rejected"
         );
     }
@@ -99,10 +112,10 @@ fn invalid_deep_depths_are_rejected() {
 #[test]
 fn corrupt_container_depth_byte_is_rejected() {
     let img = textured_deep(16, 16, 12);
-    let mut bytes = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let mut bytes = encode(&img, &EncodeOptions::compressed()).unwrap();
     for bad in [0u8, 8, 17, 200] {
         bytes[4] = bad;
-        assert!(parse_icer(&bytes).is_err(), "depth byte {bad} accepted");
+        assert!(decode(&bytes).is_err(), "depth byte {bad} accepted");
     }
 }
 
@@ -110,9 +123,12 @@ fn corrupt_container_depth_byte_is_rejected() {
 fn uncompressed_path_12bit_bit_exact() {
     // §III.D raw path: two little-endian bytes per sample.
     let img = textured_deep(20, 12, 12);
-    let bytes = encode_icer(&img, &EncodeOptions::default()).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits: 12 });
+    let bytes = encode(&img, &EncodeOptions::default()).unwrap();
+    let decoded = decode(&bytes).unwrap();
+    assert_eq!(
+        (decoded.format, decoded.bit_depth),
+        (IcerPixelFormat::Gray16Le, 12)
+    );
     assert_eq!(decoded.planes, img.planes);
 }
 
@@ -121,8 +137,8 @@ fn multi_segment_row_strips_12bit_lossless() {
     let img = textured_deep(32, 32, 12);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes, img.planes);
 }
 
@@ -131,8 +147,8 @@ fn transform_domain_segments_12bit_lossless() {
     let img = textured_deep(32, 32, 12);
     let mut opts = EncodeOptions::compressed().with_transform_domain_segments();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes, img.planes);
 }
 
@@ -140,8 +156,8 @@ fn transform_domain_segments_12bit_lossless() {
 fn interleaved_entropy_backend_12bit_lossless() {
     let img = textured_deep(32, 32, 12);
     let opts = EncodeOptions::compressed().with_interleaved_entropy();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes, img.planes);
 }
 
@@ -149,8 +165,8 @@ fn interleaved_entropy_backend_12bit_lossless() {
 fn priority_interleaving_12bit_lossless() {
     let img = textured_deep(32, 32, 12);
     let opts = EncodeOptions::compressed().with_priority_interleaving();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.planes, img.planes);
 }
 
@@ -162,7 +178,7 @@ fn min_loss_byte_curve_is_monotone_12bit() {
     let mut prev = usize::MAX;
     for m in [0u8, 2, 4, 6, 8, 10] {
         let opts = EncodeOptions::compressed().with_min_loss(m);
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(
             bytes.len() <= prev,
             "min_loss {m} grew the stream: {} > {prev}",
@@ -177,15 +193,15 @@ fn budget_truncation_is_monotone_12bit() {
     // Progressive truncation: PSNR non-decreasing in the byte budget,
     // measured with the §VII 12-bit peak (4095).
     let img = textured_deep(32, 32, 12);
-    let unbudgeted = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let unbudgeted = encode(&img, &EncodeOptions::compressed()).unwrap();
     let full = unbudgeted.len() as u64;
     let mut prev_psnr = -1.0f32;
     for frac in [4u64, 3, 2, 1] {
         let budget = full / frac;
         let opts = EncodeOptions::compressed().with_byte_budget(budget);
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(bytes.len() as u64 <= budget);
-        let decoded = parse_icer(&bytes).unwrap();
+        let decoded = decode(&bytes).unwrap();
         let p = psnr_db(&img, &decoded);
         assert!(
             p >= prev_psnr - 0.01,
@@ -204,13 +220,13 @@ fn lenient_decode_missing_strip_fills_deep_midpoint() {
     let img = textured_deep(32, 32, 12);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
 
     // Rebuild the container with segment 1 excised from the inner
     // stream.
     let parsed = oxideav_icer::parse_container(&bytes).unwrap();
     let inner = parsed.plane_bytes(&bytes, 0);
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 4);
     // Offsets in `meta` are rebased to the container buffer; segment 1
     // of the inner stream spans [seg1.offset - base, seg2.offset - base).
@@ -233,8 +249,8 @@ fn lenient_decode_missing_strip_fills_deep_midpoint() {
     assert_eq!(lenient.missing_count, 1);
     assert!(!lenient.received[1]);
     assert_eq!(
-        lenient.image.pixel_format,
-        IcerPixelFormat::GrayDeep { bits: 12 }
+        (lenient.image.format, lenient.image.bit_depth),
+        (IcerPixelFormat::Gray16Le, 12)
     );
     // Strip 1 covers rows 8..16: every sample is the 12-bit midpoint.
     for y in 8..16 {
@@ -255,8 +271,8 @@ fn metadata_walk_reports_deep_container_segments() {
     let img = textured_deep(32, 32, 14);
     let mut opts = EncodeOptions::compressed();
     opts.segment_count = 2;
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let meta = parse_icer_metadata(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let meta = info(&bytes).unwrap();
     assert_eq!(meta.segments.len(), 2);
     assert_eq!(meta.segments[0].header.width, 32);
     // Offsets are rebased to the container buffer: the first segment
@@ -268,13 +284,12 @@ fn metadata_walk_reports_deep_container_segments() {
 #[test]
 fn decode_limits_apply_to_deep_streams() {
     let img = textured_deep(32, 32, 12);
-    let bytes = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-    let tight = DecodeLimits {
-        max_pixels_per_segment: 16,
-        max_total_pixels: 16,
-    };
-    assert!(parse_icer_with_limits(&bytes, &tight).is_err());
-    assert!(parse_icer_with_limits(&bytes, &DecodeLimits::default()).is_ok());
+    let bytes = encode(&img, &EncodeOptions::compressed()).unwrap();
+    let tight = DecodeOptions::new()
+        .with_max_pixels_per_segment(16)
+        .with_max_pixels(16);
+    assert!(decode_with(&bytes, &tight).is_err());
+    assert!(decode_with(&bytes, &DecodeOptions::default()).is_ok());
 }
 
 #[test]
@@ -283,11 +298,11 @@ fn quality_target_12bit_meets_floor() {
     // target is reachable well below the lossless byte count.
     let img = textured_deep(32, 32, 12);
     let opts = EncodeOptions::compressed().with_quality_target(40.0);
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let decoded = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let decoded = decode(&bytes).unwrap();
     let p = psnr_db(&img, &decoded);
     assert!(p >= 40.0, "achieved {p} dB");
-    let lossless = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let lossless = encode(&img, &EncodeOptions::compressed()).unwrap();
     assert!(
         bytes.len() < lossless.len(),
         "40 dB target should undercut lossless ({} vs {})",
@@ -300,15 +315,15 @@ fn quality_target_12bit_meets_floor() {
 fn auto_filter_rd_12bit_picks_byte_winner() {
     let img = textured_deep(32, 32, 12);
     let opts = EncodeOptions::compressed().with_auto_filter_rd();
-    let auto_bytes = encode_icer(&img, &opts).unwrap();
+    let auto_bytes = encode(&img, &opts).unwrap();
     // The RD pick can never exceed either explicit candidate.
     for filter in [WaveletFilter::FilterQ, WaveletFilter::FilterA] {
         let mut fopts = EncodeOptions::compressed();
         fopts.filter = filter;
-        let candidate = encode_icer(&img, &fopts).unwrap();
+        let candidate = encode(&img, &fopts).unwrap();
         assert!(auto_bytes.len() <= candidate.len(), "{filter:?}");
     }
-    assert_eq!(parse_icer(&auto_bytes).unwrap().planes, img.planes);
+    assert_eq!(decode(&auto_bytes).unwrap().planes, img.planes);
 }
 
 #[test]
@@ -316,7 +331,7 @@ fn uncompressed_fallback_fires_on_deep_noise() {
     // An LCG noise tile at 12 bits defeats the entropy stage; the
     // §III.D per-segment fallback must pick the raw path and stay
     // bit-exact.
-    let mut img = IcerImage::zeros(24, 24, IcerPixelFormat::GrayDeep { bits: 12 });
+    let mut img = IcerImage::zeros_deep(24, 24, 12).unwrap();
     let mut state = 0x1234_5678u32;
     for y in 0..24 {
         for x in 0..24 {
@@ -324,11 +339,11 @@ fn uncompressed_fallback_fires_on_deep_noise() {
             img.set_sample(0, x, y, (state >> 16) as u16 & 0x0FFF);
         }
     }
-    let plain = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let plain = encode(&img, &EncodeOptions::compressed()).unwrap();
     let fb = EncodeOptions::compressed().with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &fb).unwrap();
+    let bytes = encode(&img, &fb).unwrap();
     assert!(bytes.len() <= plain.len());
-    assert_eq!(parse_icer(&bytes).unwrap().planes, img.planes);
+    assert_eq!(decode(&bytes).unwrap().planes, img.planes);
 }
 
 #[test]
@@ -356,10 +371,13 @@ fn roi_priorities_and_budget_compose_at_12bit() {
     let mut opts = EncodeOptions::compressed().with_byte_budget(700);
     opts.segment_count = 4;
     let opts = opts.with_center_roi();
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(bytes.len() <= 700);
-    let decoded = parse_icer(&bytes).unwrap();
+    let decoded = decode(&bytes).unwrap();
     assert_eq!(decoded.width, 32);
     assert_eq!(decoded.height, 32);
-    assert_eq!(decoded.pixel_format, IcerPixelFormat::GrayDeep { bits: 12 });
+    assert_eq!(
+        (decoded.format, decoded.bit_depth),
+        (IcerPixelFormat::Gray16Le, 12)
+    );
 }

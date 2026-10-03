@@ -7,15 +7,13 @@
 //! context for a refinement bit is then category-1 -> context 9/10,
 //! category-2 -> context 11, and category-3 bits are *left uncoded*
 //! (sent at a fixed probability-of-zero of 1/2). These tests exercise the
-//! scheme end-to-end through the public `encode_icer` / `parse_icer`
+//! scheme end-to-end through the public `encode` / `decode`
 //! surface: the category transitions must run identically on both sides,
 //! so a divergence would corrupt the decode and fail the round-trips
 //! below.
 
 use oxideav_icer::context::{magnitude_context, MagnitudeContext, CATEGORY2_CONTEXT};
-use oxideav_icer::{
-    encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
-};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
 
 /// The category -> context mapping is exactly the §III.B rule:
 /// cat 1 -> 9 (no H/V significant neighbour) or 10; cat 2 -> 11; cat 3+
@@ -84,8 +82,8 @@ fn full_quality_filter_q_bit_exact_through_category3() {
         let mut opts = EncodeOptions::compressed();
         opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
-        let bytes = encode_icer(&img, &opts).expect("encode");
-        let dec = parse_icer(&bytes).expect("decode");
+        let bytes = encode(&img, &opts).expect("encode");
+        let dec = decode(&bytes).expect("decode");
         assert_eq!(
             dec.planes[0].data, img.planes[0].data,
             "filter-Q full-quality decode must be bit-exact through the category-3 uncoded path"
@@ -104,9 +102,9 @@ fn progressive_truncation_monotone_under_category_model() {
         let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
         opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
-        let bytes = encode_icer(&img, &opts).expect("encode");
+        let bytes = encode(&img, &opts).expect("encode");
         assert!(bytes.len() as u64 <= budget);
-        let dec = parse_icer(&bytes).expect("decode");
+        let dec = decode(&bytes).expect("decode");
         let n = (img.width * img.height) as f64;
         let mse: f64 = img.planes[0]
             .data
@@ -147,9 +145,9 @@ fn colour_filter_q_bit_exact_under_category_model() {
     }
     let mut opts = EncodeOptions::compressed();
     opts.filter = WaveletFilter::FilterQ;
-    let bytes = encode_icer(&img, &opts).expect("encode");
-    let dec = parse_icer(&bytes).expect("decode");
-    assert_eq!(dec.pixel_format, IcerPixelFormat::Yuv444P);
+    let bytes = encode(&img, &opts).expect("encode");
+    let dec = decode(&bytes).expect("decode");
+    assert_eq!(dec.format, IcerPixelFormat::Yuv444P);
     for p in 0..3 {
         assert_eq!(
             dec.planes[p].data, img.planes[p].data,

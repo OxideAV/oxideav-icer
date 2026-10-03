@@ -19,8 +19,8 @@
 //!   plane and can read throughput in MiB/s rather than per-frame
 //!   nanoseconds.
 //!
-//! Each input is benchmarked end-to-end on `encode_icer` and
-//! `parse_icer`. The uncompressed path (`EncodeOptions::default()`)
+//! Each input is benchmarked end-to-end on `encode` and
+//! `decode`. The uncompressed path (`EncodeOptions::default()`)
 //! is exercised separately on the larger ramp to give us a contrast
 //! against the compressed path on the same image -- the encoder and
 //! the decoder's framing walk should both be near-`memcpy` speed when
@@ -28,8 +28,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use oxideav_icer::{
-    encode_icer, encode_icer3d, parse_icer, parse_icer3d, CubeEncodeOptions, EncodeOptions,
-    IcerCube, IcerImage, IcerPixelFormat, WaveletFilter,
+    decode, encode, encode_icer3d, parse_icer3d, CubeEncodeOptions, EncodeOptions, IcerCube,
+    IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 /// Diagonal ramp identical to the round-trip tests' `ramp_image`. Keeps
@@ -57,12 +57,13 @@ fn smooth_image(w: u32, h: u32) -> IcerImage {
 }
 
 fn compressed_filter_q_opts() -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
 }
 
@@ -77,7 +78,7 @@ fn bench_encode_compressed(c: &mut Criterion) {
     ));
     group.bench_function("ramp_16x16", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&ramp_small), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&ramp_small), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
@@ -89,7 +90,7 @@ fn bench_encode_compressed(c: &mut Criterion) {
     ));
     group.bench_function("smooth_16x16", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&smooth), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&smooth), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
@@ -101,7 +102,7 @@ fn bench_encode_compressed(c: &mut Criterion) {
     ));
     group.bench_function("ramp_64x64", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&ramp_large), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&ramp_large), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
@@ -116,37 +117,37 @@ fn bench_decode_compressed(c: &mut Criterion) {
     // Pre-encode each fixture once -- we are measuring the decode path,
     // not the encode path.
     let ramp_small = ramp_image(16, 16);
-    let ramp_small_bytes = encode_icer(&ramp_small, &opts).unwrap();
+    let ramp_small_bytes = encode(&ramp_small, &opts).unwrap();
     group.throughput(Throughput::Bytes(
         (ramp_small.width as u64) * (ramp_small.height as u64),
     ));
     group.bench_function("ramp_16x16", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&ramp_small_bytes)).unwrap();
+            let img = decode(black_box(&ramp_small_bytes)).unwrap();
             black_box(img);
         });
     });
 
     let smooth = smooth_image(16, 16);
-    let smooth_bytes = encode_icer(&smooth, &opts).unwrap();
+    let smooth_bytes = encode(&smooth, &opts).unwrap();
     group.throughput(Throughput::Bytes(
         (smooth.width as u64) * (smooth.height as u64),
     ));
     group.bench_function("smooth_16x16", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&smooth_bytes)).unwrap();
+            let img = decode(black_box(&smooth_bytes)).unwrap();
             black_box(img);
         });
     });
 
     let ramp_large = ramp_image(64, 64);
-    let ramp_large_bytes = encode_icer(&ramp_large, &opts).unwrap();
+    let ramp_large_bytes = encode(&ramp_large, &opts).unwrap();
     group.throughput(Throughput::Bytes(
         (ramp_large.width as u64) * (ramp_large.height as u64),
     ));
     group.bench_function("ramp_64x64", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&ramp_large_bytes)).unwrap();
+            let img = decode(black_box(&ramp_large_bytes)).unwrap();
             black_box(img);
         });
     });
@@ -167,15 +168,15 @@ fn bench_uncompressed_path(c: &mut Criterion) {
     ));
     group.bench_function("encode", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&ramp), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
 
-    let bytes = encode_icer(&ramp, &opts).unwrap();
+    let bytes = encode(&ramp, &opts).unwrap();
     group.bench_function("decode", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&bytes)).unwrap();
+            let img = decode(black_box(&bytes)).unwrap();
             black_box(img);
         });
     });
@@ -189,12 +190,13 @@ fn bench_uncompressed_path(c: &mut Criterion) {
 /// isolates the cost of the `beta * d[n+1]` predictor term in the
 /// shared eq (3) recurrence.
 fn compressed_filter_a_opts() -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
 }
 
@@ -211,7 +213,7 @@ fn bench_filter_a_path(c: &mut Criterion) {
     ));
     enc_group.bench_function("ramp_16x16", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&ramp_small), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&ramp_small), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
@@ -222,7 +224,7 @@ fn bench_filter_a_path(c: &mut Criterion) {
     ));
     enc_group.bench_function("smooth_16x16", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&smooth), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&smooth), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
@@ -233,42 +235,42 @@ fn bench_filter_a_path(c: &mut Criterion) {
     ));
     enc_group.bench_function("ramp_64x64", |b| {
         b.iter(|| {
-            let bytes = encode_icer(black_box(&ramp_large), black_box(&opts)).unwrap();
+            let bytes = encode(black_box(&ramp_large), black_box(&opts)).unwrap();
             black_box(bytes);
         });
     });
     enc_group.finish();
 
     let mut dec_group = c.benchmark_group("decode_compressed_filter_a");
-    let ramp_small_bytes = encode_icer(&ramp_small, &opts).unwrap();
+    let ramp_small_bytes = encode(&ramp_small, &opts).unwrap();
     dec_group.throughput(Throughput::Bytes(
         (ramp_small.width as u64) * (ramp_small.height as u64),
     ));
     dec_group.bench_function("ramp_16x16", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&ramp_small_bytes)).unwrap();
+            let img = decode(black_box(&ramp_small_bytes)).unwrap();
             black_box(img);
         });
     });
 
-    let smooth_bytes = encode_icer(&smooth, &opts).unwrap();
+    let smooth_bytes = encode(&smooth, &opts).unwrap();
     dec_group.throughput(Throughput::Bytes(
         (smooth.width as u64) * (smooth.height as u64),
     ));
     dec_group.bench_function("smooth_16x16", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&smooth_bytes)).unwrap();
+            let img = decode(black_box(&smooth_bytes)).unwrap();
             black_box(img);
         });
     });
 
-    let ramp_large_bytes = encode_icer(&ramp_large, &opts).unwrap();
+    let ramp_large_bytes = encode(&ramp_large, &opts).unwrap();
     dec_group.throughput(Throughput::Bytes(
         (ramp_large.width as u64) * (ramp_large.height as u64),
     ));
     dec_group.bench_function("ramp_64x64", |b| {
         b.iter(|| {
-            let img = parse_icer(black_box(&ramp_large_bytes)).unwrap();
+            let img = decode(black_box(&ramp_large_bytes)).unwrap();
             black_box(img);
         });
     });
@@ -292,12 +294,13 @@ fn bench_filter_a_path(c: &mut Criterion) {
 /// further dyadic recursion no longer changes the bit-plane scanner's
 /// stripe coverage).
 fn compressed_filter_q_opts_levels(levels: u8) -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: levels,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = levels;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
 }
 
@@ -312,7 +315,7 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
         let opts = compressed_filter_q_opts_levels(d);
         enc_group.bench_function(format!("levels_{}", d), |b| {
             b.iter(|| {
-                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                let bytes = encode(black_box(&ramp), black_box(&opts)).unwrap();
                 black_box(bytes);
             });
         });
@@ -323,10 +326,10 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
     dec_group.throughput(Throughput::Bytes(pixel_bytes));
     for &d in &DEPTHS {
         let opts = compressed_filter_q_opts_levels(d);
-        let bytes = encode_icer(&ramp, &opts).unwrap();
+        let bytes = encode(&ramp, &opts).unwrap();
         dec_group.bench_function(format!("levels_{}", d), |b| {
             b.iter(|| {
-                let img = parse_icer(black_box(&bytes)).unwrap();
+                let img = decode(black_box(&bytes)).unwrap();
                 black_box(img);
             });
         });
@@ -355,13 +358,14 @@ fn bench_wavelet_levels_sweep(c: &mut Criterion) {
 /// sweep `[1, 2, 4, 8]` keeps every strip at >= 8 rows (64 / 8 = 8),
 /// well above the floor.
 fn compressed_filter_q_opts_segments(segments: u16) -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: 2,
-        bit_plane_count: 8,
-        uncompressed: false,
-        segment_count: segments,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o.segment_count = segments;
+        o
     }
 }
 
@@ -376,7 +380,7 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
         let opts = compressed_filter_q_opts_segments(n);
         enc_group.bench_function(format!("segments_{}", n), |b| {
             b.iter(|| {
-                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                let bytes = encode(black_box(&ramp), black_box(&opts)).unwrap();
                 black_box(bytes);
             });
         });
@@ -387,10 +391,10 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
     dec_group.throughput(Throughput::Bytes(pixel_bytes));
     for &n in &SEGMENTS {
         let opts = compressed_filter_q_opts_segments(n);
-        let bytes = encode_icer(&ramp, &opts).unwrap();
+        let bytes = encode(&ramp, &opts).unwrap();
         dec_group.bench_function(format!("segments_{}", n), |b| {
             b.iter(|| {
-                let img = parse_icer(black_box(&bytes)).unwrap();
+                let img = decode(black_box(&bytes)).unwrap();
                 black_box(img);
             });
         });
@@ -427,12 +431,13 @@ fn bench_segment_count_sweep(c: &mut Criterion) {
 /// same effective `q` while `12` and `16` walk above it; the floor /
 /// no-floor split is exactly the interesting dynamic.
 fn compressed_filter_q_opts_bit_planes(bit_planes: u8) -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterQ,
-        wavelet_levels: 2,
-        bit_plane_count: bit_planes,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterQ;
+        o.wavelet_levels = 2;
+        o.bit_plane_count = bit_planes;
+        o.uncompressed = false;
+        o
     }
 }
 
@@ -447,7 +452,7 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
         let opts = compressed_filter_q_opts_bit_planes(q);
         enc_group.bench_function(format!("q_{}", q), |b| {
             b.iter(|| {
-                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                let bytes = encode(black_box(&ramp), black_box(&opts)).unwrap();
                 black_box(bytes);
             });
         });
@@ -458,10 +463,10 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
     dec_group.throughput(Throughput::Bytes(pixel_bytes));
     for &q in &BIT_PLANES {
         let opts = compressed_filter_q_opts_bit_planes(q);
-        let bytes = encode_icer(&ramp, &opts).unwrap();
+        let bytes = encode(&ramp, &opts).unwrap();
         dec_group.bench_function(format!("q_{}", q), |b| {
             b.iter(|| {
-                let img = parse_icer(black_box(&bytes)).unwrap();
+                let img = decode(black_box(&bytes)).unwrap();
                 black_box(img);
             });
         });
@@ -492,12 +497,13 @@ fn bench_bit_plane_count_sweep(c: &mut Criterion) {
 /// the deepest sensible value for a 64x64 input (subband LL at depth
 /// 4 is 4x4 = 16 coefficients) -- matches the round-210 ceiling.
 fn compressed_filter_a_opts_levels(levels: u8) -> EncodeOptions {
-    EncodeOptions {
-        filter: WaveletFilter::FilterA,
-        wavelet_levels: levels,
-        bit_plane_count: 8,
-        uncompressed: false,
-        ..EncodeOptions::default()
+    {
+        let mut o = EncodeOptions::default();
+        o.filter = WaveletFilter::FilterA;
+        o.wavelet_levels = levels;
+        o.bit_plane_count = 8;
+        o.uncompressed = false;
+        o
     }
 }
 
@@ -512,7 +518,7 @@ fn bench_filter_a_wavelet_levels_sweep(c: &mut Criterion) {
         let opts = compressed_filter_a_opts_levels(d);
         enc_group.bench_function(format!("levels_{}", d), |b| {
             b.iter(|| {
-                let bytes = encode_icer(black_box(&ramp), black_box(&opts)).unwrap();
+                let bytes = encode(black_box(&ramp), black_box(&opts)).unwrap();
                 black_box(bytes);
             });
         });
@@ -523,10 +529,10 @@ fn bench_filter_a_wavelet_levels_sweep(c: &mut Criterion) {
     dec_group.throughput(Throughput::Bytes(pixel_bytes));
     for &d in &DEPTHS {
         let opts = compressed_filter_a_opts_levels(d);
-        let bytes = encode_icer(&ramp, &opts).unwrap();
+        let bytes = encode(&ramp, &opts).unwrap();
         dec_group.bench_function(format!("levels_{}", d), |b| {
             b.iter(|| {
-                let img = parse_icer(black_box(&bytes)).unwrap();
+                let img = decode(black_box(&bytes)).unwrap();
                 black_box(img);
             });
         });
@@ -612,12 +618,12 @@ fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
 
     // Wire-form pins: M = 0 is byte-identical to the plain compressed
     // encode; the transform-domain stream decodes bit-exactly.
-    let strip_bytes = encode_icer(&img, &strip).unwrap();
-    let strip_m0 = encode_icer(&img, &strip.clone().with_min_loss(0)).unwrap();
+    let strip_bytes = encode(&img, &strip).unwrap();
+    let strip_m0 = encode(&img, &strip.clone().with_min_loss(0)).unwrap();
     assert_eq!(strip_bytes, strip_m0, "M = 0 must not change the wire form");
-    let tf_bytes = encode_icer(&img, &tf).unwrap();
+    let tf_bytes = encode(&img, &tf).unwrap();
     assert_eq!(
-        parse_icer(&tf_bytes).unwrap().planes[0].data,
+        decode(&tf_bytes).unwrap().planes[0].data,
         img.planes[0].data,
         "transform-domain filter-Q decode must stay bit-exact"
     );
@@ -625,16 +631,16 @@ fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
     let mut group = c.benchmark_group("transform_segments_64x64_s4");
     group.throughput(Throughput::Bytes(plane_bytes));
     group.bench_function("encode_row_strip", |b| {
-        b.iter(|| black_box(encode_icer(black_box(&img), &strip).unwrap()));
+        b.iter(|| black_box(encode(black_box(&img), &strip).unwrap()));
     });
     group.bench_function("encode_transform", |b| {
-        b.iter(|| black_box(encode_icer(black_box(&img), &tf).unwrap()));
+        b.iter(|| black_box(encode(black_box(&img), &tf).unwrap()));
     });
     group.bench_function("decode_row_strip", |b| {
-        b.iter(|| black_box(parse_icer(black_box(&strip_bytes)).unwrap()));
+        b.iter(|| black_box(decode(black_box(&strip_bytes)).unwrap()));
     });
     group.bench_function("decode_transform", |b| {
-        b.iter(|| black_box(parse_icer(black_box(&tf_bytes)).unwrap()));
+        b.iter(|| black_box(decode(black_box(&tf_bytes)).unwrap()));
     });
     group.finish();
 
@@ -642,12 +648,12 @@ fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(plane_bytes));
     for m in [0u8, 2, 4, 8] {
         let opts = compressed_filter_q_opts().with_min_loss(m);
-        let encoded = encode_icer(&img, &opts).unwrap();
+        let encoded = encode(&img, &opts).unwrap();
         group.bench_function(format!("encode_m{m}"), |b| {
-            b.iter(|| black_box(encode_icer(black_box(&img), &opts).unwrap()));
+            b.iter(|| black_box(encode(black_box(&img), &opts).unwrap()));
         });
         group.bench_function(format!("decode_m{m}"), |b| {
-            b.iter(|| black_box(parse_icer(black_box(&encoded)).unwrap()));
+            b.iter(|| black_box(decode(black_box(&encoded)).unwrap()));
         });
     }
     group.finish();
@@ -659,16 +665,16 @@ fn bench_transform_segments_and_min_loss(c: &mut Criterion) {
 /// Throughput counts the raw sample bytes (2 per pixel) so the deep
 /// numbers are comparable to the 8-bit groups per transmitted byte.
 fn bench_deep_sample_path(c: &mut Criterion) {
-    let mut img = IcerImage::zeros(64, 64, oxideav_icer::IcerPixelFormat::GrayDeep { bits: 12 });
+    let mut img = IcerImage::zeros_deep(64, 64, 12).unwrap();
     for y in 0..64u32 {
         for x in 0..64u32 {
             img.set_sample(0, x, y, ((x * 97 + y * 57 + (x ^ y) * 31) % 4096) as u16);
         }
     }
     let opts = compressed_filter_q_opts();
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert_eq!(
-        parse_icer(&bytes).unwrap().planes,
+        decode(&bytes).unwrap().planes,
         img.planes,
         "deep bench fixture must decode lossless"
     );
@@ -679,13 +685,13 @@ fn bench_deep_sample_path(c: &mut Criterion) {
     ));
     group.bench_function("encode", |b| {
         b.iter(|| {
-            let out = encode_icer(black_box(&img), black_box(&opts)).unwrap();
+            let out = encode(black_box(&img), black_box(&opts)).unwrap();
             black_box(out);
         });
     });
     group.bench_function("decode", |b| {
         b.iter(|| {
-            let out = parse_icer(black_box(&bytes)).unwrap();
+            let out = decode(black_box(&bytes)).unwrap();
             black_box(out);
         });
     });
@@ -714,9 +720,9 @@ fn bench_representative_sizes(c: &mut Criterion) {
     // point §V.C prescribes at this size (Typical picks 4-6).
     let mut opts = compressed_filter_q_opts();
     opts.segment_count = 4;
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert_eq!(
-        parse_icer(&bytes).unwrap().planes[0].data,
+        decode(&bytes).unwrap().planes[0].data,
         img.planes[0].data,
         "representative 2-D fixture must decode lossless"
     );
@@ -725,10 +731,10 @@ fn bench_representative_sizes(c: &mut Criterion) {
     group.sample_size(20);
     group.throughput(Throughput::Bytes(256 * 256));
     group.bench_function("encode", |b| {
-        b.iter(|| black_box(encode_icer(black_box(&img), &opts).unwrap()));
+        b.iter(|| black_box(encode(black_box(&img), &opts).unwrap()));
     });
     group.bench_function("decode", |b| {
-        b.iter(|| black_box(parse_icer(black_box(&bytes)).unwrap()));
+        b.iter(|| black_box(decode(black_box(&bytes)).unwrap()));
     });
     group.finish();
 

@@ -23,7 +23,7 @@
 //!   * the rd_pruning mutual exclusion.
 
 use oxideav_icer::{
-    encode_icer, parse_icer, walk_segment, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    decode, encode, walk_segment, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
 };
 
 fn textured(w: usize, h: usize, seed: u64) -> IcerImage {
@@ -91,8 +91,8 @@ fn lossless_bit_exact_geometry_matrix() {
                 if interleaved {
                     opts = opts.with_interleaved_entropy();
                 }
-                let bytes = encode_icer(&img, &opts).unwrap();
-                let dec = parse_icer(&bytes).unwrap();
+                let bytes = encode(&img, &opts).unwrap();
+                let dec = decode(&bytes).unwrap();
                 assert_bit_exact(
                     &img,
                     &dec,
@@ -110,12 +110,12 @@ fn lossless_bit_exact_geometry_matrix() {
 #[test]
 fn wire_flag_and_legacy_byte_identity() {
     let img = textured(48, 40, 3);
-    let legacy = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
+    let legacy = encode(&img, &EncodeOptions::compressed()).unwrap();
     let walked = walk_segment(&legacy).unwrap();
     assert!(!walked.header.priority_interleaved);
     assert_eq!(legacy[2] & 0x80, 0, "legacy streams keep the bit clear");
 
-    let prio = encode_icer(
+    let prio = encode(
         &img,
         &EncodeOptions::compressed().with_priority_interleaving(),
     )
@@ -128,8 +128,8 @@ fn wire_flag_and_legacy_byte_identity() {
     assert_eq!(walked.header.width, 48);
 
     // Both decode bit-exact.
-    assert_bit_exact(&img, &parse_icer(&legacy).unwrap(), "legacy");
-    assert_bit_exact(&img, &parse_icer(&prio).unwrap(), "priority");
+    assert_bit_exact(&img, &decode(&legacy).unwrap(), "legacy");
+    assert_bit_exact(&img, &decode(&prio).unwrap(), "priority");
 }
 
 /// The wire packets follow the deterministic
@@ -141,7 +141,7 @@ fn wire_flag_and_legacy_byte_identity() {
 fn wire_packets_match_schedule() {
     let img = textured(64, 64, 11);
     let opts = EncodeOptions::compressed().with_priority_interleaving();
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     let walked = walk_segment(&bytes).unwrap();
     let q = walked.header.bit_plane_count as u32;
     let d = walked.header.decomp_levels;
@@ -184,9 +184,9 @@ fn colour_roundtrip_bit_exact() {
         }
     }
     let opts = EncodeOptions::compressed().with_priority_interleaving();
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
-    assert_eq!(dec.pixel_format, IcerPixelFormat::Yuv444P);
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
+    assert_eq!(dec.format, IcerPixelFormat::Yuv444P);
     assert_bit_exact(&img, &dec, "colour 4:4:4");
 }
 
@@ -198,12 +198,8 @@ fn row_strip_multi_segment_bit_exact() {
         let img = textured(48, 64, 21);
         let mut opts = EncodeOptions::compressed().with_priority_interleaving();
         opts.segment_count = segs;
-        let bytes = encode_icer(&img, &opts).unwrap();
-        assert_bit_exact(
-            &img,
-            &parse_icer(&bytes).unwrap(),
-            &format!("{segs} strips"),
-        );
+        let bytes = encode(&img, &opts).unwrap();
+        assert_bit_exact(&img, &decode(&bytes).unwrap(), &format!("{segs} strips"));
     }
 }
 
@@ -222,8 +218,8 @@ fn transform_domain_segments_bit_exact() {
             if interleaved {
                 opts = opts.with_interleaved_entropy();
             }
-            let bytes = encode_icer(&img, &opts).unwrap();
-            let dec = parse_icer(&bytes).unwrap();
+            let bytes = encode(&img, &opts).unwrap();
+            let dec = decode(&bytes).unwrap();
             assert_bit_exact(
                 &img,
                 &dec,
@@ -240,12 +236,12 @@ fn transform_domain_segments_bit_exact() {
 #[test]
 fn min_loss_composes_monotone() {
     let img = textured(64, 64, 5);
-    let plain = encode_icer(
+    let plain = encode(
         &img,
         &EncodeOptions::compressed().with_priority_interleaving(),
     )
     .unwrap();
-    let m0 = encode_icer(
+    let m0 = encode(
         &img,
         &EncodeOptions::compressed()
             .with_priority_interleaving()
@@ -257,14 +253,14 @@ fn min_loss_composes_monotone() {
     let mut prev_bytes = usize::MAX;
     let mut prev_mse = -1.0f64;
     for m in [0u8, 1, 2, 3, 4, 6, 8] {
-        let bytes = encode_icer(
+        let bytes = encode(
             &img,
             &EncodeOptions::compressed()
                 .with_priority_interleaving()
                 .with_min_loss(m),
         )
         .unwrap();
-        let dec = parse_icer(&bytes).unwrap();
+        let dec = decode(&bytes).unwrap();
         assert_eq!(dec.width, 64);
         assert_eq!(dec.height, 64);
         let e = mse(&img, &dec);
@@ -281,7 +277,7 @@ fn min_loss_composes_monotone() {
         prev_mse = e;
     }
     // M = 0 is lossless.
-    let dec = parse_icer(&m0).unwrap();
+    let dec = decode(&m0).unwrap();
     assert_bit_exact(&img, &dec, "M = 0 lossless");
 }
 
@@ -292,7 +288,7 @@ fn rd_pruning_rejected() {
     let opts = EncodeOptions::compressed()
         .with_priority_interleaving()
         .with_rd_budget(400);
-    let err = encode_icer(&img, &opts).unwrap_err();
+    let err = encode(&img, &opts).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("priority_interleaving"),
@@ -311,9 +307,9 @@ fn budget_truncation_monotone_and_framed() {
         let opts = EncodeOptions::compressed()
             .with_priority_interleaving()
             .with_byte_budget(budget);
-        let bytes = encode_icer(&img, &opts).unwrap();
+        let bytes = encode(&img, &opts).unwrap();
         assert!(bytes.len() as u64 <= budget.max(12), "cap honoured");
-        let dec = parse_icer(&bytes).unwrap();
+        let dec = decode(&bytes).unwrap();
         assert_eq!((dec.width, dec.height), (64, 64), "geometry framed");
         let p = psnr(&img, &dec);
         assert!(
@@ -339,17 +335,16 @@ fn truncated_quality_beats_msb_down_order() {
     let img = textured(64, 64, 13);
     let mut gains = Vec::new();
     for budget in [250u64, 500, 750, 1000, 1500, 2000, 2500, 3000] {
-        let legacy =
-            encode_icer(&img, &EncodeOptions::compressed().with_byte_budget(budget)).unwrap();
-        let prio = encode_icer(
+        let legacy = encode(&img, &EncodeOptions::compressed().with_byte_budget(budget)).unwrap();
+        let prio = encode(
             &img,
             &EncodeOptions::compressed()
                 .with_priority_interleaving()
                 .with_byte_budget(budget),
         )
         .unwrap();
-        let p_legacy = psnr(&img, &parse_icer(&legacy).unwrap());
-        let p_prio = psnr(&img, &parse_icer(&prio).unwrap());
+        let p_legacy = psnr(&img, &decode(&legacy).unwrap());
+        let p_prio = psnr(&img, &decode(&prio).unwrap());
         let gain = p_prio - p_legacy;
         println!(
             "budget {budget:>5}: legacy {} B / {p_legacy:.2} dB, priority {} B / {p_prio:.2} dB, gain {gain:+.2} dB",
@@ -386,8 +381,8 @@ fn truncated_quality_beats_msb_down_order() {
 fn lossless_rate_bounded_overhead() {
     for seed in [5u64, 13, 21] {
         let img = textured(64, 64, seed);
-        let legacy = encode_icer(&img, &EncodeOptions::compressed()).unwrap();
-        let prio = encode_icer(
+        let legacy = encode(&img, &EncodeOptions::compressed()).unwrap();
+        let prio = encode(
             &img,
             &EncodeOptions::compressed().with_priority_interleaving(),
         )
@@ -417,12 +412,12 @@ fn soft_target_composes() {
         .with_priority_interleaving()
         .with_target_bytes(600)
         .with_byte_budget(1200);
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     assert!(
         bytes.len() >= 600
             || bytes.len() < 600 && {
                 // A stream naturally smaller than the target is legal.
-                let full = encode_icer(
+                let full = encode(
                     &img,
                     &EncodeOptions::compressed().with_priority_interleaving(),
                 )
@@ -431,7 +426,7 @@ fn soft_target_composes() {
             }
     );
     assert!(bytes.len() as u64 <= 1200);
-    let dec = parse_icer(&bytes).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert_eq!((dec.width, dec.height), (64, 64));
 }
 
@@ -443,12 +438,12 @@ fn quality_target_composes() {
     let opts = EncodeOptions::compressed()
         .with_priority_interleaving()
         .with_quality_target(30.0);
-    let bytes = encode_icer(&img, &opts).unwrap();
-    let dec = parse_icer(&bytes).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
+    let dec = decode(&bytes).unwrap();
     assert!(psnr(&img, &dec) >= 30.0);
     // And it is smaller than the lossless stream (30 dB is well below
     // the lossless ceiling on this textured fixture).
-    let lossless = encode_icer(
+    let lossless = encode(
         &img,
         &EncodeOptions::compressed().with_priority_interleaving(),
     )
@@ -476,7 +471,7 @@ fn uncompressed_fallback_composes() {
     let opts = EncodeOptions::compressed()
         .with_priority_interleaving()
         .with_uncompressed_fallback();
-    let bytes = encode_icer(&img, &opts).unwrap();
+    let bytes = encode(&img, &opts).unwrap();
     let walked = walk_segment(&bytes).unwrap();
     if walked.header.uncompressed {
         assert!(
@@ -484,5 +479,5 @@ fn uncompressed_fallback_composes() {
             "raw segments must not carry the priority flag"
         );
     }
-    assert_bit_exact(&img, &parse_icer(&bytes).unwrap(), "fallback");
+    assert_bit_exact(&img, &decode(&bytes).unwrap(), "fallback");
 }

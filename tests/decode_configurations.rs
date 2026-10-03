@@ -19,9 +19,7 @@
 //! fixed configs) with a systematic matrix, and `truncation_fidelity.rs`
 //! (one fixture) with progressive monotonicity across the whole matrix.
 
-use oxideav_icer::{
-    encode_icer, parse_icer, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
-};
+use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
 
 fn ramp(w: u32, h: u32) -> IcerImage {
     let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);
@@ -71,10 +69,9 @@ fn filter_q_full_quality_bit_exact_matrix() {
             let mut opts = EncodeOptions::compressed();
             opts.filter = WaveletFilter::FilterQ;
             opts.wavelet_levels = levels;
-            let bytes = encode_icer(&img, &opts)
-                .unwrap_or_else(|e| panic!("encode {w}x{h} L{levels}: {e:?}"));
-            let dec =
-                parse_icer(&bytes).unwrap_or_else(|e| panic!("decode {w}x{h} L{levels}: {e:?}"));
+            let bytes =
+                encode(&img, &opts).unwrap_or_else(|e| panic!("encode {w}x{h} L{levels}: {e:?}"));
+            let dec = decode(&bytes).unwrap_or_else(|e| panic!("decode {w}x{h} L{levels}: {e:?}"));
             assert_eq!(dec.width, w);
             assert_eq!(dec.height, h);
             assert_eq!(
@@ -99,13 +96,13 @@ fn filter_q_progressive_monotone_matrix() {
                 let mut opts = EncodeOptions::compressed().with_byte_budget(budget);
                 opts.filter = WaveletFilter::FilterQ;
                 opts.wavelet_levels = levels;
-                let bytes = encode_icer(&img, &opts).expect("encode");
+                let bytes = encode(&img, &opts).expect("encode");
                 assert!(
                     bytes.len() as u64 <= budget,
                     "{w}x{h} L{levels} b={budget}: output {} exceeds cap",
                     bytes.len()
                 );
-                let dec = parse_icer(&bytes).expect("decode");
+                let dec = decode(&bytes).expect("decode");
                 let p = psnr(&img, &dec);
                 assert!(
                     p >= prev - 0.1,
@@ -130,10 +127,10 @@ fn filter_a_decode_bit_exact_matrix() {
             let mut opts = EncodeOptions::compressed();
             opts.filter = WaveletFilter::FilterA;
             opts.wavelet_levels = levels;
-            let bytes = encode_icer(&img, &opts)
-                .unwrap_or_else(|e| panic!("encode A {w}x{h} L{levels}: {e:?}"));
+            let bytes =
+                encode(&img, &opts).unwrap_or_else(|e| panic!("encode A {w}x{h} L{levels}: {e:?}"));
             let dec =
-                parse_icer(&bytes).unwrap_or_else(|e| panic!("decode A {w}x{h} L{levels}: {e:?}"));
+                decode(&bytes).unwrap_or_else(|e| panic!("decode A {w}x{h} L{levels}: {e:?}"));
             assert_eq!(dec.width, w);
             assert_eq!(dec.height, h);
             assert_eq!(
@@ -156,8 +153,8 @@ fn oversized_bit_plane_count_decodes_bit_exact() {
         opts.filter = WaveletFilter::FilterQ;
         opts.wavelet_levels = 3;
         opts.bit_plane_count = q;
-        let bytes = encode_icer(&img, &opts).expect("encode");
-        let dec = parse_icer(&bytes).expect("decode");
+        let bytes = encode(&img, &opts).expect("encode");
+        let dec = decode(&bytes).expect("decode");
         assert_eq!(
             dec.planes[0].data, img.planes[0].data,
             "filter-Q with bit_plane_count={q} must be bit-exact"
