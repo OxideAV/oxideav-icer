@@ -504,7 +504,7 @@ fn parse_icer_single_plane(bytes: &[u8], opts: &DecodeOptions, depth: u8) -> Res
 /// DWT reconstructs the pixels (IPN 42-155 §V.B).
 ///
 /// `strict` requires all `total_segments` segments present with
-/// contiguous indices (the [`parse_icer`] contract); lenient mode
+/// contiguous indices (the [`crate::decode`] contract); lenient mode
 /// tolerates missing segments — their coefficients stay zero, which
 /// reconstructs as a smooth low-detail patch through the shared inverse
 /// transform (§V.B error containment; the loss "bleeds" only slightly
@@ -823,7 +823,7 @@ fn decode_compressed_segment_into(
 /// IPN 42-155 §III.E "Image Partitioning" is the spec justification:
 /// segments are self-contained independently-decodable units, and the
 /// paper notes (§I, §III.E) that this independence is what makes ICER
-/// loss-tolerant on the deep-space link. The strict [`parse_icer`]
+/// loss-tolerant on the deep-space link. The strict [`crate::decode`]
 /// rejects gaps in the `segment_index` sequence with
 /// `IcerError::invalid("non-contiguous segment indices: ...")`; the
 /// lenient API accepts them and surfaces the gap on the report instead.
@@ -831,7 +831,7 @@ fn decode_compressed_segment_into(
 pub struct LenientDecode {
     /// Decoded image. Missing strips are filled with 128 (level-shifted
     /// zero, matching the round-6 ROI-priority placeholder semantic
-    /// already implemented in [`parse_icer`]).
+    /// already implemented in [`crate::decode`]).
     pub image: IcerImage,
     /// `received[i] == true` iff segment with `segment_index == i` was
     /// present in the bytestream. Length equals
@@ -868,7 +868,7 @@ pub struct LenientDecode {
 /// [`parse_icer_lenient_with`] for explicit control.
 ///
 /// On a bytestream with **no** missing segments, the returned image
-/// is bit-identical to what [`parse_icer`] would return and
+/// is bit-identical to what [`crate::decode`] would return and
 /// `missing_count == 0`.
 pub fn parse_icer_lenient(bytes: &[u8]) -> Result<LenientDecode> {
     parse_icer_lenient_with(bytes, &DecodeOptions::default())
@@ -1038,7 +1038,7 @@ fn parse_icer_lenient_single_plane(
     }
 
     // Determine the canonical strip height. Convention (matches
-    // `encode_icer`'s `div_ceil(h, segment_count)` split): every strip
+    // `encode`'s `div_ceil(h, segment_count)` split): every strip
     // except the last has identical height. We use the height of
     // segment 0 as the canonical strip_h; the trailing segment is
     // allowed to be shorter.
@@ -1131,7 +1131,7 @@ fn parse_icer_lenient_single_plane(
 }
 
 /// Decode the IPN 42-155 §III.D "uncompressed" path explicitly. The
-/// generic [`parse_icer`] entry point also handles this case, but the
+/// generic [`crate::decode`] entry point also handles this case, but the
 /// dedicated function is kept for callers that want to assert the
 /// uncompressed-only invariant.
 pub fn decode_uncompressed_icer(walked: &WalkedSegment<'_>) -> Result<IcerImage> {

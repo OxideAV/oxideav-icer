@@ -179,7 +179,7 @@ pub struct EncodeOptions {
     ///
     /// The output byte stream is the per-segment encoded blobs
     /// concatenated **in priority order**, not in segment-index
-    /// order. The decoder (`parse_icer`) already sorts segments by
+    /// order. The decoder (`crate::decode`) already sorts segments by
     /// their on-the-wire `segment_index` field before stitching the
     /// strips, so out-of-priority emission is transparent on the
     /// decode side.
@@ -592,7 +592,7 @@ impl EncodeOptions {
 
     /// Enable automatic filter selection using the cheap
     /// [`crate::analyze::recommend_filter`] heuristic. Overrides any
-    /// previously-set `filter` value on the call to [`encode_icer`].
+    /// previously-set `filter` value on the call to [`crate::encode`].
     /// See [`EncodeOptions::auto_filter`].
     #[must_use]
     pub fn with_auto_filter(mut self) -> Self {
@@ -619,7 +619,7 @@ impl EncodeOptions {
     ///
     /// The vector length must equal [`Self::segment_count`] and the
     /// values must form a permutation of `0..segment_count`. Validation
-    /// happens at [`encode_icer`] time (so the builder remains
+    /// happens at [`crate::encode`] time (so the builder remains
     /// infallible); a malformed vector returns an
     /// [`crate::error::IcerError::Unsupported`] error at encode.
     #[must_use]
@@ -767,19 +767,20 @@ impl EncodeOptions {
     }
 }
 
-/// Encode `image` into the on-the-wire ICER byte stream. Single or
-/// multiple segments depending on `opts.segment_count`.
+/// Pre-contract name of [`crate::encode`]: encode `image` into the
+/// on-the-wire ICER byte stream.
 ///
 /// # Colour images
 ///
 /// A single-plane [`IcerPixelFormat::Gray8`] image produces a bare
 /// single-plane ICER bitstream (the historical wire form — byte-for-byte
-/// unchanged). A colour [`IcerPixelFormat::Yuv444P`] image is encoded as
-/// three **independent** single-plane ICER bitstreams (IPN 42-155 §III
-/// describes ICER as a single-component coder whose deployed colour scheme
-/// runs one ICER instance per component), concatenated behind the small
-/// [`crate::plane_container`] header. The decoder
-/// ([`crate::decoder::parse_icer`]) dispatches on the leading sentinel.
+/// unchanged). A three-plane [`IcerPixelFormat::Yuv444P`] /
+/// [`IcerPixelFormat::Gbrp8`] image is encoded as three **independent**
+/// single-plane ICER bitstreams (IPN 42-155 §III describes ICER as a
+/// single-component coder whose deployed colour scheme runs one ICER
+/// instance per component), concatenated behind the small
+/// [`crate::plane_container`] header. The decoder ([`crate::decode`])
+/// dispatches on the leading sentinel.
 #[deprecated(note = "use oxideav_icer::encode (IMAGE_CRATE_API)")]
 pub fn encode_icer(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     encode_image(image, opts)
@@ -829,7 +830,7 @@ fn encode_icer_deep(image: &IcerImage, bits: u8, opts: &EncodeOptions) -> Result
     // encodes/decodes see full container-framed streams (a bare deep
     // stream would be indistinguishable from an 8-bit one on decode)
     // and the container wrap happens exactly once: the trials clear
-    // `quality_target_psnr`, so their recursive `encode_icer` calls
+    // `quality_target_psnr`, so their recursive `encode_image` calls
     // fall through to the plain wrap below.
     if let Some(target_db) = opts.quality_target_psnr {
         if !opts.uncompressed {
@@ -974,7 +975,7 @@ fn encode_icer_multi_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Ve
 }
 
 /// Encode a single-plane (Gray8) image. This is the historical
-/// `encode_icer` body; the wire form it produces is unchanged.
+/// `encode` body; the wire form it produces is unchanged.
 fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<Vec<u8>> {
     if image.format != IcerPixelFormat::Gray8 {
         return Err(IcerError::Unsupported(
