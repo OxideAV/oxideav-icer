@@ -556,10 +556,13 @@ pass logic — stripe order, contexts, the four-category scheme — drives
 either backend; only the per-packet entropy coding differs.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_interleaved_entropy();         // code with the §IV coder
 let bytes = encode(&image, &opts)?;
 let decoded = decode(&bytes)?;       // decoder dispatches on the wire flag
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The backend choice is recorded in a previously-reserved segment-header bit
@@ -652,11 +655,14 @@ exactly as §III describes:
   carries the priority-group index in its `bit_plane` field.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_priority_interleaving()       // §III.A progressive order
     .with_byte_budget(2_000);           // quota cut on a priority boundary
 let bytes = encode(&image, &opts)?;
 let decoded = decode(&bytes)?;      // decoder dispatches on the wire flag
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The mode rides a previously-reserved header bit (byte 2 bit 7 — the
@@ -704,11 +710,14 @@ integer shift — coefficient `(x, y)` belongs to the §V.D rectangle
 containing LL pixel `(x >> D, y >> D)` (`coefficient_segment_map`).
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let mut opts = oxideav_icer::EncodeOptions::compressed()
     .with_transform_domain_segments();
 opts.segment_count = 8;                  // §V.D partition of the LL subband
 let bytes = oxideav_icer::encode(&image, &opts)?;
 let decoded = oxideav_icer::decode(&bytes)?;   // recomputes the partition
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Wire form: one segment per §V.D rectangle, each header carrying the
@@ -783,6 +792,7 @@ effect quantised with step `2^k` and reconstruct at the §III.A
 deadzone points; `M >= B + D` encodes almost nothing (§VI.A).
 
 ```rust
+# use oxideav_icer::*;
 let opts = oxideav_icer::EncodeOptions::compressed()
     .with_min_loss(3)                    // quality goal
     .with_byte_budget(4096);             // quota — whichever binds first
@@ -898,10 +908,13 @@ Both modes compose with `with_byte_budget` / `with_target_bytes` -- the
 auto-selected filter is then passed through the existing quota path.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_auto_filter_rd()              // try Q and A, pick smaller
     .with_byte_budget(8192);            // hard cap on output bytes
 let bytes = encode(&image, &opts)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Choosing the number of segments (IPN 42-155 §V.C)
@@ -923,10 +936,13 @@ geometry-valid: capped by §V.D eq (9) (`s ≤ LL-subband area`), this
 crate's row-strip 2-row minimum, and the MER cap of 32.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_auto_segments(ChannelReliability::Typical)  // §V.C pick
     .with_byte_budget(20_000);                        // feeds the bytes axis
 let bytes = encode(&image, &opts)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Composes with row-strip and §V.B transform-domain segmentation, both
@@ -964,6 +980,8 @@ is transparent on decode; dropped segments reconstruct as flat 128
 (level-shifted zero coefficients).
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_byte_budget(220)              // very tight budget
     .with_center_roi();                 // centre-first emission
@@ -971,6 +989,7 @@ let bytes = encode(&image, &opts)?;
 // Decode: dropped strips materialise as flat 128, centre strips
 // keep their fidelity.
 let decoded = decode(&bytes)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 **Empirical measurement** (128-row image, 4 segments, 900-byte budget
@@ -1066,10 +1085,13 @@ high-frequency content where the natural MSB-down order is
 score-non-monotonic.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_rd_budget(400);                // hard cap + R-D selection
 let bytes = encode(&image, &opts)?;
 assert!(bytes.len() <= 400);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The R-D mode composes with `with_auto_filter` and
@@ -1098,11 +1120,15 @@ counterpart:
   per-index presence map and the missing-segment count.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
+# let bytes = std::fs::read("damaged.icer")?;
 let lenient = oxideav_icer::parse_icer_lenient(&bytes)?;
 assert_eq!(lenient.received[2], false); // segment 2 was lost in transit
 assert_eq!(lenient.missing_count, 1);
 // `lenient.image` is the reconstructed image with segment 2's strip
 // filled flat 128.
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Constraints:
@@ -1132,12 +1158,15 @@ back whatever quality the truncation yields. The inverse shape: pin a quality (P
 report back the smallest byte count that meets it.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_quality_target(30.0);                 // PSNR floor in dB
 let bytes = encode(&image, &opts)?;
 let decoded = decode(&bytes)?;
 let achieved = oxideav_icer::analyze::psnr_db(&image, &decoded);
 assert!(achieved >= 30.0);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Algorithm:
@@ -1203,6 +1232,8 @@ whole-segment scheduling — starving the periphery is that mode's
 point.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_byte_budget(8192);          // hard cap
 let bytes = encode(&image, &opts)?;
@@ -1214,6 +1245,7 @@ let opts = EncodeOptions::compressed()
     .with_byte_budget(10_000);        // hard cap — never exceeded
 let bytes = encode(&image, &opts)?;
 assert!(bytes.len() <= 10_000);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Semantics:
@@ -1336,12 +1368,15 @@ This is surfaced as an `EncodeOptions` builder:
   smooth strip -> compressed) transparently.
 
 ```rust
+# use oxideav_icer::*;
+# let image = IcerImage::zeros(64, 64, IcerPixelFormat::Gray8);
 let opts = EncodeOptions::compressed()
     .with_uncompressed_fallback();
 let bytes = encode(&image, &opts)?;
 // Decoder reads each segment's `uncompressed` flag and reconstructs
 // accordingly -- no caller-side awareness needed.
 let decoded = decode(&bytes)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Compose-rules:
@@ -1516,6 +1551,7 @@ let opts = CubeEncodeOptions::default()           // filter Q, 3 levels
     .with_min_loss(0);                            // 0 = lossless if quota allows
 let bytes = encode_icer3d(&cube, &opts)?;
 let decoded = parse_icer3d(&bytes)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Rate control is §IV.B verbatim: compression stops when the *minimum
