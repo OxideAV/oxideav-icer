@@ -128,6 +128,8 @@ pub mod api;
 pub mod arith;
 pub mod bitplane;
 pub mod bitplane3d;
+#[cfg(feature = "registry")]
+pub mod container;
 pub mod context;
 pub mod context3d;
 pub mod cube;

@@ -73,9 +73,10 @@ remain for one release as `#[deprecated]` wrappers.
 
 The default `registry` Cargo feature pulls in `oxideav-core` and adds:
 
-* `register(&mut RuntimeContext)` — codec factories + the `.icer`
-  extension hint (also wired into `oxideav_meta::register_all` through
-  `oxideav_core::register!`); `register_codecs(&mut CodecRegistry)` /
+* `register(&mut RuntimeContext)` — codec factories + the `icer`
+  container (probe, demuxer, muxer, `.icer` extension; also wired into
+  `oxideav_meta::register_all` through `oxideav_core::register!`);
+  `register_codecs(&mut CodecRegistry)` /
   `register_containers(&mut ContainerRegistry)` for one side only.
 * `make_decoder(&CodecParameters)` / `make_encoder(&CodecParameters)` —
   the factories behind the registry. The `Decoder` yields one frame per
@@ -98,6 +99,46 @@ The default `registry` Cargo feature pulls in `oxideav-core` and adds:
 
 Both trait impls are thin adapters over the standalone functions — one
 implementation.
+
+### The `icer` container
+
+`register` / `register_containers` install the `icer` container
+(`container` module), so `oxideav_image::open(&ctx, "pancam.icer")` and
+the CLI resolve probe → demuxer → decoder through the registry:
+
+- **Probe.** ICER has no file magic except the ICER-3D cube's
+  `00 00 C3 01` (score 100). Everything else is structural, the walk
+  `info` performs: a plane container whose every segment header chains
+  to the end of the buffer scores 90, a bare 2-D segment stream that
+  does so 70, a plane container whose walk runs off the probe buffer (a
+  stream larger than 256 KiB) 50. A bare stream that runs off the buffer
+  is indistinguishable from noise (the 12-byte header plausibility alone
+  accepts about a quarter of random inputs) and scores 0 without an
+  `.icer` hint; the hint lifts any structural match to at least 75 and
+  scores 25 alone. The sibling crates' image fixtures (467 files) and
+  synthesised foreign headers are pinned to score 0.
+- **Demuxer.** One video stream — `width` / `height` and the native
+  layout from `info` (`Gray8` / `Gray16Le` / `Yuv444P` / `Gbrp8`,
+  labelled with core's depth rung exactly as the decoder labels its
+  frames: `Gray10Le` / `Gray12Le` for 10- / 12-bit deep gray, other
+  depths on the significant-bits side-channel), **no colour signal**
+  (ICER carries none) — and one packet holding the whole file, `pts` 0
+  in a `1/1` time base. `metadata()` carries `bit_depth` and, for a
+  cube, `bands`.
+- **ICER-3D cubes.** A cube is one joint 3-D wavelet transform; no
+  per-band bitstream exists. The cube therefore stays **one packet** and
+  the registry decoder emits **one frame per spectral band** in
+  `decode_all` order with `pts` = band index (band `k` of a packet with
+  `pts` `p` is `p + k`). ICER has no timing: no `duration` is stamped.
+  The §V.C segment election and the band walk stay in the codec.
+- **Muxer.** One packet — the encoder's complete stream — is written
+  verbatim. Several packets are the bands of one cube: each is decoded
+  and the images go through `encode_all` (`IcerCube::from_band_images` →
+  `encode_icer3d` under `EncodeOptions::default`), the mirror of the
+  decoder's band walk; bands must share geometry and depth. The default
+  2-D and cube encodes are lossless, so `decode_all(mux(frames)) ==
+  frames` and the registry round trip `demux(mux(frames)) == frames`
+  hold byte for byte on every layout.
 
 ## Supported layouts
 

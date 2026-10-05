@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `icer` container** (`container` module, `registry` feature):
+  `register` / `register_containers` now install a probe, a demuxer and
+  a muxer besides the `.icer` extension, so the framework
+  (`oxideav_image::open`, the CLI) can open and write ICER files through
+  the registry. Probe: cube magic → 100; else the structural walk `info`
+  performs — plane container walked to the end → 90, bare segment stream
+  walked → 70, container cut by the probe buffer → 50, a cut bare stream
+  → 0 without the `.icer` hint (the 12-byte plausibility alone accepts a
+  quarter of random inputs); hint lifts a structural match to ≥ 75, bare
+  hint 25; the sibling crates' 467 image fixtures and synthesised foreign
+  headers score 0. Demuxer: one video stream with the `info` geometry
+  and the decoder's core label (`Gray8` / `Gray10Le` / `Gray12Le` /
+  `Gray16Le` / `Yuv444P` / `Gbrp8`), no colour signal, the whole file as
+  one packet (`pts` 0, `1/1`), `metadata()` `bit_depth` + `bands`. An
+  ICER-3D cube is one joint transform, so it stays one packet and the
+  registry decoder emits one frame per band with `pts` = band index
+  (`packet.pts + band`, new). Muxer: one packet verbatim; several packets
+  decoded and combined into a cube through `encode_all`. Pinned:
+  registry planes == `decode` planes on seven 2-D layouts (Gray8, 10 /
+  11 / 12 / 16-bit deep gray, Yuv444P, Gbrp8) and == `decode_all` on
+  8- and 12-bit cubes; `demux(mux(frames)) == frames` and
+  `mux == encode_all` (both default encodes are lossless); bad streams /
+  packets / mismatched bands refused (geometry, layout and depth are
+  checked from the headers before any plane is allocated); hostile
+  truncations and byte flips never panic; new `demux` fuzz target (probe
+  and demuxer legs on every input; the codec legs bounded at 1 M samples,
+  because the decoder's working set is a few hundred bytes per sample and
+  a 12-byte header may claim tens of megapixels within the 256 MP cap —
+  two 60 s sessions clean after the bound).
+- The registry decoder stamps `pts` per band (`packet.pts + band index`)
+  on cube frames instead of the packet `pts` on every frame.
 - `IMAGE_CRATE_API` contract surface at the crate root: `probe`, `info` /
   `info_with`, `decode` / `decode_with` / `decode_rgb8` / `decode_rgba8` /
   `decode_all` / `decode_all_with` / `decode_from`, `encode` /

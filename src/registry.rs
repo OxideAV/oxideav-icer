@@ -245,15 +245,13 @@ pub fn register(ctx: &mut RuntimeContext) {
 
 oxideav_core::register!("icer", register);
 
-/// Register the `.icer` file extension so the container registry can
-/// resolve the codec identifier from a filename hint.
-///
-/// ICER has no separate container format — the on-the-wire byte stream
-/// (see [`crate::header::SegmentHeader`]) is also the file format — so
-/// only the extension hook is wired up here. No demuxer or muxer is
-/// registered.
+/// Register the `icer` container ([`crate::container`]): the probe (cube
+/// magic, else the structural walk `info` performs), the demuxer (the
+/// whole file as one packet; a cube's bands come out of the decoder as
+/// one frame each), the muxer (one packet verbatim, several packets
+/// combined into an ICER-3D cube) and the `.icer` extension.
 pub fn register_containers(reg: &mut ContainerRegistry) {
-    reg.register_extension("icer", "icer");
+    crate::container::register(reg);
 }
 
 /// Decoder factory registered with the codec registry. One packet per
@@ -304,8 +302,13 @@ impl Decoder for IcerDecoder {
 
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         for frame in decode_all_with(&packet.data, &self.options)? {
+            // One frame per spectral band of a cube: `pts` counts the
+            // bands from the packet's own `pts` (band `k` → `pts + k`),
+            // so every band keeps its index in the stream's 1/1 time
+            // base. A 2-D stream is the single frame `index == 0`.
+            let pts = packet.pts.map(|p| p + i64::from(frame.index));
             self.pending
-                .push_back(image_into_video_frame(frame.image, packet.pts));
+                .push_back(image_into_video_frame(frame.image, pts));
         }
         Ok(())
     }

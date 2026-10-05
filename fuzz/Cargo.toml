@@ -28,6 +28,13 @@ libfuzzer-sys = "0.4"
 [dependencies.oxideav-icer]
 path = ".."
 default-features = false
+# The `demux` target drives the registry container (demuxer, decoder,
+# muxer), so the framework feature is on; the standalone targets never
+# touch `oxideav-core`.
+features = ["registry"]
+
+[dependencies.oxideav-core]
+version = "0.1"
 
 # Prevent this from interfering with the umbrella workspace.
 [workspace]
@@ -45,5 +52,15 @@ doc = false
 [[bin]]
 name = "encode_roundtrip"
 path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+
+# `demux` drives the `icer` container through the registry: the probe
+# (cube magic, else the structural walk), the demuxer, the registry
+# decoder draining every band frame, and the muxer on the demuxed packet
+# (twice, exercising the cube-combine path).
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
 test = false
 doc = false
