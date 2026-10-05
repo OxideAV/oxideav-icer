@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-icer/compare/v0.0.5...v0.0.6) - 2026-10-05
+
+### Other
+
+- the icer demuxer + muxer behind register_containers (Layer 2)
+- README examples use the current registry API
+- doc prose names the contract verbs — decode / encode instead of the deprecated parse_icer / encode_icer in decoder + encoder rustdoc
+- rustdoc hygiene — no intra-doc links to crate-private items or to registry-gated items from the standalone build
+- README in the contract order + CHANGELOG — Standalone use, Framework use, Supported layouts, Options, Metadata and colour, Limits ahead of the format specifics
+- contract fuzz + CI hygiene — probe/info/decode/decode_all layers in the decode target, Gbrp8 corpus seeds, ci-standalone tests + clippy, crates.io exclude
+- IMAGE_CRATE_API contract surface — probe/info/decode*/encode* roots, IcerImage contract shape, DecodeOptions, Gbrp8 raw path, frame bridge
+
 ### Added
 
 - **The `icer` container** (`container` module, `registry` feature):
