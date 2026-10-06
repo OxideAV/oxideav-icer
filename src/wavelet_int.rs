@@ -224,6 +224,29 @@ pub fn forward_1d(x: &[i32], p: &IntFilterParams, l: &mut Vec<i32>, h: &mut Vec<
 /// low-pass `l` (length `ceil(N/2)`) and high-pass `h` (length
 /// `floor(N/2)`), reconstruct `x[0..N]` exactly. IPN 42-155 §II.A.
 pub fn inverse_1d(l: &[i32], h: &[i32], n: usize, p: &IntFilterParams, x: &mut Vec<i32>) {
+    let mut sc = InverseScratch::default();
+    inverse_1d_with(l, h, n, p, x, &mut sc);
+}
+
+/// Reusable `i64` scratch for [`inverse_1d_with`]: the §II.A `r` and `d`
+/// sequences, kept across calls so a whole-image inverse allocates
+/// them once per line length instead of once per line.
+#[derive(Default)]
+pub(crate) struct InverseScratch {
+    r: Vec<i64>,
+    d: Vec<i64>,
+}
+
+/// [`inverse_1d`] with caller-provided scratch (the arithmetic is
+/// identical; only the allocations move).
+pub(crate) fn inverse_1d_with(
+    l: &[i32],
+    h: &[i32],
+    n: usize,
+    p: &IntFilterParams,
+    x: &mut Vec<i32>,
+    sc: &mut InverseScratch,
+) {
     debug_assert!(n >= 3, "spec eq (3) requires N >= 3");
     let n_lo = n.div_ceil(2);
     let n_hi = n / 2;
@@ -234,7 +257,9 @@ pub fn inverse_1d(l: &[i32], h: &[i32], n: usize, p: &IntFilterParams, x: &mut V
     x.resize(n, 0);
 
     // Recompute r[n] from the stored low-pass outputs (eq (2)).
-    let mut r = vec![0i64; n_lo];
+    let r = &mut sc.r;
+    r.clear();
+    r.resize(n_lo, 0);
     for k in 1..n_lo {
         r[k] = l[k - 1] as i64 - l[k] as i64;
     }
@@ -244,9 +269,11 @@ pub fn inverse_1d(l: &[i32], h: &[i32], n: usize, p: &IntFilterParams, x: &mut V
     // and "n = 1" branches), which is why the recovery proceeds from the
     // highest index downward -- d[n+1] is already known when computing
     // d[n].
-    let mut d = vec![0i64; n_hi];
+    let d = &mut sc.d;
+    d.clear();
+    d.resize(n_hi, 0);
     for n_idx in (0..n_hi).rev() {
-        let pred = predictor(n_idx, n_hi, n, p, &d, &r);
+        let pred = predictor(n_idx, n_hi, n, p, d, r);
         d[n_idx] = h[n_idx] as i64 + pred;
     }
 
@@ -389,6 +416,9 @@ fn forward_2d_one_level(buf: &mut [i32], w: usize, h: usize, p: &IntFilterParams
 
 /// Inverse of [`forward_2d_one_level`]. IPN 42-155 §II.B: a 2-D
 /// stage is inverted in reverse order -- columns first, then rows.
+/// The compact-copy reference shape the in-place lattice inverse of
+/// [`inverse_2d_dyadic`] is pinned against (test-only).
+#[cfg(test)]
 fn inverse_2d_one_level(buf: &mut [i32], w: usize, h: usize, p: &IntFilterParams) {
     let mut col = vec![0i32; h];
     for x in 0..w {
@@ -436,6 +466,17 @@ pub fn forward_2d_dyadic(
 }
 
 /// Exact inverse of [`forward_2d_dyadic`].
+///
+/// Runs in place on the strided lattice of each stage — every row and
+/// column of the stage's `sw x sh` LL lattice is gathered into a line
+/// buffer, inverted with [`inverse_1d_with`] and scattered back — so
+/// the only working memory beyond `buf` is a handful of line-length
+/// scratch vectors (`budget::DWT_SCRATCH_PER_LINE` bytes per sample of
+/// the longest line). The forward path keeps its compact per-stage
+/// copy ([`crate::wavelet::gather_lattice`]); the two produce the same
+/// sequences in the same order, so the reconstruction is bit-identical
+/// to the previous gather / invert / scatter shape (columns first, then
+/// rows, per §II.B).
 pub fn inverse_2d_dyadic(
     buf: &mut [i32],
     width: usize,
@@ -456,10 +497,63 @@ pub fn inverse_2d_dyadic(
         stages.push((stride, sw, sh));
         stride *= 2;
     }
+    let mut line = LineScratch::default();
     for (stride, sw, sh) in stages.into_iter().rev() {
-        let mut sub = crate::wavelet::gather_lattice(buf, width, stride, sw, sh);
-        inverse_2d_one_level(&mut sub, sw, sh, &p);
-        crate::wavelet::scatter_lattice(buf, width, stride, sw, sh, &sub);
+        // Columns first: lattice column `xi` is x = xi * stride, y = yi *
+        // stride for yi in 0..sh (buffer step `stride * width`).
+        for xi in 0..sw {
+            line.inverse_lattice(buf, xi * stride, stride * width, sh, &p);
+        }
+        // Then rows: lattice row `yi` is y = yi * stride, x = xi * stride
+        // for xi in 0..sw (buffer step `stride`).
+        for yi in 0..sh {
+            line.inverse_lattice(buf, yi * stride * width, stride, sw, &p);
+        }
+    }
+}
+
+/// Line-length scratch for the in-place lattice inverse: the gathered
+/// even / odd (low / high) halves, the reconstructed line and the
+/// `i64` §II.A sequences.
+#[derive(Default)]
+pub(crate) struct LineScratch {
+    l: Vec<i32>,
+    h: Vec<i32>,
+    x: Vec<i32>,
+    inner: InverseScratch,
+}
+
+impl LineScratch {
+    /// Invert one interleaved line of `count` samples sitting at
+    /// `buf[base + i * step]`, in place. Lines shorter than the §II.A
+    /// predictor's three samples are left untouched, exactly like
+    /// [`inverse_1d_interleaved`].
+    #[inline]
+    pub(crate) fn inverse_lattice(
+        &mut self,
+        buf: &mut [i32],
+        base: usize,
+        step: usize,
+        count: usize,
+        p: &IntFilterParams,
+    ) {
+        if count < 3 {
+            return;
+        }
+        let n_lo = count.div_ceil(2);
+        let n_hi = count / 2;
+        self.l.clear();
+        self.h.clear();
+        for k in 0..n_lo {
+            self.l.push(buf[base + 2 * k * step]);
+        }
+        for k in 0..n_hi {
+            self.h.push(buf[base + (2 * k + 1) * step]);
+        }
+        inverse_1d_with(&self.l, &self.h, count, p, &mut self.x, &mut self.inner);
+        for (i, &v) in self.x.iter().enumerate() {
+            buf[base + i * step] = v;
+        }
     }
 }
 
@@ -864,6 +958,61 @@ mod tests {
             // for any sample depth up to 16 bits under any filter.
             assert!(65535 <= max_input_range(f, 32, 2).unwrap(), "{f:?}");
             assert_eq!(word_bits_for_input_range(65535, f), Some(32), "{f:?}");
+        }
+    }
+
+    /// The in-place lattice inverse reproduces the previous
+    /// gather / invert / scatter shape bit for bit — on random
+    /// coefficient buffers (not only on forward-transform outputs), so
+    /// hostile streams reconstruct identically too.
+    #[test]
+    fn lattice_inverse_matches_compact_copy_reference() {
+        fn reference(buf: &mut [i32], width: usize, height: usize, levels: u8, f: WaveletFilter) {
+            let p = f.int_params();
+            let mut stages = Vec::new();
+            let mut stride = 1usize;
+            for _ in 0..levels {
+                let sw = width.div_ceil(stride);
+                let sh = height.div_ceil(stride);
+                if sw < 3 || sh < 3 {
+                    break;
+                }
+                stages.push((stride, sw, sh));
+                stride *= 2;
+            }
+            for (stride, sw, sh) in stages.into_iter().rev() {
+                let mut sub = crate::wavelet::gather_lattice(buf, width, stride, sw, sh);
+                inverse_2d_one_level(&mut sub, sw, sh, &p);
+                crate::wavelet::scatter_lattice(buf, width, stride, sw, sh, &sub);
+            }
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for f in ALL {
+            for &(w, h) in &[
+                (3usize, 3usize),
+                (7, 5),
+                (16, 16),
+                (33, 9),
+                (64, 48),
+                (5, 70),
+            ] {
+                for levels in 1u8..=6 {
+                    let original: Vec<i32> = (0..w * h)
+                        .map(|_| (next() % 20001) as i32 - 10000)
+                        .collect();
+                    let mut a = original.clone();
+                    let mut b = original.clone();
+                    reference(&mut a, w, h, levels, f);
+                    inverse_2d_dyadic(&mut b, w, h, levels, f);
+                    assert_eq!(a, b, "{f:?} {w}x{h} D={levels}");
+                }
+            }
         }
     }
 

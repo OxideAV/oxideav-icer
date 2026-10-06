@@ -7,7 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.6](https://github.com/OxideAV/oxideav-icer/compare/v0.0.5...v0.0.6) - 2026-10-05
+### Changed
+
+- **Bounded decoder memory.** `DecodeOptions::max_bytes` now bounds the
+  decoder's *planned peak working set* — the decoded planes plus the
+  largest per-segment coefficient buffer and coder state — computed
+  from the framing before anything is allocated (`budget` module; the
+  formula is in the README's "Memory" section). Previously it bounded
+  the decoded planes alone, so a 12-byte header could pass the byte
+  budget and still make the decoder commit several times the output.
+  `ImageInfo::working_set_bytes` (new, ICER extra) reports the plan;
+  `info` refuses exactly what `decode` refuses. The default stays
+  1 GiB: with the 64 MPx per-segment cap that admits every row-strip
+  image the pixel caps admit and refuses 256 MPx transform-domain
+  images (~2 GiB) until `max_bytes` is raised — a behaviour change
+  for callers who relied on the output-only accounting at that scale.
+- **Smaller decode footprint, byte-identical output.** The 2-D
+  bit-plane decoder keeps one packed state byte per coefficient (the
+  §III.B category, sign and deepest delivered plane — four vectors and
+  a flag before) and accumulates magnitudes in the `i32` coefficient
+  buffer itself, reconstructing the §III.A deadzone points in place:
+  12 bytes per sample of coder state + reconstruction became 5. The
+  inverse §II.A transform runs in place on each stage's strided
+  lattice with line-length scratch (the full-size per-stage copy is
+  gone); §V.B transform-domain segments decode straight into the
+  shared whole-image buffer (no per-segment image copy); §III.D
+  uncompressed strips copy straight from the packet bodies; zero-packet
+  segments are written as the level-shift midpoint without a
+  coefficient buffer or inverse DWT; colour containers assemble their
+  planes without zero-filled placeholders; `IcerImage::zeros` no longer
+  clones a template plane (which doubled every decode's transient
+  footprint). The ICER-3D decoder packs the IPN 42-164 §IV.C category
+  and sign in one byte, accumulates in its coefficient buffer, replaces
+  the per-subband coordinate lists with lattice descriptors, and
+  writes band frames directly — `decode_all` on a cube no longer
+  materialises the cube and then copies it into frames (the `IcerCube`
+  fronts stack the frames once). The §IV interleaved entropy coder
+  builds its Table 10 codeword tables once per process
+  (`ixec::shared_bins`) and walks prebuilt tries instead of rebuilding
+  a trie from a clone of the codeword list on every bit — several
+  hundred kilobytes of allocation per packet before. Every fixture
+  decodes byte-identically; the lattice inverse is pinned against the
+  previous compact-copy shape on random buffers under every filter.
+  Measured peak RSS per sample (release, `decode_all`): a 1 MP
+  single-segment image 13.4 → 6.3 B, a 1 MP transform-domain image
+  18.7 → 7.5 B, 8-/12-bit 256×256×16 cubes 6.5 / 6.9 → 2.6 / 3.6 B
+  (strips) and 13.2 / 13.8 → 6.3 / 7.3 B (transform-domain), a hostile
+  64 MP header with no body 690 MB / 1.2 s → 69 MB / 0.06 s (README
+  "Memory").
+
+- Hostile input: a header declaring the format's maximum geometry
+  (65535 × 65535, or 65535³ for a cube) returns `LimitExceeded` in
+  well under a millisecond without any allocation above a few
+  kilobytes; a 64 MP header with no body (the default per-segment cap)
+  costs its 64 MiB output plane and nothing else; truncated segments
+  and impossible band counts never panic (`tests/memory_budget.rs`,
+  counting allocator). New `plan_budget` fuzz target: the planner and
+  the decoder must agree on budget refusals, an accepted plan must fit
+  its budget, and the lenient depth decoders must honour a refusal.
+
+## [0.0.6]
+(https://github.com/OxideAV/oxideav-icer/compare/v0.0.5...v0.0.6) - 2026-10-05
 
 ### Other
 

@@ -55,6 +55,16 @@ path = "fuzz_targets/encode_roundtrip.rs"
 test = false
 doc = false
 
+# `plan_budget` fuzzes the memory planner (r473): the first byte picks a
+# `max_bytes` budget, the rest is the stream; `info_with` and
+# `decode_all_with` must agree on budget refusals, an accepted plan must
+# fit the budget, and the lenient depth decoders must honour a refusal.
+[[bin]]
+name = "plan_budget"
+path = "fuzz_targets/plan_budget.rs"
+test = false
+doc = false
+
 # `demux` drives the `icer` container through the registry: the probe
 # (cube magic, else the structural walk), the demuxer, the registry
 # decoder draining every band frame, and the muxer on the demuxed packet

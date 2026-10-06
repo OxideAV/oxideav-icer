@@ -31,7 +31,7 @@ use crate::error::{IcerError, Result};
 /// | `max_width` / `max_height` | `None` | the 16-bit header fields already bound them to 65535 |
 /// | `max_pixels_per_segment` | 64 MPx | one segment's `width × height` (ICER extra) |
 /// | `max_pixels` | 256 MPx | the stitched image's `width × height` (summed over row-strip segments; a cube's `width × height × bands`) |
-/// | `max_bytes` | 1 GiB | decoded plane bytes (`pixels × sample_bytes × planes`) |
+/// | `max_bytes` | 1 GiB | the decoder's planned peak **working set** — decoded planes plus the largest per-segment coefficient buffer and coder state (README "Memory"; `ImageInfo::working_set_bytes`) |
 /// | `strict` | `false` | no effect — see below |
 ///
 /// # `strict`
@@ -53,7 +53,9 @@ pub struct DecodeOptions {
     /// Reject images with more than this many pixels (`width ×
     /// height`, summed over row-strip segments; `× bands` for a cube).
     pub max_pixels: Option<u64>,
-    /// Reject images whose decoded planes would exceed this many bytes.
+    /// Reject streams whose planned peak working set (decoded planes +
+    /// the largest per-segment decode state, see the type docs) would
+    /// exceed this many bytes.
     pub max_bytes: Option<u64>,
     /// No effect (see the type docs); exists for contract shape.
     pub strict: bool,
@@ -68,7 +70,7 @@ impl DecodeOptions {
     pub const DEFAULT_MAX_PIXELS_PER_SEGMENT: u64 = 64 * 1024 * 1024;
     /// Default [`Self::max_pixels`]: 256 MPx.
     pub const DEFAULT_MAX_PIXELS: u64 = 256 * 1024 * 1024;
-    /// Default [`Self::max_bytes`]: 1 GiB of decoded planes.
+    /// Default [`Self::max_bytes`]: 1 GiB of planned working set.
     pub const DEFAULT_MAX_BYTES: u64 = 1 << 30;
 
     /// The defaults (see the type docs).
@@ -94,7 +96,7 @@ impl DecodeOptions {
         self
     }
 
-    /// Set (or lift with `None`) the decoded-bytes limit.
+    /// Set (or lift with `None`) the working-set byte limit.
     pub fn with_max_bytes(mut self, max_bytes: impl Into<Option<u64>>) -> Self {
         self.max_bytes = max_bytes.into();
         self
@@ -173,12 +175,12 @@ impl DecodeOptions {
         Ok(())
     }
 
-    /// Check the decoded plane bytes against [`Self::max_bytes`].
+    /// Check a planned peak working set against [`Self::max_bytes`].
     pub(crate) fn check_bytes(&self, bytes: u64) -> Result<()> {
         if let Some(m) = self.max_bytes {
             if bytes > m {
                 return Err(IcerError::limit(format!(
-                    "decoded planes of {bytes} bytes exceed max_bytes {m} \
+                    "planned decoder working set of {bytes} bytes exceeds max_bytes {m} \
                      (see DecodeOptions::max_bytes)"
                 )));
             }

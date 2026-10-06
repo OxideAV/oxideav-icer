@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "oxideav-icer"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxideav-core",
 ]

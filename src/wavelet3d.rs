@@ -57,7 +57,7 @@
 //! applies at the frozen spatial-low-pass lattice `2^t_s`.
 
 use crate::header::WaveletFilter;
-use crate::wavelet_int::{forward_1d, inverse_1d, IntFilterParams};
+use crate::wavelet_int::{forward_1d, inverse_1d_with, IntFilterParams, InverseScratch};
 
 /// IPN 42-164 §III.B dynamic-range expansion factor `γ` of one
 /// one-dimensional high-pass filtering operation, as an exact rational
@@ -181,12 +181,14 @@ impl Lattice {
     }
 }
 
-/// Reusable transform scratch buffers (sample gather + l/h split).
+/// Reusable transform scratch buffers (sample gather + l/h split + the
+/// inverse's `i64` §II.A sequences).
 #[derive(Default)]
 struct Scratch {
     x: Vec<i32>,
     l: Vec<i32>,
     h: Vec<i32>,
+    inner: InverseScratch,
 }
 
 /// One forward 1-D stage over a [`Lattice`]: samples are gathered,
@@ -221,7 +223,8 @@ fn inverse_lattice(buf: &mut [i32], lat: Lattice, p: &IntFilterParams, s: &mut S
     for i in 0..n_hi {
         s.h.push(buf[lat.pos(2 * i + 1)]);
     }
-    inverse_1d(&s.l, &s.h, lat.count, p, &mut s.x);
+    inverse_1d_with(&s.l, &s.h, lat.count, p, &mut s.x, &mut s.inner);
+
     for (i, &v) in s.x.iter().enumerate() {
         buf[lat.pos(i)] = v;
     }

@@ -233,7 +233,7 @@ metadata stage.
 | `max_width` / `max_height` | `None` | the 16-bit header fields already bound both to 65535 |
 | `max_pixels_per_segment` (ICER extra) | 64 MPx | one segment's `width × height` — the unit the coefficient buffer and inverse DWT are sized by (a cube: `width × strip_height × bands`, or the whole cube in transform-domain mode) |
 | `max_pixels` | 256 MPx | the stitched image's `width × height`, summed over row-strip segments and over the planes of a container; a cube's `width × height × bands` |
-| `max_bytes` | 1 GiB | decoded plane bytes (`pixels × sample_bytes × planes`; a cube is materialised as `u16` samples) |
+| `max_bytes` | 1 GiB | the decoder's **planned peak working set** — decoded planes plus the largest per-segment coefficient buffer and coder state (see "Memory"); not only the output |
 | `strict` | `false` | no effect (see "Options") |
 
 Why pixel caps and not only bytes: the wire format's `u16` width /
@@ -249,7 +249,109 @@ caps the *reconstruction geometry* it infers from a gapped
 `segment_index` sequence (two tiny received strips at a huge index gap
 would otherwise buy a multi-GB placeholder allocation).
 
+## Memory
+
+The decoder plans its peak memory from the framing before it allocates
+anything, and `DecodeOptions::max_bytes` is checked against that plan —
+the **working set**, not the decoded planes alone. `info` /
+`ImageInfo::working_set_bytes` reports the figure for any stream (what
+`decode_all` will hold at its peak); a stream `info` accepts under a
+policy decodes within that many bytes of heap, which
+`tests/memory_budget.rs` pins with a counting global allocator on every
+layout and coding mode.
+
+**Formula.** 2-D streams (bare segments or the plane container; planes
+and row-strip segments are decoded one after another, so only the
+output outlives a segment):
+
+```text
+plan = Σ_planes width × height × sample_bytes          -- the output
+     + max over segments of segment_working_set
+     + 128 KiB                                         -- framing walk, frame records
+
+segment_working_set (compressed row strip of w × h)
+     = w × h × (4 + 1 [+ 1 when min_loss > 0])       -- i32 coefficients + one state byte [+ §VI.A skip map]
+     + 32 × max(w, h) + segment bytes + 128 KiB        -- DWT line scratch, packet copies, schedule / models
+segment_working_set (§V.B transform-domain, W × H image)
+     = W × H × (4 + 1 + 2 [+ 1])                       -- + the u16 §V.B segment map
+     + 32 × max(W, H) + plane bytes + 128 KiB
+segment_working_set (§III.D uncompressed) = 0          -- copied straight into the plane
+```
+
+ICER-3D cubes (`W × H × bands` samples; row strips of `strip_h` rows or
+one §V.D transform-domain partition), decoded straight into one frame
+per band:
+
+```text
+plan = W × H × bands × sample_bytes                    -- the band frames (u8 to 8 bits, u16 beyond)
+     + V_seg × (4 + 1)                                 -- i32 coefficients + one state byte
+     + subband tables + 128 KiB
+V_seg = W × strip_h × bands (strips)  |  W × H × bands (transform-domain)
+```
+
+**Why these sizes.** The coefficient buffer is `i32`: IPN 42-155 §II.C
+Table 4 gives the input range a 32-bit word accommodates after two
+high-pass operations as ≥ 422 726 500 for every filter, so any sample
+depth up to 16 bits fits, and the header's 6-bit bit-plane count
+(`Q ≤ 32`) bounds hostile magnitudes to the same word. The bit-plane
+decoder accumulates magnitudes directly in that buffer and keeps one
+packed byte per coefficient — the §III.B category (four categories,
+2 bits), the sign (§III.A sign-magnitude, 1 bit) and the deepest
+delivered bit plane (`0..=30`, 5 bits) — then applies the §III.A
+deadzone reconstruction in place. The inverse §II.A transform runs on
+the strided lattice of each stage with line-length scratch instead of a
+per-stage copy of the image. The ICER-3D state is the IPN 42-164 §IV.C
+category and sign in one byte, and the subband member sets are lattice
+descriptors rather than coordinate lists. Zero-packet segments are
+served as the level-shift midpoint without a coefficient buffer or an
+inverse DWT, so a hostile 12-byte header with no body costs its output
+plane and nothing else.
+
+**Defaults and how to move them.** `max_bytes` defaults to 1 GiB of
+working set (`DecodeOptions::DEFAULT_MAX_BYTES`). With the per-segment
+cap at 64 MPx that admits every row-strip image the pixel caps admit
+(a 64 MPx strip plans ~320 MiB plus the output) and refuses a 256 MPx
+§V.B transform-domain image (~2 GiB) or a 256 MP transform-domain cube
+(~1.3 GiB) until the caller raises it:
+
+```rust
+# use oxideav_icer::*;
+# let bytes: Vec<u8> = Vec::new();
+let plan = info_with(&bytes, &DecodeOptions::new().unlimited())?.working_set_bytes;
+let opts = DecodeOptions::new().with_max_bytes(plan.max(1 << 30));
+# let _ = decode_with(&bytes, &opts);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Lower it (`with_max_bytes(32 << 20)`, say) to refuse anything that
+would hold more than 32 MiB — the planner then rejects a 64 MPx header
+before the plane is allocated. The `registry` decoder applies
+`DecodeOptions::default` per packet (`IcerDecoder::set_options` to
+change it); the framework's `VideoFrame` conversion adds one copy of
+the frame on top of the plan. The plan is a bound: the measured peak
+heap sits below it by the fixed overheads (each 128 KiB) and by the
+strip-amortised terms on multi-segment images.
+
+**Measured** (r473; `decode_all`, release build, maximum resident set
+size over a read-only baseline, `/usr/bin/time -l` on macOS; every
+decode byte-identical before and after):
+
+| stream | samples | before B/sample | after B/sample |
+|---|---|---|---|
+| 2048² Gray8 lossless, 128 row strips | 4.19 M | 2.35 | 1.22 |
+| 1024² Gray8, one segment, byte-budget truncated | 1.05 M | 13.41 | 6.27 |
+| 1024² Gray8, 16 §V.B transform-domain segments | 1.05 M | 18.73 | 7.53 |
+| 256×256×16 cube, 8-bit, 4 strips / 4 §V.D segments | 1.05 M | 6.53 / 13.20 | 2.56 / 6.30 |
+| 256×256×16 cube, 12-bit, 4 strips / 4 §V.D segments | 1.05 M | 6.86 / 13.83 | 3.56 / 7.30 |
+| hostile 12-byte header, 8192² (64 MP), no body | 67.1 M | 10.26 (690 MB, 1.19 s) | 1.00 (69 MB, 0.06 s) |
+
+The single-segment row is the per-segment term the formula bounds
+(`4 + 1` plus the output plane and scratch); the strip rows amortise it
+against the output.
+
+
 ## Status
+
 
 | Subsystem                | Status            |
 |--------------------------|-------------------|
@@ -1349,7 +1451,24 @@ words.
 ```bash
 cd fuzz
 cargo +nightly fuzz run decode_segment -- -max_total_time=60
+cargo +nightly fuzz run plan_budget -- -max_total_time=60 -malloc_limit_mb=32
 ```
+
+`plan_budget` (r473) fuzzes the memory planner (see "Memory"): the
+first input byte picks a `max_bytes` budget (64 KiB … 16 MiB, the
+1 GiB default, unlimited), the rest is the stream. `info_with` and
+`decode_all_with` must agree on budget refusals, an accepted plan must
+fit its budget and match the decoded geometry, the plan must not depend
+on the policy it was checked under, and the lenient depth decoders must
+honour a refusal. With the pixel caps held at 1 MP / segment and 4 MP
+total (the `decode_segment` budget) the plan stays under 32 MiB, so
+`-malloc_limit_mb=32` turns any single allocation the planner did not
+account for into a finding (keep the default `-rss_limit_mb`: the
+sanitizer build's shadow memory and quarantine put a garbage-decode
+iteration at many times its live heap). r473: two 60 s sessions, 0
+findings (the one `oom` artifact of the first session was the
+sanitizer's RSS at 24 MB live, reproduced clean at the default limit).
+
 
 Local bounded runs on the r454 pipeline (§V.C auto-segments wire
 synthesis + the r454 scan optimisations): `decode_segment` 26596

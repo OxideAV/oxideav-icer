@@ -442,11 +442,11 @@ impl IcerImage {
     /// [`IcerImage::new`] for a fallible path).
     pub fn zeros(width: u32, height: u32, format: PixelFormat) -> Self {
         let stride = width as usize * format.sample_bytes();
-        let plane = Plane::new(stride, vec![0u8; stride * height as usize]);
-        let mut planes = Vec::with_capacity(format.plane_count());
-        for _ in 0..format.plane_count() {
-            planes.push(plane.clone());
-        }
+        // One zeroed allocation per plane (no template plane cloned:
+        // the clone doubled the transient footprint of every decode).
+        let planes = (0..format.plane_count())
+            .map(|_| Plane::new(stride, vec![0u8; stride * height as usize]))
+            .collect();
         Self {
             width,
             height,
@@ -1012,6 +1012,14 @@ pub struct ImageInfo {
     /// segments, in plane order, for a plane container; offsets are
     /// relative to the whole input). Empty for a cube.
     pub segments: Vec<SegmentMetadata>,
+    /// ICER extra: the decoder's planned peak working set for
+    /// [`crate::decode_all`] on this stream, in bytes — the decoded
+    /// planes plus the largest per-segment coefficient buffer and coder
+    /// state (see the README's "Memory" section for the formula). This
+    /// is the figure [`crate::DecodeOptions::max_bytes`] is checked
+    /// against; a stream `info` accepts under a given policy decodes
+    /// within this many bytes of heap.
+    pub working_set_bytes: u64,
 }
 
 impl ImageInfo {

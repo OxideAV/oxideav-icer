@@ -20,8 +20,9 @@
 use std::io::{Read, Write};
 
 use crate::cube::{
-    encode_icer3d, is_cube, parse_cube_header, parse_icer3d_with, CubeEncodeOptions, IcerCube,
+    decode_cube_frames, encode_icer3d, is_cube, parse_cube_header, CubeEncodeOptions, IcerCube,
 };
+
 use crate::decoder::{decode_image, walk_stream};
 use crate::encoder::{encode_image, EncodeOptions};
 use crate::error::{IcerError, Result};
@@ -126,8 +127,10 @@ pub fn info_with(bytes: &[u8], opts: &DecodeOptions) -> Result<ImageInfo> {
             bit_depth: hdr.bit_depth,
             kind: StreamKind::Cube,
             segments: Vec::new(),
+            working_set_bytes: hdr.working_set,
         });
     }
+
     let layout = walk_stream(bytes, opts)?;
     Ok(ImageInfo {
         width: layout.width,
@@ -142,6 +145,7 @@ pub fn info_with(bytes: &[u8], opts: &DecodeOptions) -> Result<ImageInfo> {
         bit_depth: layout.bit_depth,
         kind: layout.kind,
         segments: layout.segments,
+        working_set_bytes: layout.working_set,
     })
 }
 
@@ -158,7 +162,10 @@ pub fn decode(bytes: &[u8]) -> Result<IcerImage> {
 /// [`DecodeOptions`]).
 pub fn decode_with(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerImage> {
     if is_cube(bytes) {
-        return parse_icer3d_with(bytes, opts)?.band_image(0);
+        // The 3-D transform couples every band, so the whole cube is
+        // decoded; band 0 is handed out, the rest dropped.
+        let mut frames = decode_cube_frames(bytes, opts)?;
+        return Ok(frames.swap_remove(0));
     }
     decode_image(bytes, opts)
 }
@@ -189,10 +196,14 @@ pub fn decode_all(bytes: &[u8]) -> Result<Vec<Frame>> {
 /// [`decode_all`] under explicit [`DecodeOptions`].
 pub fn decode_all_with(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Frame>> {
     if is_cube(bytes) {
-        let cube = parse_icer3d_with(bytes, opts)?;
-        return (0..cube.bands)
-            .map(|b| Ok(Frame::new(cube.band_image(b)?, b)))
-            .collect();
+        // The cube decoder writes its band frames directly (no cube →
+        // frame copy), which is what the working-set plan counts.
+        let frames = decode_cube_frames(bytes, opts)?;
+        return Ok(frames
+            .into_iter()
+            .enumerate()
+            .map(|(b, img)| Frame::new(img, b as u32))
+            .collect());
     }
     Ok(vec![Frame::new(decode_image(bytes, opts)?, 0)])
 }

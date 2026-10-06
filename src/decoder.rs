@@ -29,13 +29,15 @@
 //! 12-byte segment header (`u16 * u16`), which means a single tiny
 //! header can request up to ~4 GB of decoder allocation per plane —
 //! a DoS surface flagged by the cargo-fuzz harness. [`DecodeOptions`]
-//! caps the per-segment and per-image pixel counts and the decoded
-//! bytes the decoder will agree to materialise; every cap is checked
-//! on the framing before any plane or coefficient buffer exists and
-//! before any inverse DWT runs, failing with
-//! [`IcerError::LimitExceeded`].
+//! caps the per-segment and per-image pixel counts and the peak
+//! working set the decoder will agree to hold (planned from the
+//! framing by [`crate::budget`] — output planes plus the largest
+//! per-segment coefficient buffer and coder state); every cap is
+//! checked before any plane or coefficient buffer exists and before
+//! any inverse DWT runs, failing with [`IcerError::LimitExceeded`].
 
 use crate::bitplane::{EncodedPacket, ScanFilter};
+use crate::budget;
 use crate::error::{IcerError, Result};
 use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
 use crate::image::StreamKind;
@@ -165,17 +167,30 @@ pub(crate) struct StreamLayout {
     pub height: u32,
     pub kind: StreamKind,
     pub segments: Vec<SegmentMetadata>,
+    /// The decoder's planned peak working set in bytes (the output
+    /// planes plus the largest per-segment decode state — see
+    /// [`crate::budget`]); what [`DecodeOptions::max_bytes`] was checked
+    /// against.
+    pub working_set: u64,
+}
+
+/// The §VI.A minimum-loss parameter a walked segment's packets carry
+/// (replicated in every packet header; `0` when the segment has none).
+fn walked_min_loss(walked: &WalkedSegment<'_>) -> u8 {
+    walked.packets.first().map_or(0, |p| p.header.min_loss)
 }
 
 /// Header-only walk of one single-plane segment stream: every segment's
 /// framing record, the canonical width, the stitched height (sum of
 /// the row strips; the declared image for §V.B transform-domain
-/// streams) and the image pixel count — each segment and the running
+/// streams), the image pixel count and the plane's decode working set
+/// (the largest per-segment term plus the plane's own bytes, which the
+/// decoder copies into `EncodedPacket`s) — each segment and the running
 /// total checked against `opts` as they are met.
 fn walk_single_plane(
     bytes: &[u8],
     opts: &DecodeOptions,
-) -> Result<(u32, u32, u64, Vec<SegmentMetadata>)> {
+) -> Result<(u32, u32, u64, u64, Vec<SegmentMetadata>)> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
     }
@@ -185,6 +200,7 @@ fn walk_single_plane(
     let mut transform_counted = false;
     let mut width: u32 = 0;
     let mut height: u64 = 0;
+    let mut segment_ws: u64 = 0;
     while cursor < bytes.len() {
         let walked = walk_segment(&bytes[cursor..])?;
         opts.check_segment(
@@ -192,6 +208,11 @@ fn walk_single_plane(
             walked.header.width as u32,
             walked.header.height as u32,
         )?;
+        segment_ws = segment_ws.max(budget::segment_working_set(
+            &walked.header,
+            walked_min_loss(&walked),
+            walked.consumed,
+        ));
         if segments.is_empty() {
             width = walked.header.width as u32;
         } else if walked.header.width as u32 != width {
@@ -231,14 +252,26 @@ fn walk_single_plane(
     let height =
         u32::try_from(height).map_err(|_| IcerError::invalid("multi-segment height overflow"))?;
     opts.check_width_height(width, height)?;
-    Ok((width, height, total_pixels, segments))
+    Ok((
+        width,
+        height,
+        total_pixels,
+        segment_ws + bytes.len() as u64,
+        segments,
+    ))
 }
 
 /// Walk the framing of a whole 2-D stream — bare segments or the plane
 /// container — applying every [`DecodeOptions`] cap (per segment,
-/// total pixels, decoded bytes, width / height) exactly as the decode
-/// path does, but without allocating a plane. Cube streams are not
-/// handled here (see [`crate::cube`]).
+/// total pixels, width / height, and `max_bytes` against the planned
+/// peak working set) exactly as the decode path does, but without
+/// allocating a plane. Cube streams are not handled here (see
+/// [`crate::cube`]).
+///
+/// The working set is the output planes plus the largest single
+/// per-plane decode term: planes and row-strip segments are decoded
+/// one after another, so only the output outlives a segment (see
+/// [`crate::budget`] for the per-sample constants).
 pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLayout> {
     if bytes.is_empty() {
         return Err(IcerError::Truncated);
@@ -251,11 +284,13 @@ pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLa
         let parsed = crate::plane_container::parse_container(bytes)?;
         let mut segments = Vec::new();
         let mut total_pixels: u64 = 0;
+        let mut plane_ws: u64 = 0;
         let mut geometry: Option<(u32, u32)> = None;
         for i in 0..parsed.format.plane_count() {
             let (base, _end) = parsed.plane_ranges[i];
             let sub = parsed.plane_bytes(bytes, i);
-            let (w, h, px, sub_segments) = walk_single_plane(sub, opts)?;
+            let (w, h, px, ws, sub_segments) = walk_single_plane(sub, opts)?;
+            plane_ws = plane_ws.max(ws);
             match geometry {
                 None => geometry = Some((w, h)),
                 Some((w0, h0)) if (w0, h0) != (w, h) => {
@@ -275,7 +310,10 @@ pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLa
             }
         }
         let (width, height) = geometry.ok_or(IcerError::Truncated)?;
-        opts.check_bytes(total_pixels * parsed.format.sample_bytes() as u64)?;
+        let working_set = budget::output_bytes(total_pixels, parsed.format.sample_bytes() as u64)
+            + plane_ws
+            + budget::FIXED_OVERHEAD;
+        opts.check_bytes(working_set)?;
         return Ok(StreamLayout {
             format: parsed.format,
             bit_depth: parsed.bit_depth,
@@ -283,10 +321,12 @@ pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLa
             height,
             kind: StreamKind::PlaneContainer,
             segments,
+            working_set,
         });
     }
-    let (width, height, total_pixels, segments) = walk_single_plane(bytes, opts)?;
-    opts.check_bytes(total_pixels)?;
+    let (width, height, total_pixels, plane_ws, segments) = walk_single_plane(bytes, opts)?;
+    let working_set = budget::output_bytes(total_pixels, 1) + plane_ws + budget::FIXED_OVERHEAD;
+    opts.check_bytes(working_set)?;
     Ok(StreamLayout {
         format: IcerPixelFormat::Gray8,
         bit_depth: 8,
@@ -294,6 +334,7 @@ pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLa
         height,
         kind: StreamKind::Segments,
         segments,
+        working_set,
     })
 }
 
@@ -351,6 +392,14 @@ pub(crate) fn decode_image(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerIma
         return Err(IcerError::Truncated);
     }
 
+    // Header-only pre-walk: every cap — per segment, total pixels,
+    // width / height, and `max_bytes` against the planned peak working
+    // set — is enforced here, before the first coefficient buffer or
+    // plane exists. The decode paths below re-check the per-segment
+    // geometry as they walk (defence in depth; header parsing is
+    // cheap) but allocate nothing the plan did not account for.
+    walk_stream(bytes, opts)?;
+
     // Colour / deep images are framed as a multi-plane container
     // (leading 0x0000 sentinel — see `crate::plane_container`). A
     // single-plane Gray8 stream never starts with 0x0000, so the
@@ -365,46 +414,42 @@ pub(crate) fn decode_image(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerIma
 
 /// Decode a multi-plane (colour) container: each plane substream is a full
 /// single-plane ICER bitstream, decoded independently and re-assembled
-/// into the declared [`IcerPixelFormat`].
+/// into the declared [`IcerPixelFormat`]. The caller has already run
+/// [`walk_stream`] on the whole container.
 fn parse_icer_multi_plane(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerImage> {
-    // Header-only pre-walk: the whole-image caps (total pixels across
-    // planes, decoded bytes) are enforced here, before the first
-    // plane's coefficient buffer exists.
-    walk_stream(bytes, opts)?;
     let parsed = crate::plane_container::parse_container(bytes)?;
     let n = parsed.format.plane_count();
     let depth = parsed.bit_depth;
 
-    let mut plane_images: Vec<IcerImage> = Vec::with_capacity(n);
+    // Decode plane by plane, moving each finished plane straight into
+    // the output's plane list — no zero-filled placeholder planes, no
+    // per-plane image copies. Every plane must agree on geometry: the
+    // container's planes are co-sited (4:4:4) views of one image.
+    let mut planes: Vec<Plane> = Vec::with_capacity(n);
+    let mut geometry: Option<(u32, u32)> = None;
     for i in 0..n {
         let sub = parsed.plane_bytes(bytes, i);
-        plane_images.push(parse_icer_single_plane(sub, opts, depth)?);
-    }
-
-    // Every plane must agree on geometry — the container's planes are
-    // co-sited (4:4:4) views of one image.
-    let w = plane_images[0].width;
-    let h = plane_images[0].height;
-    for (i, p) in plane_images.iter().enumerate() {
-        if p.width != w || p.height != h {
-            return Err(IcerError::Unsupported(format!(
-                "colour plane {i} geometry {}x{} disagrees with plane 0 {}x{}",
-                p.width, p.height, w, h
-            )));
+        let img = parse_icer_single_plane(sub, opts, depth)?;
+        match geometry {
+            None => geometry = Some((img.width, img.height)),
+            Some((w, h)) if (w, h) != (img.width, img.height) => {
+                return Err(IcerError::Unsupported(format!(
+                    "colour plane {i} geometry {}x{} disagrees with plane 0 {w}x{h}",
+                    img.width, img.height
+                )))
+            }
+            _ => {}
         }
+        planes.push(
+            img.planes
+                .into_iter()
+                .next()
+                .ok_or_else(|| IcerError::invalid("decoded colour plane has no data"))?,
+        );
     }
-
-    let mut out = IcerImage::zeros(w, h, parsed.format);
+    let (w, h) = geometry.ok_or(IcerError::Truncated)?;
+    let mut out = IcerImage::new(w, h, parsed.format, planes)?;
     out.bit_depth = parsed.bit_depth;
-    for (i, p) in plane_images.into_iter().enumerate() {
-        // Each decoded plane image is Gray8 with a single plane; move it
-        // into slot `i` of the colour image.
-        out.planes[i] = p
-            .planes
-            .into_iter()
-            .next()
-            .ok_or_else(|| IcerError::invalid("decoded colour plane has no data"))?;
-    }
     Ok(out)
 }
 
@@ -487,7 +532,6 @@ fn parse_icer_single_plane(bytes: &[u8], opts: &DecodeOptions, depth: u8) -> Res
     }
 
     opts.check_width_height(canonical_width as u32, total_height as u32)?;
-    opts.check_bytes(total_pixels * sample_bytes(depth) as u64)?;
     let mut img = zeros_gray(canonical_width as u32, total_height as u32, depth);
     let mut y_cursor = 0usize;
     for walked in &walked_all {
@@ -580,7 +624,10 @@ fn decode_transform_domain(
     }
 
     // Recompute the §V.D partition (never encoded — §V.D) and decode
-    // each present segment's coefficients into the shared buffer.
+    // each present segment's coefficients straight into the shared
+    // whole-image buffer: the segments' coefficient sets are disjoint,
+    // and the `_into` decoders touch only the coefficients their
+    // filter visits, so no per-segment copy of the image is needed.
     let seg_map = crate::partition::coefficient_segment_map(w, h, levels, total)?;
     let (w_ll, h_ll) = crate::partition::ll_dimensions(w, h, levels);
     let rects = crate::partition::partition(w_ll, h_ll, total)?;
@@ -596,22 +643,9 @@ fn decode_transform_domain(
         // §VI.A minimum loss, replicated in every packet header.
         let min_loss = wseg.packets[0].header.min_loss;
         let window = rects[seg_idx as usize].image_window(levels, w, h);
-        let encoded_packets: Vec<EncodedPacket> = wseg
-            .packets
-            .iter()
-            .map(|wp| EncodedPacket {
-                bit_plane: wp.header.bit_plane,
-                is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
-                body: wp.body.to_vec(),
-                delta_distortion: 0.0,
-            })
-            .collect();
-        let kind = if wseg.header.interleaved_entropy {
-            crate::entropy::EntropyKind::Interleaved
-        } else {
-            crate::entropy::EntropyKind::Arithmetic
-        };
-        let part = if wseg.header.priority_interleaved {
+        let encoded_packets = encoded_packets_of(wseg);
+        let kind = entropy_kind_of(&wseg.header);
+        if wseg.header.priority_interleaved {
             // §III.A subband-priority interleaving over this §V.B
             // segment (min_loss excludes whole subband bit planes from
             // the schedule; no per-coefficient skip map applies).
@@ -620,7 +654,7 @@ fn decode_transform_domain(
                 skip: None,
                 window: Some(window),
             };
-            crate::bitplane::decode_bitplanes_prioritized(
+            crate::bitplane::decode_bitplanes_prioritized_into(
                 &encoded_packets,
                 w,
                 h,
@@ -629,7 +663,8 @@ fn decode_transform_domain(
                 kind,
                 &filter,
                 min_loss,
-            )?
+                &mut coeffs,
+            )?;
         } else {
             let skip_map: Option<Vec<u8>> =
                 (min_loss > 0).then(|| crate::priority::min_loss_skip_map(w, h, levels, min_loss));
@@ -638,7 +673,7 @@ fn decode_transform_domain(
                 skip: skip_map.as_deref(),
                 window: Some(window),
             };
-            crate::bitplane::decode_bitplanes_filtered(
+            crate::bitplane::decode_bitplanes_filtered_into(
                 &encoded_packets,
                 w,
                 h,
@@ -646,14 +681,8 @@ fn decode_transform_domain(
                 levels,
                 kind,
                 &filter,
-            )?
-        };
-        let (wx0, wx1, wy0, wy1) = window;
-        for y in wy0..wy1 {
-            for x in wx0..wx1 {
-                let i = y * w + x;
-                coeffs[i] = part[i];
-            }
+                &mut coeffs,
+            )?;
         }
     }
     let missing_count = received.iter().filter(|&&r| !r).count();
@@ -676,6 +705,32 @@ fn decode_transform_domain(
     Ok((img, received, missing_count))
 }
 
+/// The walked packets of a segment as the bit-plane decoder's
+/// [`EncodedPacket`] records (bodies copied — at most the segment's
+/// own `u16` body length).
+fn encoded_packets_of(walked: &WalkedSegment<'_>) -> Vec<EncodedPacket> {
+    walked
+        .packets
+        .iter()
+        .map(|wp| EncodedPacket {
+            bit_plane: wp.header.bit_plane,
+            is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
+            body: wp.body.to_vec(),
+            // Decoder side does not need the R-D estimate; default to 0.0.
+            delta_distortion: 0.0,
+        })
+        .collect()
+}
+
+/// The entropy backend a segment header selects (IPN 42-155 §IV).
+fn entropy_kind_of(header: &SegmentHeader) -> crate::entropy::EntropyKind {
+    if header.interleaved_entropy {
+        crate::entropy::EntropyKind::Interleaved
+    } else {
+        crate::entropy::EntropyKind::Arithmetic
+    }
+}
+
 fn decode_segment_into(
     walked: &WalkedSegment<'_>,
     plane: &mut Plane,
@@ -694,24 +749,21 @@ fn decode_segment_into(
             fill_mid_rows(plane, y_offset, strip_h, canonical_width, depth);
             return Ok(());
         }
-        // Concatenate every packet body, then copy at most the strip's
-        // raw sample bytes (width * height * sample_bytes).
+        // The packet bodies concatenate to the strip's raw sample bytes
+        // (width * height * sample_bytes, §III.D); copy them row by row
+        // straight out of the input — no intermediate strip buffer.
         let row_bytes = canonical_width * sb;
         let strip_bytes = row_bytes * strip_h;
-        let mut concat: Vec<u8> = Vec::with_capacity(strip_bytes);
-        for p in &walked.packets {
-            concat.extend_from_slice(p.body);
-            if concat.len() >= strip_bytes {
-                break;
-            }
-        }
-        if concat.len() < strip_bytes {
+        let available: usize = walked.packets.iter().map(|p| p.body.len()).sum();
+        if available < strip_bytes {
             return Err(IcerError::Truncated);
         }
+        let mut src = walked.packets.iter().flat_map(|p| p.body.iter().copied());
         for y in 0..strip_h {
             let dst = &mut plane.data[(y_offset + y) * plane.stride..][..row_bytes];
-            let src = &concat[y * row_bytes..(y + 1) * row_bytes];
-            dst.copy_from_slice(src);
+            for (d, s) in dst.iter_mut().zip(&mut src) {
+                *d = s;
+            }
         }
         Ok(())
     } else {
@@ -732,68 +784,63 @@ fn decode_compressed_segment_into(
 
     // A zero-packet compressed segment is valid: it means the encoder
     // stopped before emitting any bit-plane data (e.g. due to a very
-    // tight byte budget). Reconstruct as all-zero coefficients — after
-    // the inverse DWT and level-shift this yields all-128 pixels.
-    let mut coeffs = if walked.packets.is_empty() {
-        vec![0i32; width * height]
+    // tight byte budget). Its coefficients are all zero, and the §II.A
+    // inverse transform of an all-zero buffer is all zero (every stage
+    // is linear in the integer sense at zero: `floor(0/2) = 0`), so the
+    // strip is the level-shift midpoint — written directly, without a
+    // coefficient buffer or an inverse DWT. This is also what bounds a
+    // hostile "12-byte header, no body" input to its output plane.
+    if walked.packets.is_empty() {
+        fill_mid_rows(plane, y_offset, height, width, depth);
+        return Ok(());
+    }
+
+    // The coefficient buffer doubles as the bit-plane decoder's
+    // magnitude accumulator (see `decode_bitplanes_filtered_into`), so
+    // the segment's working set is this buffer plus one state byte per
+    // coefficient (`budget::segment_working_set`).
+    let mut coeffs = vec![0i32; width * height];
+    let encoded_packets = encoded_packets_of(walked);
+    let kind = entropy_kind_of(&walked.header);
+    // §VI.A minimum loss, replicated in every packet header: apply
+    // the identical per-subband plane exclusion the encoder used
+    // (0 on every pre-existing stream = no exclusion).
+    let min_loss = walked.packets[0].header.min_loss;
+    if walked.header.priority_interleaved {
+        // §III.A subband-priority interleaving: replay the identical
+        // priority-group schedule (min_loss drops whole subband bit
+        // planes from it, so no per-coefficient skip map applies).
+        crate::bitplane::decode_bitplanes_prioritized_into(
+            &encoded_packets,
+            width,
+            height,
+            q,
+            levels,
+            kind,
+            &ScanFilter::ALL,
+            min_loss,
+            &mut coeffs,
+        )?;
     } else {
-        // Reconstruct the EncodedPacket list from the walked packet
-        // headers. Each WalkedPacket's header has bit_plane + pass
-        // fields that map directly to EncodedPacket's bit_plane +
-        // is_significance.
-        let encoded_packets: Vec<EncodedPacket> = walked
-            .packets
-            .iter()
-            .map(|wp| EncodedPacket {
-                bit_plane: wp.header.bit_plane,
-                is_significance: matches!(wp.header.pass, BitPlanePass::Significance),
-                body: wp.body.to_vec(),
-                // Decoder side does not need the R-D estimate; default to 0.0.
-                delta_distortion: 0.0,
-            })
-            .collect();
-        let kind = if walked.header.interleaved_entropy {
-            crate::entropy::EntropyKind::Interleaved
-        } else {
-            crate::entropy::EntropyKind::Arithmetic
+        let skip_map: Option<Vec<u8>> = (min_loss > 0)
+            .then(|| crate::priority::min_loss_skip_map(width, height, levels, min_loss));
+        let filter = ScanFilter {
+            segment: None,
+            skip: skip_map.as_deref(),
+            window: None,
         };
-        // §VI.A minimum loss, replicated in every packet header: apply
-        // the identical per-subband plane exclusion the encoder used
-        // (0 on every pre-existing stream = no exclusion).
-        let min_loss = walked.packets[0].header.min_loss;
-        if walked.header.priority_interleaved {
-            // §III.A subband-priority interleaving: replay the identical
-            // priority-group schedule (min_loss drops whole subband bit
-            // planes from it, so no per-coefficient skip map applies).
-            crate::bitplane::decode_bitplanes_prioritized(
-                &encoded_packets,
-                width,
-                height,
-                q,
-                levels,
-                kind,
-                &ScanFilter::ALL,
-                min_loss,
-            )?
-        } else {
-            let skip_map: Option<Vec<u8>> = (min_loss > 0)
-                .then(|| crate::priority::min_loss_skip_map(width, height, levels, min_loss));
-            let filter = ScanFilter {
-                segment: None,
-                skip: skip_map.as_deref(),
-                window: None,
-            };
-            crate::bitplane::decode_bitplanes_filtered(
-                &encoded_packets,
-                width,
-                height,
-                q,
-                levels,
-                kind,
-                &filter,
-            )?
-        }
-    };
+        crate::bitplane::decode_bitplanes_filtered_into(
+            &encoded_packets,
+            width,
+            height,
+            q,
+            levels,
+            kind,
+            &filter,
+            &mut coeffs,
+        )?;
+    }
+    drop(encoded_packets);
     wavelet_int::inverse_2d_dyadic(&mut coeffs, width, height, levels, walked.header.filter);
     // Inverse level-shift + clamp to the n-bit domain (0..=255 at depth
     // 8). Saturating: a corrupted stream can decode coefficients near
@@ -1011,6 +1058,14 @@ fn parse_icer_lenient_single_plane(
     // coefficients stay zero — a smooth low-detail patch through the
     // shared inverse transform rather than a flat-128 strip.
     if walked_all.iter().any(|w| w.header.transform_segmented) {
+        // The whole-image working set of the shared-transform path
+        // (every header declares the full image; the walk above
+        // checked the pixel caps once).
+        let first = &walked_all[0].header;
+        let plan = budget::output_bytes(segment_pixels(first), sample_bytes(depth) as u64)
+            + budget::segment_working_set(first, walked_min_loss(&walked_all[0]), bytes.len())
+            + budget::FIXED_OVERHEAD;
+        opts.check_bytes(plan)?;
         let (image, received, missing_count) = decode_transform_domain(&walked_all, false, depth)?;
         return Ok(LenientDecode {
             image,
@@ -1078,7 +1133,20 @@ fn parse_icer_lenient_single_plane(
         .ok_or_else(|| IcerError::invalid("multi-segment pixel-count overflow"))?;
     opts.check_total_pixels(recon_pixels, "lenient reconstruction geometry")?;
     opts.check_width_height(canonical_width as u32, total_height as u32)?;
-    opts.check_bytes(recon_pixels * sample_bytes(depth) as u64)?;
+    // Planned peak working set: the reconstruction plane plus the
+    // largest received segment's decode state (segments are decoded one
+    // after another) plus the packet copies.
+    let segment_ws = walked_all
+        .iter()
+        .map(|w| budget::segment_working_set(&w.header, walked_min_loss(w), w.consumed))
+        .max()
+        .unwrap_or(0);
+    opts.check_bytes(
+        budget::output_bytes(recon_pixels, sample_bytes(depth) as u64)
+            + segment_ws
+            + bytes.len() as u64
+            + budget::FIXED_OVERHEAD,
+    )?;
 
     let mut img = zeros_gray(canonical_width as u32, total_height as u32, depth);
     let mut received = vec![false; expected_segment_count];

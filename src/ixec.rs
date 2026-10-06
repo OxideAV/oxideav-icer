@@ -62,6 +62,13 @@
 pub struct ComponentCode {
     /// `(input_codeword, output_codeword)` pairs, in a stable order.
     pairs: Vec<(Vec<bool>, Vec<bool>)>,
+    /// Trie over the input codewords (index = position in `pairs`),
+    /// built once with the code so every per-bit lookup is one walk —
+    /// the earlier shape rebuilt it from a clone of the codeword list
+    /// on every call.
+    input_trie: Trie,
+    /// Trie over the output codewords (index = position in `pairs`).
+    output_trie: Trie,
 }
 
 /// Result of consuming bits through a [`Trie`]: either a codeword index
@@ -159,7 +166,13 @@ impl ComponentCode {
     /// pairs. Both sides must be prefix-free + exhaustive (the caller's
     /// responsibility; the constructors below produce valid sets).
     fn from_pairs(pairs: Vec<(Vec<bool>, Vec<bool>)>) -> Self {
-        ComponentCode { pairs }
+        let inputs: Vec<Vec<bool>> = pairs.iter().map(|(i, _)| i.clone()).collect();
+        let outputs: Vec<Vec<bool>> = pairs.iter().map(|(_, o)| o.clone()).collect();
+        ComponentCode {
+            input_trie: Trie::build(&inputs),
+            output_trie: Trie::build(&outputs),
+            pairs,
+        }
     }
 
     /// Number of (input, output) codeword pairs.
@@ -231,9 +244,7 @@ impl ComponentCode {
     /// is only a (strict) prefix of an input codeword (caller must
     /// supply more) — a malformed dead-end also yields `None`.
     pub fn encode_one(&self, bits: &[bool]) -> Option<(Vec<bool>, usize)> {
-        let inputs: Vec<Vec<bool>> = self.pairs.iter().map(|(i, _)| i.clone()).collect();
-        let trie = Trie::build(&inputs);
-        match trie.walk(bits) {
+        match self.input_trie.walk(bits) {
             TrieStep::Complete { index, consumed } => Some((self.pairs[index].1.clone(), consumed)),
             _ => None,
         }
@@ -243,9 +254,7 @@ impl ComponentCode {
     /// `bits` (channel bits), returning the matched input codeword and
     /// the number of channel bits consumed. `None` on incomplete / dead.
     pub fn decode_one(&self, bits: &[bool]) -> Option<(Vec<bool>, usize)> {
-        let outputs: Vec<Vec<bool>> = self.pairs.iter().map(|(_, o)| o.clone()).collect();
-        let trie = Trie::build(&outputs);
-        match trie.walk(bits) {
+        match self.output_trie.walk(bits) {
             TrieStep::Complete { index, consumed } => Some((self.pairs[index].0.clone(), consumed)),
             _ => None,
         }
@@ -260,38 +269,35 @@ impl ComponentCode {
     /// Look up the output codeword paired with a *complete* input
     /// codeword `input`, or `None` if `input` is not a codeword.
     fn output_for_input(&self, input: &[bool]) -> Option<&[bool]> {
-        self.pairs
-            .iter()
-            .find(|(i, _)| i.as_slice() == input)
-            .map(|(_, o)| o.as_slice())
+        match self.input_trie.walk(input) {
+            TrieStep::Complete { index, consumed } if consumed == input.len() => {
+                Some(self.pairs[index].1.as_slice())
+            }
+            _ => None,
+        }
     }
 
     /// Look up the input codeword paired with a *complete* output
     /// codeword `output`, or `None`.
     fn input_for_output(&self, output: &[bool]) -> Option<&[bool]> {
-        self.pairs
-            .iter()
-            .find(|(_, o)| o.as_slice() == output)
-            .map(|(i, _)| i.as_slice())
+        match self.output_trie.walk(output) {
+            TrieStep::Complete { index, consumed } if consumed == output.len() => {
+                Some(self.pairs[index].0.as_slice())
+            }
+            _ => None,
+        }
     }
 
     /// Classify a run of source bits against the *input* codeword set:
     /// is `bits` exactly a codeword, a strict prefix of one or more, or
-    /// neither?
+    /// neither? (One trie walk: a terminal reached with bits to spare
+    /// is "neither" — a prefix-free set has no codeword extending
+    /// another.)
     fn classify_input(&self, bits: &[bool]) -> InputStatus {
-        // Exact match?
-        if self.pairs.iter().any(|(i, _)| i.as_slice() == bits) {
-            return InputStatus::Complete;
-        }
-        // Strict prefix of some codeword?
-        if self
-            .pairs
-            .iter()
-            .any(|(i, _)| i.len() > bits.len() && i[..bits.len()] == *bits)
-        {
-            InputStatus::Partial
-        } else {
-            InputStatus::None
+        match self.input_trie.walk(bits) {
+            TrieStep::Complete { consumed, .. } if consumed == bits.len() => InputStatus::Complete,
+            TrieStep::More => InputStatus::Partial,
+            _ => InputStatus::None,
         }
     }
 
@@ -485,6 +491,20 @@ pub const CUTOFFS: [u32; 17] = [
 /// * Bins 9–17 — the Golomb codes G5, G6, G7, G11, G17, G31, G70, G200,
 ///   G512.
 pub fn bins() -> Vec<Bin> {
+    shared_bins().to_vec()
+}
+
+/// The Table 10 bin design built once per process and shared by every
+/// encoder / decoder instance. The codeword tables (Golomb `G_512`'s
+/// 513 input words alone are ~130 K bits) and their tries used to be
+/// rebuilt for every packet body — several hundred kilobytes of
+/// allocation per packet, visible in the decoder's peak heap.
+pub fn shared_bins() -> &'static [Bin] {
+    static BINS: std::sync::OnceLock<Vec<Bin>> = std::sync::OnceLock::new();
+    BINS.get_or_init(build_bins)
+}
+
+fn build_bins() -> Vec<Bin> {
     // §IV.D shorthand strings for bins 2..=8, transcribed from Table 10.
     let sh2 = "(((((0^4 1, 1^4 ), 0^3 1), 001), 10), (01, (110, (0^5 , 1^3 0))))";
     let sh3 = "(((001, ((1101, 0^3 11), 1^3 )), 10), (01, (0^4 , (1100, 0^3 10))))";
@@ -585,7 +605,7 @@ struct Word {
 /// output codeword when that word reaches the *front* of the list
 /// complete — preserving the order the decoder needs.
 pub struct InterleavedEncoder {
-    bins: Vec<Bin>,
+    bins: &'static [Bin],
     /// Ordered word list (front = index 0). At most one *partial* word
     /// per bin is open at a time (the most recent).
     words: std::collections::VecDeque<Word>,
@@ -637,7 +657,7 @@ impl InterleavedEncoder {
     /// Build a fresh encoder over the Table 10 bin design.
     pub fn new() -> Self {
         InterleavedEncoder {
-            bins: bins(),
+            bins: shared_bins(),
             words: std::collections::VecDeque::new(),
             out: BitSink::default(),
             #[cfg(test)]
@@ -776,7 +796,7 @@ impl Default for InterleavedEncoder {
 /// back to its input codeword, returns the input codeword's first bit,
 /// and stores the remainder as the new suffix.
 pub struct InterleavedDecoder<'a> {
-    bins: Vec<Bin>,
+    bins: &'static [Bin],
     /// Channel bits (MSB-first) with a read cursor.
     chan: &'a [u8],
     bit_pos: usize,
@@ -801,10 +821,11 @@ impl<'a> InterleavedDecoder<'a> {
     /// Build a decoder over the channel byte stream produced by
     /// [`InterleavedEncoder::finish`].
     pub fn new(channel: &'a [u8]) -> Self {
-        let bins = bins();
+        let bins = shared_bins();
         let n = bins.len();
         InterleavedDecoder {
             bins,
+
             chan: channel,
             bit_pos: 0,
             suffix: (0..n).map(|_| std::collections::VecDeque::new()).collect(),

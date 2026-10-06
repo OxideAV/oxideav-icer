@@ -83,8 +83,7 @@
 //! ```
 
 use crate::bitplane3d::{
-    decode_cube_bitplanes, decode_cube_bitplanes_into, encode_cube_bitplanes, CubeGeometry,
-    CubePacket,
+    decode_cube_bitplanes_into, encode_cube_bitplanes, CubeGeometry, CubePacket,
 };
 use crate::entropy::EntropyKind;
 use crate::error::{IcerError, Result};
@@ -669,7 +668,16 @@ pub fn parse_icer3d(bytes: &[u8]) -> Result<IcerCube> {
 /// Decode an ICER-3D cube stream under an explicit [`DecodeOptions`]
 /// policy.
 pub fn parse_icer3d_with(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerCube> {
-    Ok(parse_cube(bytes, opts, false)?.cube)
+    IcerCube::from_band_images(&parse_cube(bytes, opts, false)?.frames)
+}
+
+/// Decode an ICER-3D cube stream into one gray image per band (what
+/// [`crate::decode_all`] hands out). The band frames are the decoder's
+/// native output — the strip / segment reconstruction writes straight
+/// into them, so this path holds no intermediate cube; the
+/// [`IcerCube`] fronts stack the frames afterwards.
+pub(crate) fn decode_cube_frames(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<IcerImage>> {
+    Ok(parse_cube(bytes, opts, false)?.frames)
 }
 
 /// [`parse_icer3d`] under a pre-contract [`DecodeLimits`] policy.
@@ -703,6 +711,25 @@ pub struct LenientCubeDecode {
     pub truncated: bool,
 }
 
+/// The decode core's output: the band frames plus the lenient report.
+pub(crate) struct CubeFrames {
+    pub frames: Vec<IcerImage>,
+    pub packets_received: Vec<usize>,
+    pub segments_received: usize,
+    pub truncated: bool,
+}
+
+impl CubeFrames {
+    fn into_lenient(self) -> Result<LenientCubeDecode> {
+        Ok(LenientCubeDecode {
+            cube: IcerCube::from_band_images(&self.frames)?,
+            packets_received: self.packets_received,
+            segments_received: self.segments_received,
+            truncated: self.truncated,
+        })
+    }
+}
+
 /// Loss-tolerant decode of an ICER-3D cube stream (default
 /// [`DecodeOptions`]).
 ///
@@ -716,12 +743,12 @@ pub struct LenientCubeDecode {
 /// the [`DecodeOptions`] policy) can still fail the decode — the
 /// geometry, filter, and segment layout are unrecoverable without it.
 pub fn parse_icer3d_lenient(bytes: &[u8]) -> Result<LenientCubeDecode> {
-    parse_cube(bytes, &DecodeOptions::default(), true)
+    parse_cube(bytes, &DecodeOptions::default(), true)?.into_lenient()
 }
 
 /// [`parse_icer3d_lenient`] under an explicit [`DecodeOptions`] policy.
 pub fn parse_icer3d_lenient_with(bytes: &[u8], opts: &DecodeOptions) -> Result<LenientCubeDecode> {
-    parse_cube(bytes, opts, true)
+    parse_cube(bytes, opts, true)?.into_lenient()
 }
 
 /// [`parse_icer3d_lenient`] under a pre-contract [`DecodeLimits`]
@@ -732,7 +759,7 @@ pub fn parse_icer3d_lenient_with_limits(
     bytes: &[u8],
     limits: &DecodeLimits,
 ) -> Result<LenientCubeDecode> {
-    parse_cube(bytes, &DecodeOptions::from(limits), true)
+    parse_cube(bytes, &DecodeOptions::from(limits), true)?.into_lenient()
 }
 
 /// The fixed 17-byte cube header, parsed and validated (geometry,
@@ -751,6 +778,10 @@ pub(crate) struct CubeHeader {
     pub strip_h: usize,
     pub transform_domain: bool,
     pub kind: EntropyKind,
+    /// The planned peak working set of decoding this cube into band
+    /// frames ([`crate::budget::cube_working_set`]) — what
+    /// [`DecodeOptions::max_bytes`] was checked against.
+    pub working_set: u64,
 }
 
 /// Parse + validate the cube header at the start of `bytes` under
@@ -843,8 +874,18 @@ pub(crate) fn parse_cube_header<'a>(
         }
     }
     opts.check_total_pixels(total, "cube")?;
-    // The cube is materialised as `u16` samples whatever the depth.
-    opts.check_bytes(total * 2)?;
+    // `max_bytes` bounds the planned peak working set: the band frames
+    // (`u8` samples up to 8 bits, `u16` beyond) plus the per-segment
+    // coefficient buffer and coder state.
+    let working_set = crate::budget::cube_working_set(
+        width as u64,
+        height as u64,
+        bands as u64,
+        strip_h as u64,
+        transform_domain,
+        if bit_depth > 8 { 2 } else { 1 },
+    );
+    opts.check_bytes(working_set)?;
 
     Ok((
         CubeHeader {
@@ -858,6 +899,7 @@ pub(crate) fn parse_cube_header<'a>(
             strip_h,
             transform_domain,
             kind,
+            working_set,
         },
         r,
     ))
@@ -867,7 +909,7 @@ pub(crate) fn parse_cube_header<'a>(
 /// shortfall is an error; in lenient mode segment-level shortfalls
 /// degrade to partial reconstruction and only header-level problems
 /// error.
-fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<LenientCubeDecode> {
+fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<CubeFrames> {
     let (hdr, mut r) = parse_cube_header(bytes, opts)?;
     let CubeHeader {
         width,
@@ -880,6 +922,7 @@ fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<Lenie
         strip_h,
         transform_domain,
         kind,
+        working_set: _,
     } = hdr;
 
     let shift = 1i32 << (bit_depth - 1);
@@ -888,7 +931,27 @@ fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<Lenie
     } else {
         (1i32 << bit_depth) - 1
     };
-    let mut cube = IcerCube::zeros(width as u32, height as u32, bands as u32, bit_depth);
+    // One gray frame per band, written in place as strips / segments
+    // complete (`Gray8` up to 8 bits, `Gray16Le` beyond — the layout
+    // `IcerCube::band_image` produces).
+    let format = if bit_depth > 8 {
+        IcerPixelFormat::Gray16Le
+    } else {
+        IcerPixelFormat::Gray8
+    };
+    let sb = if bit_depth > 8 { 2usize } else { 1 };
+    let mut frames: Vec<IcerImage> = (0..bands)
+        .map(|_| IcerImage::zeros(width as u32, height as u32, format).with_bit_depth(bit_depth))
+        .collect::<Result<_>>()?;
+    // Store one reconstructed sample into a frame row.
+    let store = |row: &mut [u8], x: usize, c: i32| {
+        let v = c.saturating_add(shift).clamp(0, ceil) as u16;
+        if sb == 2 {
+            row[x * 2..x * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        } else {
+            row[x] = v as u8;
+        }
+    };
 
     /// One segment's wire fields: q, per-band means, packets.
     type SegmentFields<'a> = (u8, Vec<i32>, Vec<(u8, &'a [u8])>);
@@ -996,17 +1059,27 @@ fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<Lenie
             let geom = CubeGeometry::with_window(width, height, bands, levels, window);
             match decode_cube_bitplanes_into(&geom, &packets, q, kind, &mut coeffs) {
                 Ok(()) => packets_received[seg] = packets.len(),
-                // A corrupt body: the coefficient buffer is untouched
-                // (reconstruction only runs after a clean decode), so
-                // the segment degrades to its means alone.
-                Err(_) if lenient => packets_received[seg] = 0,
+                // A corrupt body: drop whatever magnitude bits landed
+                // before the failure so the segment degrades to its
+                // means alone.
+                Err(_) if lenient => {
+                    geom.clear_members(&mut coeffs);
+                    packets_received[seg] = 0;
+                }
                 Err(e) => return Err(e),
             }
             add_plane_means(&mut coeffs, &geom, &means, window);
         }
         inverse_3d(&mut coeffs, width, height, bands, levels, filter);
-        for (dst, &c) in cube.samples.iter_mut().zip(&coeffs) {
-            *dst = c.saturating_add(shift).clamp(0, ceil) as u16;
+        for (b, frame) in frames.iter_mut().enumerate() {
+            let plane = &mut frame.planes[0];
+            let src_plane = b * width * height;
+            for y in 0..height {
+                let row = &mut plane.data[y * plane.stride..][..width * sb];
+                for x in 0..width {
+                    store(row, x, coeffs[src_plane + y * width + x]);
+                }
+            }
         }
     } else {
         for seg in 0..seg_count {
@@ -1016,12 +1089,10 @@ fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<Lenie
             let mut coeffs = vec![0i32; width * sh * bands];
             if let Some((q, means, packets)) = read_one(seg)? {
                 segments_received += 1;
-                match decode_cube_bitplanes(&geom, &packets, q, kind) {
-                    Ok(c) => {
-                        coeffs = c;
-                        packets_received[seg] = packets.len();
-                    }
-                    Err(_) if lenient => {}
+                match decode_cube_bitplanes_into(&geom, &packets, q, kind, &mut coeffs) {
+                    Ok(()) => packets_received[seg] = packets.len(),
+                    // Corrupt body: no partial magnitudes survive.
+                    Err(_) if lenient => coeffs.fill(0),
                     Err(e) => return Err(e),
                 }
                 add_plane_means(&mut coeffs, &geom, &means, (0, width, 0, sh));
@@ -1029,23 +1100,21 @@ fn parse_cube(bytes: &[u8], opts: &DecodeOptions, lenient: bool) -> Result<Lenie
             inverse_3d(&mut coeffs, width, sh, bands, levels, filter);
 
             // Undo the level shift, clamp to the sample range, and place
-            // the strip rows into the output cube.
-            for b in 0..bands {
+            // the strip rows into each band's frame.
+            for (b, frame) in frames.iter_mut().enumerate() {
+                let plane = &mut frame.planes[0];
                 let src_plane = b * width * sh;
-                let dst_plane = b * width * height;
                 for y in 0..sh {
+                    let row = &mut plane.data[(y0 + y) * plane.stride..][..width * sb];
                     for x in 0..width {
-                        let v = coeffs[src_plane + y * width + x]
-                            .saturating_add(shift)
-                            .clamp(0, ceil);
-                        cube.samples[dst_plane + (y0 + y) * width + x] = v as u16;
+                        store(row, x, coeffs[src_plane + y * width + x]);
                     }
                 }
             }
         }
     }
-    Ok(LenientCubeDecode {
-        cube,
+    Ok(CubeFrames {
+        frames,
         packets_received,
         segments_received,
         truncated,

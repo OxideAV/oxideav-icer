@@ -128,6 +128,7 @@ pub mod api;
 pub mod arith;
 pub mod bitplane;
 pub mod bitplane3d;
+pub(crate) mod budget;
 #[cfg(feature = "registry")]
 pub mod container;
 pub mod context;

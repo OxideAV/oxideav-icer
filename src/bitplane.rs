@@ -82,6 +82,110 @@ fn has_hv_significant(pattern: u8) -> bool {
     pattern & HV_NEIGHBOUR_MASK != 0
 }
 
+/// Read-only significance view the neighbour-context helpers query.
+/// The encoder keeps a `bool` per coefficient; the decoder keeps one
+/// packed [`cell`] byte per coefficient (category / sign / deepest
+/// delivered plane) — the helpers are generic over the view so both
+/// sides compile to direct loads and the decoder never materialises the
+/// five parallel vectors it used to.
+trait SigView {
+    /// `true` once coefficient `i` has a magnitude bit coded.
+    fn significant(&self, i: usize) -> bool;
+}
+
+/// [`SigView`] plus the sign of a significant coefficient (only
+/// queried for significant neighbours — IPN 42-155 §III.B Table 8).
+trait SignView: SigView {
+    fn negative(&self, i: usize) -> bool;
+}
+
+impl SigView for [bool] {
+    #[inline]
+    fn significant(&self, i: usize) -> bool {
+        self[i]
+    }
+}
+
+/// The encoder's two-vector state as one view.
+struct BoolSig<'a> {
+    sig: &'a [bool],
+    neg: &'a [bool],
+}
+
+impl SigView for BoolSig<'_> {
+    #[inline]
+    fn significant(&self, i: usize) -> bool {
+        self.sig[i]
+    }
+}
+
+impl SignView for BoolSig<'_> {
+    #[inline]
+    fn negative(&self, i: usize) -> bool {
+        self.neg[i]
+    }
+}
+
+impl SigView for [u8] {
+    #[inline]
+    fn significant(&self, i: usize) -> bool {
+        cell::cat(self[i]) != 0
+    }
+}
+
+impl SignView for [u8] {
+    #[inline]
+    fn negative(&self, i: usize) -> bool {
+        self[i] & cell::NEG != 0
+    }
+}
+
+/// The decoder's packed per-coefficient state byte.
+///
+/// | bits | field | bound |
+/// |---|---|---|
+/// | 0–1 | IPN 42-155 §III.B category (`0` = insignificant, `1..=3`) | four categories |
+/// | 2 | sign (`1` = negative) | §III.A sign-magnitude form |
+/// | 3–7 | deepest delivered magnitude bit plane | `0..=30` (`Q ≤ 31`) |
+///
+/// Significance is `category != 0`, so no separate flag is stored; the
+/// plane field is only read for significant coefficients, which always
+/// wrote it first, so a zero-initialised buffer needs no sentinel.
+pub(crate) mod cell {
+    /// Category mask (bits 0–1).
+    pub const CAT_MASK: u8 = 0b0000_0011;
+    /// Sign bit (bit 2).
+    pub const NEG: u8 = 0b0000_0100;
+    /// Shift of the deepest-delivered-plane field (bits 3–7).
+    pub const LAST_SHIFT: u32 = 3;
+
+    /// The §III.B category.
+    #[inline]
+    pub fn cat(c: u8) -> u8 {
+        c & CAT_MASK
+    }
+
+    /// The deepest delivered magnitude bit plane.
+    #[inline]
+    pub fn last_bit(c: u8) -> u8 {
+        c >> LAST_SHIFT
+    }
+
+    /// `c` with its category replaced.
+    #[inline]
+    pub fn with_cat(c: u8, cat: u8) -> u8 {
+        debug_assert!(cat <= 3);
+        (c & !CAT_MASK) | cat
+    }
+
+    /// `c` with its deepest delivered plane replaced.
+    #[inline]
+    pub fn with_last_bit(c: u8, bp: usize) -> u8 {
+        debug_assert!(bp < 32);
+        (c & (CAT_MASK | NEG)) | ((bp as u8) << LAST_SHIFT)
+    }
+}
+
 /// Restricts which coefficients (and which of their magnitude bit
 /// planes) the scan passes visit. Two orthogonal restrictions compose:
 ///
@@ -154,6 +258,29 @@ impl ScanFilter<'_> {
             }
         }
         true
+    }
+
+    /// Zero every coefficient this filter owns — inside its bounds and,
+    /// with a §V.B segment map, mapped to its segment — so the buffer
+    /// can serve as the decoder's magnitude accumulator.
+    fn clear_owned(&self, coeffs: &mut [i32], width: usize, height: usize) {
+        let (x0, x1, y0, y1) = self.bounds(width, height);
+        for y in y0..y1 {
+            let row = y * width;
+            match self.segment {
+                None => coeffs[row + x0..row + x1].fill(0),
+                Some((map, seg)) => {
+                    for (c, &m) in coeffs[row + x0..row + x1]
+                        .iter_mut()
+                        .zip(&map[row + x0..row + x1])
+                    {
+                        if m == seg {
+                            *c = 0;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn validate(&self, n: usize) -> Result<()> {
@@ -564,30 +691,61 @@ pub fn decode_bitplanes_filtered(
     kind: crate::entropy::EntropyKind,
     filter: &ScanFilter<'_>,
 ) -> Result<Vec<i32>> {
+    let mut coeffs = vec![0i32; width * height];
+    decode_bitplanes_filtered_into(packets, width, height, q, levels, kind, filter, &mut coeffs)?;
+    Ok(coeffs)
+}
+
+/// [`decode_bitplanes_filtered`] into a caller-provided coefficient
+/// buffer of `width * height` entries. The coefficients the filter owns
+/// (inside its window and, with a §V.B segment map, mapped to its
+/// segment) are reset to `0` on entry and are the only ones written, so
+/// §V.B transform-domain segments can decode one after another into a
+/// single shared whole-image buffer without an intermediate
+/// per-segment copy.
+///
+/// Memory: the buffer itself doubles as the magnitude accumulator (the
+/// §III.B passes set magnitude bits in place and the §III.A deadzone
+/// reconstruction then applies sign and offset in place), so the only
+/// allocation here is one packed state byte per coefficient
+/// ([`cell`]) — see `budget::STATE_BYTES_2D`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_bitplanes_filtered_into(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+    levels: u8,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+    coeffs: &mut [i32],
+) -> Result<()> {
     let n = width * height;
     if q == 0 || q > 31 {
         return Err(IcerError::invalid(format!(
             "bit-plane count {q} outside (0,31]"
         )));
     }
+    if coeffs.len() != n {
+        return Err(IcerError::invalid(format!(
+            "coefficient buffer length {} != width*height = {n}",
+            coeffs.len()
+        )));
+    }
     filter.validate(n)?;
     let q_usize = q as usize;
 
-    let mut significant = vec![false; n];
-    let mut sign = vec![false; n];
-    let mut mag = vec![0u32; n];
-    // IPN 42-155 §III.B per-pixel category, advanced in lockstep with the
-    // encoder so the category-aware refinement contexts + category-3
-    // uncoded bits decode identically.
-    let mut cat = vec![0u8; n];
-    // Per-coefficient deepest delivered magnitude bit-plane (the §III.A
-    // per-coefficient deadzone exponent). `q` means "no bit delivered"
-    // (sentinel for an insignificant coefficient). A coefficient that
-    // became significant at plane `s` but whose plane-`bp < s` refinement
-    // packet was dropped keeps `last_bit = s`, so its reconstruction bin
-    // is wider than a coefficient whose refinement survived. See the
-    // per-coefficient reconstruction loop below.
-    let mut last_bit = vec![q; n];
+    // One packed byte per coefficient: the IPN 42-155 §III.B category
+    // (0 = still insignificant; 1..=3 = magnitude bits coded so far),
+    // the sign, and the deepest delivered magnitude bit plane (the
+    // §III.A per-coefficient deadzone exponent — a coefficient that
+    // became significant at plane `s` but whose plane-`bp < s`
+    // refinement packet was dropped keeps `s`, so its reconstruction
+    // bin is wider than one whose refinement survived). The plane field
+    // is only read for significant coefficients, which always wrote it
+    // first, so the all-zero initial state needs no sentinel.
+    let mut state = vec![0u8; n];
+    filter.clear_owned(coeffs, width, height);
 
     for bp_idx in 0..q_usize {
         let bp = q_usize - 1 - bp_idx;
@@ -595,8 +753,8 @@ pub fn decode_bitplanes_filtered(
         // Find the significance packet for this bit-plane index. A
         // truncated stream simply omits trailing packets; a missing
         // significance packet means this and every lower plane were never
-        // delivered, so nothing more can be decoded and `last_bit` must
-        // not be lowered.
+        // delivered, so nothing more can be decoded and the delivered
+        // planes must not be lowered.
         let sig_body = packets
             .iter()
             .find(|p| p.bit_plane == bp_idx as u8 && p.is_significance)
@@ -614,11 +772,8 @@ pub fn decode_bitplanes_filtered(
         decode_significance_pass(
             sig_dec.as_mut(),
             &mut sig_model,
-            &mut significant,
-            &mut sign,
-            &mut mag,
-            &mut cat,
-            &mut last_bit,
+            &mut state,
+            coeffs,
             width,
             height,
             bp,
@@ -630,8 +785,8 @@ pub fn decode_bitplanes_filtered(
         // absent (the budget cut fell between this plane's significance
         // and refinement packets) the refinement pass is skipped entirely
         // -- the already-significant coefficients keep their coarser
-        // `last_bit` and a wider reconstruction bin, which is exactly the
-        // §III.A deadzone the dropped plane implies for them.
+        // delivered plane and a wider reconstruction bin, which is exactly
+        // the §III.A deadzone the dropped plane implies for them.
         if let Some(ref_body) = packets
             .iter()
             .find(|p| p.bit_plane == bp_idx as u8 && !p.is_significance)
@@ -643,10 +798,8 @@ pub fn decode_bitplanes_filtered(
             decode_refinement_pass(
                 ref_dec.as_mut(),
                 &mut ref_model,
-                &significant,
-                &mut mag,
-                &mut cat,
-                &mut last_bit,
+                &mut state,
+                coeffs,
                 width,
                 height,
                 bp,
@@ -664,7 +817,7 @@ pub fn decode_bitplanes_filtered(
             // truncated stream usually has no lower planes either, but
             // this keeps the model exact when only the refinement packet
             // of an intermediate plane is missing.)
-            advance_refinement_categories(&significant, &mag, &mut cat, width, height, bp, filter);
+            advance_refinement_categories(&mut state, coeffs, width, height, bp, filter);
         }
     }
 
@@ -679,8 +832,8 @@ pub fn decode_bitplanes_filtered(
     // knows its MSB (`b = bp`); one that was already significant but whose
     // plane-`bp` refinement was dropped only knows down to `bp + 1`
     // (`b = bp + 1`), i.e. a bin twice as wide. The earlier global-`b`
-    // approximation under-reconstructed the latter class. `last_bit[i]`
-    // carries each coefficient's true deepest delivered plane.
+    // approximation under-reconstructed the latter class. The state
+    // byte carries each coefficient's true deepest delivered plane.
     //
     // IPN 42-155 §III.A fixes the reconstruction point per bin:
     //   * the central deadzone bin `[-(∆-1), ∆-1]` (insignificant
@@ -694,39 +847,47 @@ pub fn decode_bitplanes_filtered(
     // is `mag + ∆/2 - 1`. When `∆ = 1` (b == 0, the full stream is
     // present) the offset is zero and the magnitude is exact -- so the
     // lossless / untruncated path is bit-identical to before.
-    Ok(deadzone_reconstruct(&mag, &sign, &last_bit))
+    deadzone_reconstruct(coeffs, &state, width, filter.bounds(width, height));
+    Ok(())
 }
 
 /// Apply the per-coefficient §III.A deadzone reconstruction point (see
-/// the comment block above): insignificant coefficients reconstruct to
-/// the origin; a significant magnitude known down to plane `b` gets its
-/// own `∆/2 - 1 = 2^(b-1) - 1` mid-bin offset. Shared by the MSB-down
-/// and the §III.A priority-interleaved decoders.
-fn deadzone_reconstruct(mag: &[u32], sign: &[bool], last_bit: &[u8]) -> Vec<i32> {
-    mag.iter()
-        .zip(sign.iter())
-        .zip(last_bit.iter())
-        .map(|((&m, &s), &b)| {
-            // Insignificant pixels (mag == 0) sit in the central deadzone
-            // bin and reconstruct to the origin regardless of `∆`.
-            let v = if m == 0 {
+/// the comment block above) in place: insignificant coefficients stay
+/// at the origin; a significant magnitude known down to plane `b` gets
+/// its own `∆/2 - 1 = 2^(b-1) - 1` mid-bin offset and its sign. Only
+/// the rows / columns inside `bounds` are visited (the rest of the
+/// buffer belongs to other §V.B segments, or was never coded). Shared
+/// by the MSB-down and the §III.A priority-interleaved decoders.
+fn deadzone_reconstruct(
+    coeffs: &mut [i32],
+    state: &[u8],
+    width: usize,
+    bounds: (usize, usize, usize, usize),
+) {
+    let (x0, x1, y0, y1) = bounds;
+    for y in y0..y1 {
+        let row = y * width;
+        for (c, &s) in coeffs[row + x0..row + x1]
+            .iter_mut()
+            .zip(&state[row + x0..row + x1])
+        {
+            if cell::cat(s) == 0 {
+                // Insignificant pixels (mag == 0) sit in the central
+                // deadzone bin and reconstruct to the origin regardless
+                // of `∆`.
+                continue;
+            }
+            let b = cell::last_bit(s);
+            let off: i32 = if b == 0 {
                 0
             } else {
-                let off: i32 = if b == 0 {
-                    0
-                } else {
-                    // ∆/2 - 1 = 2^(b-1) - 1.
-                    (1i32 << (b - 1)) - 1
-                };
-                m as i32 + off
+                // ∆/2 - 1 = 2^(b-1) - 1.
+                (1i32 << (b - 1)) - 1
             };
-            if s {
-                -v
-            } else {
-                v
-            }
-        })
-        .collect()
+            let v = *c + off;
+            *c = if s & cell::NEG != 0 { -v } else { v };
+        }
+    }
 }
 
 /// Number of least-significant magnitude bit planes that were *not*
@@ -745,8 +906,9 @@ fn deadzone_reconstruct(mag: &[u32], sign: &[bool], last_bit: &[u8]) -> Vec<i32>
 /// `b` is the smallest such magnitude position over all present packets;
 /// an empty packet set (handled by the caller) yields `q` here.
 ///
-/// Superseded for reconstruction by the per-coefficient `last_bit`
-/// tracking in [`decode_bitplanes_multi`] (which handles the
+/// Superseded for reconstruction by the per-coefficient deepest-
+/// delivered-plane field of the decoder's state byte ([`cell`], see
+/// [`decode_bitplanes_multi`]; it handles the
 /// significance-survives / refinement-dropped case the strip-global `b`
 /// could not distinguish); retained as the clean-boundary characterisation
 /// the unit test pins.
@@ -792,7 +954,7 @@ fn encode_significance_pass(
                     continue;
                 }
                 let (ctx, stride, is_hl) =
-                    significance_visit(significant, width, height, x, y, levels);
+                    significance_visit(&*significant, width, height, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
 
                 let mag = coeffs[i].unsigned_abs();
@@ -810,8 +972,10 @@ fn encode_significance_pass(
                     // Sign bit with sign-flip convention (IPN 42-155 §III.B),
                     // subband-aware (HL axis transpose for Table 8).
                     let (sctx, flip) = sign_visit(
-                        significant,
-                        sign,
+                        &BoolSig {
+                            sig: significant,
+                            neg: sign,
+                        },
                         width,
                         height,
                         x,
@@ -836,21 +1000,19 @@ fn encode_significance_pass(
 
 /// Significance + sign decode pass for one bit-plane, stripe-ordered.
 ///
-/// `last_bit[i]` records, for every coefficient that received a magnitude
-/// bit, the deepest (smallest) bit-plane `bp` at which a bit was decoded
-/// for it. A coefficient that becomes significant in this pass has its
-/// MSB plane `bp` recorded here; the refinement pass lowers it further as
-/// refinement packets survive. This drives the per-coefficient §III.A
-/// deadzone reconstruction point (see [`decode_bitplanes_multi`]).
+/// A coefficient that becomes significant here transitions to category 1
+/// (IPN 42-155 §III.B: "after the first '1' bit from the pixel is
+/// encoded, the pixel's category becomes 1"), sets its MSB in `mag` and
+/// records this plane as its deepest delivered one; the refinement pass
+/// lowers that further as refinement packets survive. This drives the
+/// per-coefficient §III.A deadzone reconstruction point (see
+/// [`decode_bitplanes_multi`]).
 #[allow(clippy::too_many_arguments)]
 fn decode_significance_pass(
     dec: &mut dyn BitSource,
     model: &mut ContextModel,
-    significant: &mut [bool],
-    sign: &mut [bool],
-    mag: &mut [u32],
-    cat: &mut [u8],
-    last_bit: &mut [u8],
+    state: &mut [u8],
+    mag: &mut [i32],
     width: usize,
     height: usize,
     bp: usize,
@@ -864,37 +1026,27 @@ fn decode_significance_pass(
         for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
             for x in wx0..wx1 {
                 let i = y * width + x;
-                if !filter.visits(i, bp) || significant[i] {
+                if !filter.visits(i, bp) || cell::cat(state[i]) != 0 {
                     continue;
                 }
-                let (ctx, stride, is_hl) =
-                    significance_visit(significant, width, height, x, y, levels);
+                let (ctx, stride, is_hl) = significance_visit(&*state, width, height, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.get_bit(num, den)?;
                 model.observe(ctx, bit);
 
                 if bit == 1 {
-                    significant[i] = true;
-                    cat[i] = 1;
-                    mag[i] |= 1u32 << bp;
-                    last_bit[i] = bp as u8;
-                    let (sctx, flip) = sign_visit(
-                        significant,
-                        sign,
-                        width,
-                        height,
-                        x,
-                        y,
-                        stride,
-                        is_hl,
-                        levels,
-                    );
+                    state[i] = cell::with_last_bit(cell::with_cat(state[i], 1), bp);
+                    mag[i] |= 1i32 << bp;
+                    let (sctx, flip) =
+                        sign_visit(&*state, width, height, x, y, stride, is_hl, levels);
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.get_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
                     // Undo the sign flip.
                     let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
-                    sign[i] = raw_sign == 1;
+                    if raw_sign == 1 {
+                        state[i] |= cell::NEG;
+                    }
                 }
             }
         }
@@ -969,11 +1121,11 @@ fn encode_refinement_pass(
 /// would, without decoding any bits. Used when the refinement packet for
 /// a bit-plane is absent (budget cut between this plane's significance
 /// and refinement packets) so the decoder's category state stays aligned
-/// with the encoder for any lower planes that still arrive.
+/// with the encoder for any lower planes that still arrive. The deepest
+/// delivered plane is deliberately *not* lowered: no bit arrived.
 fn advance_refinement_categories(
-    significant: &[bool],
-    mag: &[u32],
-    cat: &mut [u8],
+    state: &mut [u8],
+    mag: &[i32],
     width: usize,
     height: usize,
     bp: usize,
@@ -986,13 +1138,14 @@ fn advance_refinement_categories(
         for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
             for x in wx0..wx1 {
                 let i = y * width + x;
-                if !filter.visits(i, bp) || !significant[i] {
+                let cat = cell::cat(state[i]);
+                if !filter.visits(i, bp) || cat == 0 {
                     continue;
                 }
-                if highest_set_bit(mag[i]) == Some(bp as u32) {
+                if highest_set_bit(mag[i] as u32) == Some(bp as u32) {
                     continue;
                 }
-                cat[i] = cat[i].saturating_add(1).min(3);
+                state[i] = cell::with_cat(state[i], (cat + 1).min(3));
             }
         }
         stripe_start += STRIPE_HEIGHT;
@@ -1003,19 +1156,18 @@ fn advance_refinement_categories(
 ///
 /// Every coefficient *visited* in this pass (already significant, not at
 /// its MSB plane) has its magnitude confirmed down to bit-plane `bp`
-/// regardless of whether the decoded bit was 0 or 1, so `last_bit[i]` is
-/// lowered to `bp`. This is what makes the per-coefficient deadzone
-/// reconstruction (see [`decode_bitplanes_multi`]) exact: a coefficient
-/// whose refinement at `bp` was *not* delivered keeps a coarser
-/// `last_bit` and therefore a wider reconstruction bin than one that was.
+/// regardless of whether the decoded bit was 0 or 1, so its deepest
+/// delivered plane is lowered to `bp`. This is what makes the
+/// per-coefficient deadzone reconstruction (see
+/// [`decode_bitplanes_multi`]) exact: a coefficient whose refinement at
+/// `bp` was *not* delivered keeps a coarser plane and therefore a wider
+/// reconstruction bin than one that was.
 #[allow(clippy::too_many_arguments)]
 fn decode_refinement_pass(
     dec: &mut dyn BitSource,
     model: &mut ContextModel,
-    significant: &[bool],
-    mag: &mut [u32],
-    cat: &mut [u8],
-    last_bit: &mut [u8],
+    state: &mut [u8],
+    mag: &mut [i32],
     width: usize,
     height: usize,
     bp: usize,
@@ -1029,14 +1181,15 @@ fn decode_refinement_pass(
         for y in stripe_start.max(wy0)..stripe_end.min(wy1) {
             for x in wx0..wx1 {
                 let i = y * width + x;
-                if !filter.visits(i, bp) || !significant[i] {
+                let cat = cell::cat(state[i]);
+                if !filter.visits(i, bp) || cat == 0 {
                     continue;
                 }
-                if highest_set_bit(mag[i]) == Some(bp as u32) {
+                if highest_set_bit(mag[i] as u32) == Some(bp as u32) {
                     continue;
                 }
-                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
-                let bit = match magnitude_context(cat[i], has_hv) {
+                let has_hv = refinement_has_hv(&*state, width, height, x, y, levels);
+                let bit = match magnitude_context(cat, has_hv) {
                     MagnitudeContext::Coded(rctx) => {
                         let (num, den) = model.probability(rctx);
                         let bit = dec.get_bit(num, den)?;
@@ -1049,12 +1202,11 @@ fn decode_refinement_pass(
                     }
                 };
                 if bit == 1 {
-                    mag[i] |= 1u32 << bp;
+                    mag[i] |= 1i32 << bp;
                 }
-                cat[i] = cat[i].saturating_add(1).min(3);
                 // The refinement bit (0 or 1) confirms the magnitude down
                 // to plane `bp` for this coefficient.
-                last_bit[i] = bp as u8;
+                state[i] = cell::with_last_bit(cell::with_cat(state[i], (cat + 1).min(3)), bp);
             }
         }
         stripe_start += STRIPE_HEIGHT;
@@ -1137,7 +1289,7 @@ fn encode_priority_unit(
                 // Significance bit; sign immediately after the first
                 // nonzero magnitude bit (§III).
                 let (ctx, stride, is_hl) =
-                    significance_visit(significant, width, height, x, y, levels);
+                    significance_visit(&*significant, width, height, x, y, levels);
                 debug_assert!(ctx < CONTEXT_COUNT);
                 let mag = coeffs[i].unsigned_abs();
                 let bit = ((mag >> abs_bit) & 1) as u8;
@@ -1149,8 +1301,10 @@ fn encode_priority_unit(
                     cat[i] = 1;
                     sign[i] = coeffs[i] < 0;
                     let (sctx, flip) = sign_visit(
-                        significant,
-                        sign,
+                        &BoolSig {
+                            sig: significant,
+                            neg: sign,
+                        },
                         width,
                         height,
                         x,
@@ -1174,7 +1328,7 @@ fn encode_priority_unit(
                 // this very plane took the significance branch above).
                 let m = coeffs[i].unsigned_abs();
                 debug_assert!(highest_set_bit(m) > Some(abs_bit as u32));
-                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
+                let has_hv = refinement_has_hv(&*significant, width, height, x, y, levels);
                 let bit = ((m >> abs_bit) & 1) as u8;
                 match magnitude_context(cat[i], has_hv) {
                     MagnitudeContext::Coded(rctx) => {
@@ -1198,18 +1352,15 @@ fn encode_priority_unit(
 }
 
 /// Decode counterpart of [`encode_priority_unit`] — the identical
-/// combined raster pass, updating `mag` / `last_bit` as magnitude bits
-/// arrive so the per-coefficient §III.A deadzone reconstruction stays
-/// exact under truncation.
+/// combined raster pass, updating the magnitude bits and the deepest
+/// delivered plane as bits arrive so the per-coefficient §III.A
+/// deadzone reconstruction stays exact under truncation.
 #[allow(clippy::too_many_arguments)]
 fn decode_priority_unit(
     dec: &mut dyn BitSource,
     model: &mut ContextModel,
-    significant: &mut [bool],
-    sign: &mut [bool],
-    mag: &mut [u32],
-    cat: &mut [u8],
-    last_bit: &mut [u8],
+    state: &mut [u8],
+    mag: &mut [i32],
     width: usize,
     height: usize,
     unit: &SubbandBitPlane,
@@ -1228,37 +1379,28 @@ fn decode_priority_unit(
                 x += lat.step;
                 continue;
             }
-            if !significant[i] {
-                let (ctx, stride, is_hl) =
-                    significance_visit(significant, width, height, x, y, levels);
+            let cat = cell::cat(state[i]);
+            if cat == 0 {
+                let (ctx, stride, is_hl) = significance_visit(&*state, width, height, x, y, levels);
                 let (num, den) = model.probability(ctx);
                 let bit = dec.get_bit(num, den)?;
                 model.observe(ctx, bit);
                 if bit == 1 {
-                    significant[i] = true;
-                    cat[i] = 1;
-                    mag[i] |= 1u32 << abs_bit;
-                    last_bit[i] = abs_bit as u8;
-                    let (sctx, flip) = sign_visit(
-                        significant,
-                        sign,
-                        width,
-                        height,
-                        x,
-                        y,
-                        stride,
-                        is_hl,
-                        levels,
-                    );
+                    state[i] = cell::with_last_bit(cell::with_cat(state[i], 1), abs_bit);
+                    mag[i] |= 1i32 << abs_bit;
+                    let (sctx, flip) =
+                        sign_visit(&*state, width, height, x, y, stride, is_hl, levels);
                     let (sn, sd) = model.probability(sctx);
                     let coded_sign = dec.get_bit(sn, sd)?;
                     model.observe(sctx, coded_sign);
                     let raw_sign = if flip { 1 - coded_sign } else { coded_sign };
-                    sign[i] = raw_sign == 1;
+                    if raw_sign == 1 {
+                        state[i] |= cell::NEG;
+                    }
                 }
             } else {
-                let has_hv = refinement_has_hv(significant, width, height, x, y, levels);
-                let bit = match magnitude_context(cat[i], has_hv) {
+                let has_hv = refinement_has_hv(&*state, width, height, x, y, levels);
+                let bit = match magnitude_context(cat, has_hv) {
                     MagnitudeContext::Coded(rctx) => {
                         let (num, den) = model.probability(rctx);
                         let bit = dec.get_bit(num, den)?;
@@ -1271,12 +1413,11 @@ fn decode_priority_unit(
                     }
                 };
                 if bit == 1 {
-                    mag[i] |= 1u32 << abs_bit;
+                    mag[i] |= 1i32 << abs_bit;
                 }
-                cat[i] = cat[i].saturating_add(1).min(3);
                 // The refinement bit (0 or 1) confirms the magnitude down
                 // to this plane for this coefficient.
-                last_bit[i] = abs_bit as u8;
+                state[i] = cell::with_last_bit(cell::with_cat(state[i], (cat + 1).min(3)), abs_bit);
             }
             x += lat.step;
         }
@@ -1373,11 +1514,11 @@ pub fn encode_bitplanes_prioritized(
     Ok(packets)
 }
 
-/// Decode packets produced by [`encode_bitplanes_prioritized`]. Packets
-/// must arrive in schedule order (they are emitted that way); a
-/// truncated stream simply stops at its last delivered packet, and
-/// every coefficient reconstructs at its own §III.A deadzone point from
-/// the deepest magnitude bit actually delivered for it.
+/// Decode a §III.A priority-interleaved packet sequence (a prefix of
+/// the [`packet_schedule`] the encoder emitted). Decoding stops at the
+/// first missing or out-of-order packet; undelivered subband bit
+/// planes reconstruct through the per-coefficient §III.A deadzone rule
+/// shared with [`decode_bitplanes_filtered`].
 #[allow(clippy::too_many_arguments)]
 pub fn decode_bitplanes_prioritized(
     packets: &[EncodedPacket],
@@ -1389,16 +1530,48 @@ pub fn decode_bitplanes_prioritized(
     filter: &ScanFilter<'_>,
     min_loss: u8,
 ) -> Result<Vec<i32>> {
+    let mut coeffs = vec![0i32; width * height];
+    decode_bitplanes_prioritized_into(
+        packets,
+        width,
+        height,
+        q,
+        levels,
+        kind,
+        filter,
+        min_loss,
+        &mut coeffs,
+    )?;
+    Ok(coeffs)
+}
+
+/// [`decode_bitplanes_prioritized`] into a caller-provided buffer, with
+/// the same entry contract as [`decode_bitplanes_filtered_into`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_bitplanes_prioritized_into(
+    packets: &[EncodedPacket],
+    width: usize,
+    height: usize,
+    q: u8,
+    levels: u8,
+    kind: crate::entropy::EntropyKind,
+    filter: &ScanFilter<'_>,
+    min_loss: u8,
+    coeffs: &mut [i32],
+) -> Result<()> {
     validate_prioritized(levels, q)?;
     let n = width * height;
+    if coeffs.len() != n {
+        return Err(IcerError::invalid(format!(
+            "coefficient buffer length {} != width*height = {n}",
+            coeffs.len()
+        )));
+    }
     filter.validate(n)?;
     let q32 = q as u32;
 
-    let mut significant = vec![false; n];
-    let mut sign = vec![false; n];
-    let mut mag = vec![0u32; n];
-    let mut cat = vec![0u8; n];
-    let mut last_bit = vec![q; n];
+    let mut state = vec![0u8; n];
+    filter.clear_owned(coeffs, width, height);
     let mut model = ContextModel::new();
 
     let schedule = packet_schedule(levels, q32, min_loss, width, height);
@@ -1420,11 +1593,8 @@ pub fn decode_bitplanes_prioritized(
             decode_priority_unit(
                 dec.as_mut(),
                 &mut model,
-                &mut significant,
-                &mut sign,
-                &mut mag,
-                &mut cat,
-                &mut last_bit,
+                &mut state,
+                coeffs,
                 width,
                 height,
                 unit,
@@ -1435,7 +1605,8 @@ pub fn decode_bitplanes_prioritized(
         }
     }
 
-    Ok(deadzone_reconstruct(&mag, &sign, &last_bit))
+    deadzone_reconstruct(coeffs, &state, width, filter.bounds(width, height));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,10 +1883,13 @@ fn neighbour_significance_pattern(
 /// interior fast path (all eight neighbours in bounds) drops the
 /// per-neighbour signed bounds arithmetic that previously ran eight
 /// times per visited bit; the edge fallback walks the identical
-/// neighbour list. Bit layout unchanged.
+/// neighbour list. Bit layout unchanged. Generic over the
+/// significance [`SigView`] (encoder `bool` vector / decoder packed
+/// state byte) — monomorphised, so each side compiles to its own
+/// direct loads.
 #[inline]
-fn gather_pattern_strided(
-    significant: &[bool],
+fn gather_pattern_strided<S: SigView + ?Sized>(
+    significant: &S,
     width: usize,
     height: usize,
     x: usize,
@@ -1726,14 +1900,14 @@ fn gather_pattern_strided(
         let up = (y - stride) * width + x;
         let mid = y * width + x;
         let down = (y + stride) * width + x;
-        u8::from(significant[up - stride])
-            | (u8::from(significant[up]) << 1)
-            | (u8::from(significant[up + stride]) << 2)
-            | (u8::from(significant[mid - stride]) << 3)
-            | (u8::from(significant[mid + stride]) << 4)
-            | (u8::from(significant[down - stride]) << 5)
-            | (u8::from(significant[down]) << 6)
-            | (u8::from(significant[down + stride]) << 7)
+        u8::from(significant.significant(up - stride))
+            | (u8::from(significant.significant(up)) << 1)
+            | (u8::from(significant.significant(up + stride)) << 2)
+            | (u8::from(significant.significant(mid - stride)) << 3)
+            | (u8::from(significant.significant(mid + stride)) << 4)
+            | (u8::from(significant.significant(down - stride)) << 5)
+            | (u8::from(significant.significant(down)) << 6)
+            | (u8::from(significant.significant(down + stride)) << 7)
     } else {
         let s = stride as isize;
         let mut pat = 0u8;
@@ -1753,7 +1927,7 @@ fn gather_pattern_strided(
                 && ny >= 0
                 && (nx as usize) < width
                 && (ny as usize) < height
-                && significant[(ny as usize) * width + (nx as usize)]
+                && significant.significant((ny as usize) * width + (nx as usize))
             {
                 pat |= 1 << bit;
             }
@@ -1769,8 +1943,8 @@ fn gather_pattern_strided(
 /// re-ran [`classify_position`] two to four times per visited bit.
 /// `levels == 0` keeps the legacy subband-agnostic classification.
 #[inline]
-fn significance_visit(
-    significant: &[bool],
+fn significance_visit<S: SigView + ?Sized>(
+    significant: &S,
     width: usize,
     height: usize,
     x: usize,
@@ -1801,9 +1975,8 @@ fn significance_visit(
 /// `neighbour_sign_pattern` + `sign_ctx_for` pair.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn sign_visit(
-    significant: &[bool],
-    sign: &[bool],
+fn sign_visit<S: SignView + ?Sized>(
+    view: &S,
     width: usize,
     height: usize,
     x: usize,
@@ -1814,8 +1987,7 @@ fn sign_visit(
 ) -> (usize, bool) {
     let s = stride as isize;
     let h = pair_pattern(
-        significant,
-        sign,
+        view,
         width,
         height,
         x as isize - s,
@@ -1824,8 +1996,7 @@ fn sign_visit(
         y as isize,
     );
     let v = pair_pattern(
-        significant,
-        sign,
+        view,
         width,
         height,
         x as isize,
@@ -1851,8 +2022,8 @@ fn sign_visit(
 /// semantics included (the historical mask does not test East; the
 /// wire-digest suite pins that equivalence).
 #[inline]
-fn refinement_has_hv(
-    significant: &[bool],
+fn refinement_has_hv<S: SigView + ?Sized>(
+    significant: &S,
     width: usize,
     height: usize,
     x: usize,
@@ -1861,9 +2032,9 @@ fn refinement_has_hv(
 ) -> bool {
     let stride = subband_stride(x, y, levels);
     let i = y * width + x;
-    (x >= stride && significant[i - stride])
-        || (y >= stride && significant[i - stride * width])
-        || (y + stride < height && significant[i + stride * width])
+    (x >= stride && significant.significant(i - stride))
+        || (y >= stride && significant.significant(i - stride * width))
+        || (y + stride < height && significant.significant(i + stride * width))
 }
 
 /// Legacy `(h_pattern, v_pattern)` sign-neighbour gather (bits 0,1 =
@@ -1880,10 +2051,13 @@ fn neighbour_sign_pattern(
     y: usize,
     levels: u8,
 ) -> (u8, u8) {
+    let view = BoolSig {
+        sig: significant,
+        neg: sign,
+    };
     let stride = subband_stride(x, y, levels) as isize;
     let h = pair_pattern(
-        significant,
-        sign,
+        &view,
         width,
         height,
         x as isize - stride,
@@ -1892,8 +2066,7 @@ fn neighbour_sign_pattern(
         y as isize,
     );
     let v = pair_pattern(
-        significant,
-        sign,
+        &view,
         width,
         height,
         x as isize,
@@ -1905,9 +2078,8 @@ fn neighbour_sign_pattern(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pair_pattern(
-    significant: &[bool],
-    sign: &[bool],
+fn pair_pattern<S: SignView + ?Sized>(
+    view: &S,
     width: usize,
     height: usize,
     ax: isize,
@@ -1919,9 +2091,9 @@ fn pair_pattern(
     for (i, (cx, cy)) in [(ax, ay), (bx, by)].iter().enumerate() {
         if *cx >= 0 && *cy >= 0 && (*cx as usize) < width && (*cy as usize) < height {
             let idx = (*cy as usize) * width + (*cx as usize);
-            if significant[idx] {
+            if view.significant(idx) {
                 p |= 1 << (i * 2); // significant bit
-                if sign[idx] {
+                if view.negative(idx) {
                     p |= 1 << (i * 2 + 1); // negative bit
                 }
             }

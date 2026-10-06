@@ -81,9 +81,39 @@ fn lattice_start(offset: usize, stride: usize, lo: usize) -> usize {
     }
 }
 
+/// The spatial positions of one subband inside a (windowed) coefficient
+/// buffer: the stride-`stride` lattice clipped to a half-open window,
+/// described by its bounds rather than materialised — a 16-byte
+/// coordinate pair per position per subband used to cost several times
+/// the coder state on low-band-count cubes. [`Self::positions`] walks it
+/// in raster order (y outer, x inner), exactly the order the materialised
+/// list had.
+#[derive(Clone, Copy)]
+struct SpatialLattice {
+    x_first: usize,
+    x_end: usize,
+    y_first: usize,
+    y_end: usize,
+    stride: usize,
+}
+
+impl SpatialLattice {
+    /// Raster-order `(x, y)` positions.
+    #[inline]
+    fn positions(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (self.y_first..self.y_end)
+            .step_by(self.stride)
+            .flat_map(move |y| {
+                (self.x_first..self.x_end)
+                    .step_by(self.stride)
+                    .map(move |x| (x, y))
+            })
+    }
+}
+
 struct SubbandMembers {
-    /// Spatial positions in raster order (y-major).
-    xy: Vec<(usize, usize)>,
+    /// Spatial positions (raster order, see [`SpatialLattice`]).
+    xy: SpatialLattice,
     /// The subband's spatial planes: λ indices, ascending.
     lambdas: Vec<usize>,
     /// λ spacing between adjacent spatial planes of this subband.
@@ -120,16 +150,13 @@ impl CubeGeometry {
             .iter()
             .map(|sb| {
                 let (xo, yo, sstride) = sb.spatial_lattice();
-                let mut xy = Vec::new();
-                let mut y = lattice_start(yo, sstride, y0);
-                while y < y1 {
-                    let mut x = lattice_start(xo, sstride, x0);
-                    while x < x1 {
-                        xy.push((x, y));
-                        x += sstride;
-                    }
-                    y += sstride;
-                }
+                let xy = SpatialLattice {
+                    x_first: lattice_start(xo, sstride, x0),
+                    x_end: x1,
+                    y_first: lattice_start(yo, sstride, y0),
+                    y_end: y1,
+                    stride: sstride,
+                };
                 let (lo, lstride) = sb.spectral_lattice();
                 let mut lambdas = Vec::new();
                 let mut l = lo;
@@ -162,6 +189,21 @@ impl CubeGeometry {
         self.width * self.height * self.bands
     }
 
+    /// Zero this geometry's member positions of `coeffs` (the decoder's
+    /// lenient path: a segment whose body proved corrupt mid-way must
+    /// leave no partial magnitudes behind and degrade to its means).
+    pub fn clear_members(&self, coeffs: &mut [i32]) {
+        let plane = self.width * self.height;
+        for m in &self.members {
+            for &lambda in &m.lambdas {
+                let base = lambda * plane;
+                for (x, y) in m.xy.positions() {
+                    coeffs[base + y * self.width + x] = 0;
+                }
+            }
+        }
+    }
+
     /// Number of magnitude bit planes needed to code `coeffs` (bits of
     /// the largest magnitude, capped at 30). Zero for an all-zero cube.
     pub fn bit_planes_needed(coeffs: &[i32]) -> u8 {
@@ -179,7 +221,7 @@ impl CubeGeometry {
         for m in &self.members {
             for &lambda in &m.lambdas {
                 let base = lambda * plane;
-                for &(x, y) in &m.xy {
+                for (x, y) in m.xy.positions() {
                     max_mag = max_mag.max(coeffs[base + y * self.width + x].unsigned_abs());
                 }
             }
@@ -188,23 +230,41 @@ impl CubeGeometry {
     }
 }
 
-/// Running coder state shared by encoder and decoder: the §IV.C
-/// category of every coefficient plus the magnitude bits / sign
-/// established so far (the decoder's reconstruction source; the encoder
-/// maintains the identical state so context decisions stay in
-/// lockstep).
+/// Running coder state shared by encoder and decoder: the IPN 42-164
+/// §IV.C category of every coefficient (four categories, 2 bits) and
+/// the sign established so far (1 bit), packed in one byte per
+/// coefficient (`budget::STATE_BYTES_3D`). The decoder accumulates the
+/// magnitude bits directly in its `i32` coefficient buffer (the
+/// reconstruction source); the encoder maintains the identical category
+/// / sign state so context decisions stay in lockstep.
 struct CoderState {
-    mag: Vec<u32>,
-    neg: Vec<bool>,
-    category: Vec<u8>,
+    cell: Vec<u8>,
 }
+
+/// Category mask of a [`CoderState`] cell (bits 0–1).
+const CELL_CAT: u8 = 0b11;
+/// Sign bit of a [`CoderState`] cell (bit 2).
+const CELL_NEG: u8 = 0b100;
 
 impl CoderState {
     fn new(volume: usize) -> Self {
         Self {
-            mag: vec![0; volume],
-            neg: vec![false; volume],
-            category: vec![0; volume],
+            cell: vec![0; volume],
+        }
+    }
+
+    /// The §IV.C category of coefficient `idx`.
+    #[inline]
+    fn category(&self, idx: usize) -> u8 {
+        self.cell[idx] & CELL_CAT
+    }
+
+    /// Record coefficient `idx`'s sign (called when it turns
+    /// significant).
+    #[inline]
+    fn set_negative(&mut self, idx: usize, negative: bool) {
+        if negative {
+            self.cell[idx] |= CELL_NEG;
         }
     }
 
@@ -212,7 +272,7 @@ impl CoderState {
     /// checked by the caller supplying `Some`), else 0 per §IV.C.
     #[inline]
     fn neighbour_category(&self, idx: Option<usize>) -> u8 {
-        idx.map_or(0, |i| self.category[i])
+        idx.map_or(0, |i| self.category(i))
     }
 
     /// Sign of the spectral neighbour as Table 6 sees it: known only
@@ -220,8 +280,8 @@ impl CoderState {
     #[inline]
     fn neighbour_sign(&self, idx: Option<usize>) -> NeighbourSign {
         match idx {
-            Some(i) if self.category[i] >= 1 => {
-                if self.neg[i] {
+            Some(i) if self.category(i) >= 1 => {
+                if self.cell[i] & CELL_NEG != 0 {
                     NeighbourSign::Negative
                 } else {
                     NeighbourSign::Positive
@@ -232,19 +292,17 @@ impl CoderState {
     }
 
     /// Advance the §IV.C category after a magnitude bit of value `bit`
-    /// was coded for coefficient `idx` at plane `b`.
+    /// was coded for coefficient `idx`.
     #[inline]
-    fn advance(&mut self, idx: usize, b: u8, bit: u8) {
-        if bit == 1 {
-            self.mag[idx] |= 1 << b;
-        }
-        match self.category[idx] {
-            0 if bit == 1 => self.category[idx] = 1,
-            0 => {}
-            1 => self.category[idx] = 2,
-            2 => self.category[idx] = 3,
-            _ => {}
-        }
+    fn advance(&mut self, idx: usize, bit: u8) {
+        let cat = self.category(idx);
+        let next = match cat {
+            0 if bit == 1 => 1,
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        };
+        self.cell[idx] = (self.cell[idx] & !CELL_CAT) | next;
     }
 }
 
@@ -297,11 +355,11 @@ fn encode_subband_plane(
     let m = &geom.members[sb_idx];
     let plane = geom.width * geom.height;
     for &lambda in &m.lambdas {
-        for &(x, y) in &m.xy {
+        for (x, y) in m.xy.positions() {
             let idx = lambda * plane + y * geom.width + x;
             let (prev, next) = neighbour_indices(geom, m, x, y, lambda);
             let bit = ((mags[idx] >> b) & 1) as u8;
-            let cat = state.category[idx];
+            let cat = state.category(idx);
             match cat {
                 0..=2 => {
                     let cm = state.neighbour_category(prev);
@@ -324,7 +382,7 @@ fn encode_subband_plane(
                         let (sn, sd) = model.probability(sctx);
                         sink.put_bit(agree, sn, sd);
                         model.observe(sctx, agree);
-                        state.neg[idx] = negs[idx];
+                        state.set_negative(idx, negs[idx]);
                     }
                 }
                 _ => {
@@ -332,28 +390,32 @@ fn encode_subband_plane(
                     sink.put_bit(bit, UNCODED_P1.0, UNCODED_P1.1);
                 }
             }
-            state.advance(idx, b, bit);
+            state.advance(idx, bit);
         }
     }
 }
 
 /// Decode one subband bit plane — the exact mirror of
-/// [`encode_subband_plane`].
+/// [`encode_subband_plane`]. Magnitude bits accumulate in `mag` (the
+/// caller's coefficient buffer, zero at every member position on
+/// entry).
+#[allow(clippy::too_many_arguments)]
 fn decode_subband_plane(
     geom: &CubeGeometry,
     sb_idx: usize,
     b: u8,
     state: &mut CoderState,
+    mag: &mut [i32],
     model: &mut ContextModel,
     source: &mut dyn BitSource,
 ) -> Result<()> {
     let m = &geom.members[sb_idx];
     let plane = geom.width * geom.height;
     for &lambda in &m.lambdas {
-        for &(x, y) in &m.xy {
+        for (x, y) in m.xy.positions() {
             let idx = lambda * plane + y * geom.width + x;
             let (prev, next) = neighbour_indices(geom, m, x, y, lambda);
-            let cat = state.category[idx];
+            let cat = state.category(idx);
             let bit = match cat {
                 0..=2 => {
                     let cm = state.neighbour_category(prev);
@@ -373,13 +435,16 @@ fn decode_subband_plane(
                         let (sn, sd) = model.probability(sctx);
                         let agree = source.get_bit(sn, sd)?;
                         model.observe(sctx, agree);
-                        state.neg[idx] = pred_neg != (agree == 1);
+                        state.set_negative(idx, pred_neg != (agree == 1));
                     }
                     bit
                 }
                 _ => source.get_bit(UNCODED_P1.0, UNCODED_P1.1)?,
             };
-            state.advance(idx, b, bit);
+            if bit == 1 {
+                mag[idx] |= 1i32 << b;
+            }
+            state.advance(idx, bit);
         }
     }
     Ok(())
@@ -460,6 +525,10 @@ pub fn decode_cube_bitplanes(
 /// written, so §V.D segment geometries sharing one transform can each
 /// decode into the same buffer (IPN 42-164 §II.B — segments are
 /// independently coded regions of a single wavelet-transformed cube).
+/// The member positions are reset to `0` on entry: the buffer doubles
+/// as the magnitude accumulator, and the per-subband deadzone
+/// reconstruction then applies sign and offset in place, so the only
+/// allocation here is one packed state byte per coefficient.
 pub fn decode_cube_bitplanes_into(
     geom: &CubeGeometry,
     packets: &[(u8, &[u8])],
@@ -467,7 +536,15 @@ pub fn decode_cube_bitplanes_into(
     kind: EntropyKind,
     coeffs: &mut [i32],
 ) -> Result<()> {
-    debug_assert_eq!(coeffs.len(), geom.volume());
+    if coeffs.len() != geom.volume() {
+        return Err(crate::error::IcerError::invalid(format!(
+            "cube coefficient buffer length {} != volume {}",
+            coeffs.len(),
+            geom.volume()
+        )));
+    }
+    // The member positions are this call's magnitude accumulator.
+    geom.clear_members(coeffs);
     let plan = cube_schedule(&geom.subbands, q);
     let mut state = CoderState::new(geom.volume());
     let mut model = new_model();
@@ -491,6 +568,7 @@ pub fn decode_cube_bitplanes_into(
                 plan[i].subband_index,
                 plan[i].b,
                 &mut state,
+                coeffs,
                 &mut model,
                 source.as_mut(),
             )?;
@@ -500,23 +578,23 @@ pub fn decode_cube_bitplanes_into(
         pkt += 1;
     }
 
-    // Reconstruct with the per-subband deadzone offset.
+    // Reconstruct with the per-subband deadzone offset, in place.
     let plane = geom.width * geom.height;
     for (sb_idx, m) in geom.members.iter().enumerate() {
         let bm = b_min[sb_idx];
-        let offset = if bm > 0 { (1u32 << (bm - 1)) - 1 } else { 0 };
+        let offset = if bm > 0 { (1i32 << (bm - 1)) - 1 } else { 0 };
         for &lambda in &m.lambdas {
-            for &(x, y) in &m.xy {
+            for (x, y) in m.xy.positions() {
                 let idx = lambda * plane + y * geom.width + x;
-                let mag = state.mag[idx];
-                let v = if mag == 0 {
-                    0
-                } else if state.neg[idx] {
-                    -((mag + offset) as i32)
+                let mag = coeffs[idx];
+                if mag == 0 {
+                    continue;
+                }
+                coeffs[idx] = if state.cell[idx] & CELL_NEG != 0 {
+                    -(mag + offset)
                 } else {
-                    (mag + offset) as i32
+                    mag + offset
                 };
-                coeffs[idx] = v;
             }
         }
     }
@@ -694,10 +772,10 @@ mod tests {
         for sb_idx in 0..full.subbands.len() {
             let mut union: Vec<(usize, usize)> = parts
                 .iter()
-                .flat_map(|g| g.members[sb_idx].xy.iter().copied())
+                .flat_map(|g| g.members[sb_idx].xy.positions())
                 .collect();
             union.sort_unstable_by_key(|&(x, y)| (y, x));
-            let mut expect = full.members[sb_idx].xy.clone();
+            let mut expect: Vec<(usize, usize)> = full.members[sb_idx].xy.positions().collect();
             expect.sort_unstable_by_key(|&(x, y)| (y, x));
             assert_eq!(union, expect, "subband {sb_idx} member cover");
             // λ planes are never windowed: segments extend through all
