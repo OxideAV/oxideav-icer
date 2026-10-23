@@ -10,7 +10,7 @@
 //! path was emitted, so the choice is transparent on decode.
 
 use oxideav_icer::{
-    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, info,
 };
 
 fn fill<F>(w: u32, h: u32, mut f: F) -> IcerImage

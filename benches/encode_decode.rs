@@ -26,10 +26,10 @@
 //! the decoder's framing walk should both be near-`memcpy` speed when
 //! the wavelet + entropy stages are bypassed.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use oxideav_icer::{
-    decode, encode, encode_icer3d, parse_icer3d, CubeEncodeOptions, EncodeOptions, IcerCube,
-    IcerImage, IcerPixelFormat, WaveletFilter,
+    CubeEncodeOptions, EncodeOptions, IcerCube, IcerImage, IcerPixelFormat, WaveletFilter, decode,
+    encode, encode_icer3d, parse_icer3d,
 };
 
 /// Diagonal ramp identical to the round-trip tests' `ramp_image`. Keeps

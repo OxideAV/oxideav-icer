@@ -16,7 +16,7 @@
 //! placeholder strip at the correct row offset (flat-128) so geometry is
 //! always preserved.
 
-use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode};
 
 fn base_opts() -> EncodeOptions {
     EncodeOptions::compressed()

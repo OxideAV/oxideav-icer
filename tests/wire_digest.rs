@@ -12,8 +12,8 @@
 //! run the test, paste the printed table back.
 
 use oxideav_icer::{
-    decode, encode, encode_icer3d, parse_icer3d, ChannelReliability, CubeEncodeOptions,
-    EncodeOptions, IcerCube, IcerImage, IcerPixelFormat, WaveletFilter,
+    ChannelReliability, CubeEncodeOptions, EncodeOptions, IcerCube, IcerImage, IcerPixelFormat,
+    WaveletFilter, decode, encode, encode_icer3d, parse_icer3d,
 };
 
 fn fnv1a(bytes: &[u8]) -> u64 {

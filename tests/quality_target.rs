@@ -28,8 +28,8 @@
 //!   `IcerError::Unsupported`.
 
 use oxideav_icer::{
-    analyze::psnr_db, decode, encode, EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    EncodeOptions, IcerError, IcerImage, IcerPixelFormat, WaveletFilter, analyze::psnr_db, decode,
+    encode,
 };
 
 /// Build a deterministic diagonal-ramp image, identical to the one used

@@ -23,7 +23,7 @@
 //!   * the rd_pruning mutual exclusion.
 
 use oxideav_icer::{
-    decode, encode, walk_segment, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, walk_segment,
 };
 
 fn textured(w: usize, h: usize, seed: u64) -> IcerImage {

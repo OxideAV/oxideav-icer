@@ -10,9 +10,9 @@
 //! failures.
 
 use oxideav_icer::{
-    decode_with, encode, encode_icer3d, info, parse_icer3d_with, parse_icer_lenient_with,
-    walk_segment, CubeEncodeOptions, DecodeOptions, EncodeOptions, IcerCube, IcerImage,
-    IcerPixelFormat,
+    CubeEncodeOptions, DecodeOptions, EncodeOptions, IcerCube, IcerImage, IcerPixelFormat,
+    decode_with, encode, encode_icer3d, info, parse_icer_lenient_with, parse_icer3d_with,
+    walk_segment,
 };
 
 // Tight geometry caps: the seeds are 32x32, so valid decodes always

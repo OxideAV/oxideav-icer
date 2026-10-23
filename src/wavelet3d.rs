@@ -57,7 +57,7 @@
 //! applies at the frozen spatial-low-pass lattice `2^t_s`.
 
 use crate::header::WaveletFilter;
-use crate::wavelet_int::{forward_1d, inverse_1d_with, IntFilterParams, InverseScratch};
+use crate::wavelet_int::{IntFilterParams, InverseScratch, forward_1d, inverse_1d_with};
 
 /// IPN 42-164 §III.B dynamic-range expansion factor `γ` of one
 /// one-dimensional high-pass filtering operation, as an exact rational

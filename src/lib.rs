@@ -172,50 +172,49 @@ pub use options::DecodeOptions;
 
 // ---- depth APIs (keep their names) -------------------------------------------
 pub use analyze::{
-    analyze, encode_to_quality_target, pick_filter_by_rate_distortion, psnr_db,
-    quality_search_bounds, recommend_filter, recommend_segment_count, region_mae, ssim,
-    supported_for_analysis, ChannelReliability, DistortionReport, ImageStats,
-    DEFAULT_RD_CANDIDATES,
+    ChannelReliability, DEFAULT_RD_CANDIDATES, DistortionReport, ImageStats, analyze,
+    encode_to_quality_target, pick_filter_by_rate_distortion, psnr_db, quality_search_bounds,
+    recommend_filter, recommend_segment_count, region_mae, ssim, supported_for_analysis,
 };
 pub use bitplane::{
-    decode_bitplanes_filtered, encode_bitplanes_filtered, EncodedPacket, ScanFilter,
+    EncodedPacket, ScanFilter, decode_bitplanes_filtered, encode_bitplanes_filtered,
 };
 pub use context::{
     neighbour_counts, sign_context_subband, sign_prediction_flip_subband,
     significance_context_subband, significance_context_table6, significance_context_table7,
 };
 pub use cube::{
-    encode_icer3d, is_cube, parse_icer3d, parse_icer3d_lenient, parse_icer3d_lenient_with,
-    parse_icer3d_with, CubeEncodeOptions, IcerCube, LenientCubeDecode,
+    CubeEncodeOptions, IcerCube, LenientCubeDecode, encode_icer3d, is_cube, parse_icer3d,
+    parse_icer3d_lenient, parse_icer3d_lenient_with, parse_icer3d_with,
 };
 pub use decoder::{
-    decode_uncompressed_icer, parse_icer_lenient, parse_icer_lenient_with, LenientDecode,
-    SegmentMetadata,
+    LenientDecode, SegmentMetadata, decode_uncompressed_icer, parse_icer_lenient,
+    parse_icer_lenient_with,
 };
 pub use entropy::EntropyKind;
 pub use header::{
-    walk_segment, BitPlanePass, PacketHeader, SegmentHeader, WalkedPacket, WalkedSegment,
-    WaveletFilter,
+    BitPlanePass, PacketHeader, SegmentHeader, WalkedPacket, WalkedSegment, WaveletFilter,
+    walk_segment,
 };
 pub use ixec::{
-    bin_for_probability, bins, Bin, ComponentCode, InterleavedDecoder, InterleavedEncoder,
-    IxecDecoder, IxecEncoder, BUFFER_WORDS,
+    BUFFER_WORDS, Bin, ComponentCode, InterleavedDecoder, InterleavedEncoder, IxecDecoder,
+    IxecEncoder, bin_for_probability, bins,
 };
 pub use partition::{
-    coefficient_segment_map, ll_dimensions, ll_segment_map, partition, partition_params,
-    PartitionParams, SegmentRect,
+    PartitionParams, SegmentRect, coefficient_segment_map, ll_dimensions, ll_segment_map,
+    partition, partition_params,
 };
-pub use plane_container::{is_container, parse_container, ParsedContainer};
+pub use plane_container::{ParsedContainer, is_container, parse_container};
 pub use priority::{
-    classify_position, encode_order, subband_weight_map, subbands, Subband, SubbandBitPlane,
-    SubbandType,
+    Subband, SubbandBitPlane, SubbandType, classify_position, encode_order, subband_weight_map,
+    subbands,
+};
+pub use wavelet_int::{
+    abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range,
 };
 pub use wavelet3d::{
     coefficient_word_bits, dynamic_range_expansion, forward_3d, high_pass_gamma, inverse_3d,
     spatial_stage_count, spectral_stage_count,
-};
-pub use wavelet_int::{
-    abs_tap_sum, approx_max_input_range, max_input_range, word_bits_for_input_range,
 };
 
 // ---- deprecated pre-contract entry points (one release) ----------------------
@@ -223,8 +222,8 @@ pub use wavelet_int::{
 pub use cube::{parse_icer3d_lenient_with_limits, parse_icer3d_with_limits};
 #[allow(deprecated)]
 pub use decoder::{
-    parse_icer, parse_icer_lenient_with_limits, parse_icer_metadata,
-    parse_icer_metadata_with_limits, parse_icer_with_limits, IcerMetadata,
+    IcerMetadata, parse_icer, parse_icer_lenient_with_limits, parse_icer_metadata,
+    parse_icer_metadata_with_limits, parse_icer_with_limits,
 };
 #[allow(deprecated)]
 pub use encoder::encode_icer;
@@ -239,6 +238,6 @@ pub use options::DecodeLimits;
 pub use registry::__oxideav_entry;
 #[cfg(feature = "registry")]
 pub use registry::{
-    from_core_pixel_format, make_decoder, make_encoder, register, register_codecs,
-    register_containers, to_core_pixel_format, IcerDecoder, IcerEncoder,
+    IcerDecoder, IcerEncoder, from_core_pixel_format, make_decoder, make_encoder, register,
+    register_codecs, register_containers, to_core_pixel_format,
 };

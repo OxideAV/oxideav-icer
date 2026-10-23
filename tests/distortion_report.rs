@@ -15,8 +15,8 @@
 //! no wavelet / entropy machinery involved.
 
 use oxideav_icer::{
-    decode, encode, region_mae, ssim, DistortionReport, EncodeOptions, IcerImage, IcerPixelFormat,
-    WaveletFilter,
+    DistortionReport, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode,
+    region_mae, ssim,
 };
 
 /// Diagonal ramp identical to the round-trip tests' fixtures.

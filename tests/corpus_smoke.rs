@@ -7,8 +7,8 @@
 //! input fails CI immediately instead of waiting for the cron.
 
 use oxideav_icer::{
-    decode_all_with, decode_with, info, parse_icer3d_with, parse_icer_lenient_with, probe,
-    walk_segment, DecodeOptions,
+    DecodeOptions, decode_all_with, decode_with, info, parse_icer_lenient_with, parse_icer3d_with,
+    probe, walk_segment,
 };
 
 /// Same tight per-iteration geometry budget the fuzz target uses.

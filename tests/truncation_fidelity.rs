@@ -18,7 +18,7 @@
 //! mid-plane cuts below clear PSNR floors set ~1 dB above the strip-global
 //! result they previously produced.
 
-use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode};
 
 /// A deterministic textured 64×64 fixture with structure across many
 /// bit planes so a budget cut falls mid-plane rather than on a clean

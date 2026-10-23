@@ -10,8 +10,8 @@
 //! escape hatches for trusted-input batch processing.
 
 use oxideav_icer::{
-    decode, decode_with, encode, info, info_with, DecodeOptions, EncodeOptions, IcerError,
-    IcerImage, IcerPixelFormat, SegmentHeader, WaveletFilter,
+    DecodeOptions, EncodeOptions, IcerError, IcerImage, IcerPixelFormat, SegmentHeader,
+    WaveletFilter, decode, decode_with, encode, info, info_with,
 };
 
 /// Build a 12-byte segment header that declares oversized geometry but

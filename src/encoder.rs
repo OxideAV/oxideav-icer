@@ -20,7 +20,7 @@
 //!     row-strip segments, each carrying an independently-decodable
 //!     coefficient buffer per IPN 42-155 §III.E.
 
-use crate::bitplane::{select_bit_plane_count, BitPlaneInput, EncodedPacket, ScanFilter};
+use crate::bitplane::{BitPlaneInput, EncodedPacket, ScanFilter, select_bit_plane_count};
 use crate::error::{IcerError, Result};
 use crate::header::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
 use crate::image::{IcerImage, IcerPixelFormat, Plane};
@@ -53,11 +53,7 @@ impl<'a> PlaneView<'a> {
 
     /// Bytes per stored sample (1 or 2).
     fn sample_bytes(self) -> usize {
-        if self.depth > 8 {
-            2
-        } else {
-            1
-        }
+        if self.depth > 8 { 2 } else { 1 }
     }
 
     /// Sample at `(x, y)`, widened to `i32`.
@@ -832,11 +828,11 @@ fn encode_icer_deep(image: &IcerImage, bits: u8, opts: &EncodeOptions) -> Result
     // and the container wrap happens exactly once: the trials clear
     // `quality_target_psnr`, so their recursive `encode_image` calls
     // fall through to the plain wrap below.
-    if let Some(target_db) = opts.quality_target_psnr {
-        if !opts.uncompressed {
-            reject_quality_target_conflicts(opts)?;
-            return crate::analyze::encode_to_quality_target(image, opts, target_db);
-        }
+    if let Some(target_db) = opts.quality_target_psnr
+        && !opts.uncompressed
+    {
+        reject_quality_target_conflicts(opts)?;
+        return crate::analyze::encode_to_quality_target(image, opts, target_db);
     }
 
     // The container framing (sentinel + tag + count + depth + length
@@ -998,11 +994,11 @@ fn encode_icer_single_plane(image: &IcerImage, opts: &EncodeOptions) -> Result<V
     // focused on the single-shot path. (Uncompressed-forced falls
     // through: the round-trip is bit-exact by construction, every
     // finite PSNR target is satisfied trivially.)
-    if let Some(target_db) = opts.quality_target_psnr {
-        if !opts.uncompressed {
-            reject_quality_target_conflicts(opts)?;
-            return crate::analyze::encode_to_quality_target(image, opts, target_db);
-        }
+    if let Some(target_db) = opts.quality_target_psnr
+        && !opts.uncompressed
+    {
+        reject_quality_target_conflicts(opts)?;
+        return crate::analyze::encode_to_quality_target(image, opts, target_db);
     }
 
     encode_single_plane_body(image, opts)
@@ -1076,22 +1072,22 @@ fn encode_single_plane_body(image: &IcerImage, opts: &EncodeOptions) -> Result<V
 
     if segment_count == 1 {
         let bytes = encode_one_segment(view, w, 0, h, 0, opts, levels)?;
-        if let Some(budget) = opts.byte_budget {
-            if bytes.len() as u64 > budget {
-                // The lone segment cannot fit the byte budget even after
-                // its own internal truncation — the §III.D uncompressed
-                // path is all-or-nothing (a partial raw body would not
-                // decode). Mirror the multi-segment skip semantics: emit
-                // the zero-body placeholder header so the stream still
-                // frames the full image geometry (flat-128 strip on
-                // decode) instead of blowing through the advertised hard
-                // cap (found by the scheduled encode_roundtrip fuzz run:
-                // a forced-uncompressed single-segment encode previously
-                // ignored `byte_budget` entirely).
-                let mut out = Vec::new();
-                emit_skipped_placeholders(&mut out, &[false], &[(0, h)], w, levels, opts);
-                return Ok(out);
-            }
+        if let Some(budget) = opts.byte_budget
+            && bytes.len() as u64 > budget
+        {
+            // The lone segment cannot fit the byte budget even after
+            // its own internal truncation — the §III.D uncompressed
+            // path is all-or-nothing (a partial raw body would not
+            // decode). Mirror the multi-segment skip semantics: emit
+            // the zero-body placeholder header so the stream still
+            // frames the full image geometry (flat-128 strip on
+            // decode) instead of blowing through the advertised hard
+            // cap (found by the scheduled encode_roundtrip fuzz run:
+            // a forced-uncompressed single-segment encode previously
+            // ignored `byte_budget` entirely).
+            let mut out = Vec::new();
+            emit_skipped_placeholders(&mut out, &[false], &[(0, h)], w, levels, opts);
+            return Ok(out);
         }
         return Ok(bytes);
     }
@@ -1425,11 +1421,11 @@ fn encode_transform_segmented(
             levels,
             inner_budget,
         )?;
-        if let Some(budget) = inner_budget {
-            if bytes.len() as u64 > budget {
-                // Even the truncated form does not fit; placeholder.
-                continue;
-            }
+        if let Some(budget) = inner_budget
+            && bytes.len() as u64 > budget
+        {
+            // Even the truncated form does not fit; placeholder.
+            continue;
         }
         out.extend_from_slice(&bytes);
         kept[seg_idx as usize] = true;
@@ -1708,27 +1704,28 @@ fn emit_planned_interleaved(
     let mut soft_stop_key: Option<i64> = None;
     for &(seg, local) in &order {
         let pkt = &plans[seg].packets[local];
-        if let Some(stop_key) = soft_stop_key {
-            if pkt.key < stop_key {
-                break;
-            }
+        if let Some(stop_key) = soft_stop_key
+            && pkt.key < stop_key
+        {
+            break;
         }
-        if let Some(budget) = byte_budget {
-            if total + pkt.wire_len() > budget {
-                // §VI.B: the quota truncates the interleaved stream —
-                // a strict global prefix, no skip-and-continue.
-                break;
-            }
+        if let Some(budget) = byte_budget
+            && total + pkt.wire_len() > budget
+        {
+            // §VI.B: the quota truncates the interleaved stream —
+            // a strict global prefix, no skip-and-continue.
+            break;
         }
         total += pkt.wire_len();
         debug_assert_eq!(kept[seg], local, "kept set must stay a per-segment prefix");
         kept[seg] = local + 1;
-        if let Some(target) = target_bytes {
-            if total >= target && soft_stop_key.is_none() {
-                // Finish the current §VI.B step (same-key packets),
-                // then stop.
-                soft_stop_key = Some(pkt.key);
-            }
+        if let Some(target) = target_bytes
+            && total >= target
+            && soft_stop_key.is_none()
+        {
+            // Finish the current §VI.B step (same-key packets),
+            // then stop.
+            soft_stop_key = Some(pkt.key);
         }
     }
 
@@ -1951,11 +1948,7 @@ fn min_visited_skip(filter: &ScanFilter<'_>, n: usize) -> u8 {
             }
         }
     }
-    if min == u8::MAX {
-        0
-    } else {
-        min
-    }
+    if min == u8::MAX { 0 } else { min }
 }
 
 /// Serialise per-bit-plane packets MSB-down (sig before ref, §IV order)
@@ -1973,10 +1966,10 @@ fn serialize_packets_msb_down(
     let mut body: Vec<u8> = Vec::new();
     let mut soft_stop_after_bp: Option<u8> = None;
     'bp_loop: for bp_idx in 0..q as usize {
-        if let Some(stop_bp) = soft_stop_after_bp {
-            if bp_idx as u8 > stop_bp {
-                break 'bp_loop;
-            }
+        if let Some(stop_bp) = soft_stop_after_bp
+            && bp_idx as u8 > stop_bp
+        {
+            break 'bp_loop;
         }
         // Absolute magnitude bit position of this plane; planes fully
         // below the §VI.A floor code nothing and are not emitted.
@@ -1998,10 +1991,10 @@ fn serialize_packets_msb_down(
                 )));
             }
             let pkt_wire_len = PacketHeader::ENCODED_BYTES as u64 + pkt.body.len() as u64;
-            if let Some(budget) = byte_budget {
-                if seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget {
-                    break 'bp_loop;
-                }
+            if let Some(budget) = byte_budget
+                && seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget
+            {
+                break 'bp_loop;
             }
             let ph = PacketHeader {
                 bit_plane: pkt.bit_plane,
@@ -2015,10 +2008,11 @@ fn serialize_packets_msb_down(
             };
             body.extend_from_slice(&ph.encode());
             body.extend_from_slice(&pkt.body);
-            if let Some(target) = opts.target_bytes {
-                if (seg_hdr_bytes + body.len() as u64) >= target && soft_stop_after_bp.is_none() {
-                    soft_stop_after_bp = Some(bp_idx as u8);
-                }
+            if let Some(target) = opts.target_bytes
+                && (seg_hdr_bytes + body.len() as u64) >= target
+                && soft_stop_after_bp.is_none()
+            {
+                soft_stop_after_bp = Some(bp_idx as u8);
             }
         }
     }
@@ -2056,10 +2050,10 @@ fn serialize_priority_packets(
             )));
         }
         let pkt_wire_len = PacketHeader::ENCODED_BYTES as u64 + pkt.body.len() as u64;
-        if let Some(budget) = byte_budget {
-            if seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget {
-                break;
-            }
+        if let Some(budget) = byte_budget
+            && seg_hdr_bytes + body.len() as u64 + pkt_wire_len > budget
+        {
+            break;
         }
         let ph = PacketHeader {
             bit_plane: pkt.bit_plane,
@@ -2069,10 +2063,10 @@ fn serialize_priority_packets(
         };
         body.extend_from_slice(&ph.encode());
         body.extend_from_slice(&pkt.body);
-        if let Some(target) = opts.target_bytes {
-            if seg_hdr_bytes + body.len() as u64 >= target {
-                break;
-            }
+        if let Some(target) = opts.target_bytes
+            && seg_hdr_bytes + body.len() as u64 >= target
+        {
+            break;
         }
     }
     if body.len() > u16::MAX as usize {
@@ -2402,10 +2396,10 @@ fn encode_one_segment_compressed(
     let floor_planes = min_visited_skip(&scan_filter, img_w * strip_h) as usize;
     'bp_loop: for bp_idx in 0..q_usize {
         // Check if soft-target stop was requested for a previous bit-plane.
-        if let Some(stop_bp) = soft_stop_after_bp {
-            if bp_idx as u8 > stop_bp {
-                break 'bp_loop;
-            }
+        if let Some(stop_bp) = soft_stop_after_bp
+            && bp_idx as u8 > stop_bp
+        {
+            break 'bp_loop;
         }
         if q_usize - 1 - bp_idx < floor_planes {
             break 'bp_loop;
@@ -2426,10 +2420,10 @@ fn encode_one_segment_compressed(
             // the dependency graph (sig(bp) depends on sig(bp-1);
             // ref(bp) depends on sig(bp)) was enforced inside the
             // selector.
-            if let Some(mask) = &kept_mask {
-                if !mask[pkt_index] {
-                    continue;
-                }
+            if let Some(mask) = &kept_mask
+                && !mask[pkt_index]
+            {
+                continue;
             }
 
             // Guard against individual packet body overflowing u16.
@@ -2449,17 +2443,17 @@ fn encode_one_segment_compressed(
             // (When the R-D selector is in use it has already enforced
             // the budget; this check remains as a defensive belt &
             // braces.)
-            if let Some(budget) = opts.byte_budget {
-                if new_total > budget {
-                    if kept_mask.is_some() {
-                        // R-D mode: selector should have prevented this,
-                        // but guard against floating-point or off-by-one
-                        // corner cases by simply skipping this packet
-                        // (do not break, later packets may still fit).
-                        continue;
-                    }
-                    break 'bp_loop;
+            if let Some(budget) = opts.byte_budget
+                && new_total > budget
+            {
+                if kept_mask.is_some() {
+                    // R-D mode: selector should have prevented this,
+                    // but guard against floating-point or off-by-one
+                    // corner cases by simply skipping this packet
+                    // (do not break, later packets may still fit).
+                    continue;
                 }
+                break 'bp_loop;
             }
 
             // Emit the packet.
@@ -2481,10 +2475,11 @@ fn encode_one_segment_compressed(
             // exceeds target_bytes, request a stop after the current
             // bit-plane pair finishes (i.e. after the refinement
             // packet for this bit-plane index).
-            if let Some(target) = opts.target_bytes {
-                if (seg_hdr_bytes + body.len() as u64) >= target && soft_stop_after_bp.is_none() {
-                    soft_stop_after_bp = Some(bp_idx as u8);
-                }
+            if let Some(target) = opts.target_bytes
+                && (seg_hdr_bytes + body.len() as u64) >= target
+                && soft_stop_after_bp.is_none()
+            {
+                soft_stop_after_bp = Some(bp_idx as u8);
             }
         }
     }
@@ -2766,7 +2761,7 @@ fn pick_lower_distortion_mask(
         let kept: Vec<EncodedPacket> = packets
             .iter()
             .zip(mask.iter())
-            .filter(|(_, &m)| m)
+            .filter(|&(_, &m)| m)
             .map(|(p, _)| p.clone())
             .collect();
         let mut coeffs =

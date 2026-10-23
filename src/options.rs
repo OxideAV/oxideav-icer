@@ -131,13 +131,13 @@ impl DecodeOptions {
     pub(crate) fn check_segment(&self, segment_index: u16, width: u32, height: u32) -> Result<()> {
         self.check_width_height(width, height)?;
         let px = width as u64 * height as u64;
-        if let Some(m) = self.max_pixels_per_segment {
-            if px > m {
-                return Err(IcerError::limit(format!(
-                    "segment {segment_index} geometry {width}x{height} = {px} pixels exceeds \
+        if let Some(m) = self.max_pixels_per_segment
+            && px > m
+        {
+            return Err(IcerError::limit(format!(
+                "segment {segment_index} geometry {width}x{height} = {px} pixels exceeds \
                      per-segment cap of {m} pixels (see DecodeOptions::max_pixels_per_segment)"
-                )));
-            }
+            )));
         }
         Ok(())
     }
@@ -145,45 +145,45 @@ impl DecodeOptions {
     /// Check a width / height pair against [`Self::max_width`] /
     /// [`Self::max_height`].
     pub(crate) fn check_width_height(&self, width: u32, height: u32) -> Result<()> {
-        if let Some(m) = self.max_width {
-            if width > m {
-                return Err(IcerError::limit(format!(
-                    "width {width} exceeds max_width {m}"
-                )));
-            }
+        if let Some(m) = self.max_width
+            && width > m
+        {
+            return Err(IcerError::limit(format!(
+                "width {width} exceeds max_width {m}"
+            )));
         }
-        if let Some(m) = self.max_height {
-            if height > m {
-                return Err(IcerError::limit(format!(
-                    "height {height} exceeds max_height {m}"
-                )));
-            }
+        if let Some(m) = self.max_height
+            && height > m
+        {
+            return Err(IcerError::limit(format!(
+                "height {height} exceeds max_height {m}"
+            )));
         }
         Ok(())
     }
 
     /// Check a running total pixel count against [`Self::max_pixels`].
     pub(crate) fn check_total_pixels(&self, total: u64, what: &str) -> Result<()> {
-        if let Some(m) = self.max_pixels {
-            if total > m {
-                return Err(IcerError::limit(format!(
-                    "{what} pixel-count {total} exceeds total cap of {m} pixels \
+        if let Some(m) = self.max_pixels
+            && total > m
+        {
+            return Err(IcerError::limit(format!(
+                "{what} pixel-count {total} exceeds total cap of {m} pixels \
                      (see DecodeOptions::max_pixels)"
-                )));
-            }
+            )));
         }
         Ok(())
     }
 
     /// Check a planned peak working set against [`Self::max_bytes`].
     pub(crate) fn check_bytes(&self, bytes: u64) -> Result<()> {
-        if let Some(m) = self.max_bytes {
-            if bytes > m {
-                return Err(IcerError::limit(format!(
-                    "planned decoder working set of {bytes} bytes exceeds max_bytes {m} \
+        if let Some(m) = self.max_bytes
+            && bytes > m
+        {
+            return Err(IcerError::limit(format!(
+                "planned decoder working set of {bytes} bytes exceeds max_bytes {m} \
                      (see DecodeOptions::max_bytes)"
-                )));
-            }
+            )));
         }
         Ok(())
     }
@@ -279,27 +279,37 @@ mod tests {
         let u = d.clone().unlimited();
         assert_eq!(u.max_bytes, None);
         assert_eq!(u.max_pixels, None);
-        assert!(DecodeOptions::new()
-            .with_max_width(4)
-            .check_segment(0, 5, 1)
-            .unwrap_err()
-            .is_limit_exceeded());
-        assert!(DecodeOptions::new()
-            .with_max_height(4)
-            .check_segment(0, 1, 5)
-            .is_err());
-        assert!(DecodeOptions::new()
-            .with_max_pixels_per_segment(10u64)
-            .check_segment(0, 4, 4)
-            .is_err());
-        assert!(DecodeOptions::new()
-            .with_max_pixels(10u64)
-            .check_total_pixels(16, "x")
-            .is_err());
-        assert!(DecodeOptions::new()
-            .with_max_bytes(10u64)
-            .check_bytes(16)
-            .is_err());
+        assert!(
+            DecodeOptions::new()
+                .with_max_width(4)
+                .check_segment(0, 5, 1)
+                .unwrap_err()
+                .is_limit_exceeded()
+        );
+        assert!(
+            DecodeOptions::new()
+                .with_max_height(4)
+                .check_segment(0, 1, 5)
+                .is_err()
+        );
+        assert!(
+            DecodeOptions::new()
+                .with_max_pixels_per_segment(10u64)
+                .check_segment(0, 4, 4)
+                .is_err()
+        );
+        assert!(
+            DecodeOptions::new()
+                .with_max_pixels(10u64)
+                .check_total_pixels(16, "x")
+                .is_err()
+        );
+        assert!(
+            DecodeOptions::new()
+                .with_max_bytes(10u64)
+                .check_bytes(16)
+                .is_err()
+        );
         assert!(DecodeOptions::new().with_strict(true).strict);
     }
 

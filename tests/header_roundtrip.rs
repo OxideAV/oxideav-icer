@@ -1,6 +1,6 @@
 //! Round-trip cover for `SegmentHeader` + `PacketHeader` parse/encode.
 
-use oxideav_icer::{walk_segment, BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter};
+use oxideav_icer::{BitPlanePass, PacketHeader, SegmentHeader, WaveletFilter, walk_segment};
 
 #[test]
 fn segment_header_roundtrip_all_filters() {

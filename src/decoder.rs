@@ -39,7 +39,7 @@
 use crate::bitplane::{EncodedPacket, ScanFilter};
 use crate::budget;
 use crate::error::{IcerError, Result};
-use crate::header::{walk_segment, BitPlanePass, SegmentHeader, WalkedSegment};
+use crate::header::{BitPlanePass, SegmentHeader, WalkedSegment, walk_segment};
 use crate::image::StreamKind;
 use crate::image::{IcerImage, IcerPixelFormat, Plane};
 #[allow(deprecated)]
@@ -77,11 +77,7 @@ fn zeros_gray(width: u32, height: u32, depth: u8) -> IcerImage {
 
 /// Bytes per stored sample for a given depth (1, or 2 little-endian).
 fn sample_bytes(depth: u8) -> usize {
-    if depth > 8 {
-        2
-    } else {
-        1
-    }
+    if depth > 8 { 2 } else { 1 }
 }
 
 /// Store one already-clamped pixel value into a plane row.
@@ -296,7 +292,7 @@ pub(crate) fn walk_stream(bytes: &[u8], opts: &DecodeOptions) -> Result<StreamLa
                 Some((w0, h0)) if (w0, h0) != (w, h) => {
                     return Err(IcerError::Unsupported(format!(
                         "colour plane {i} geometry {w}x{h} disagrees with plane 0 {w0}x{h0}"
-                    )))
+                    )));
                 }
                 _ => {}
             }
@@ -436,7 +432,7 @@ fn parse_icer_multi_plane(bytes: &[u8], opts: &DecodeOptions) -> Result<IcerImag
                 return Err(IcerError::Unsupported(format!(
                     "colour plane {i} geometry {}x{} disagrees with plane 0 {w}x{h}",
                     img.width, img.height
-                )))
+                )));
             }
             _ => {}
         }

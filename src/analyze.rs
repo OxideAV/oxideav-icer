@@ -29,7 +29,7 @@
 //! stronger high-pass prediction) and are deliberately conservative +
 //! documented so callers can audit them.
 
-use crate::encoder::{encode_image, EncodeOptions};
+use crate::encoder::{EncodeOptions, encode_image};
 use crate::error::Result;
 use crate::header::WaveletFilter;
 use crate::image::{IcerImage, IcerPixelFormat};

@@ -433,7 +433,7 @@ fn parse_tree(
         }
         Token::Open => {
             *pos += 1; // consume '('
-                       // Left child: zero branch.
+            // Left child: zero branch.
             prefix.push(false);
             parse_tree(tokens, pos, prefix, pairs);
             prefix.pop();

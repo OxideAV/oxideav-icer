@@ -7,7 +7,7 @@
 //! `EncodeOptions::with_byte_budget` and `EncodeOptions::with_target_bytes`
 //! builder methods.
 
-use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, decode, encode};
 
 /// Build a 256x256 8-bit gray gradient image where pixel (x, y) =
 /// ((x + y * 256 / 255) & 0xFF), producing a smooth diagonal ramp.

@@ -708,12 +708,16 @@ impl IcerImage {
         let h = self.height as usize;
         let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
         let rgb = self.to_rgb8();
-        for (s, d) in rgb.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
-            d[..3].copy_from_slice(s);
-            d[3] = 255;
+        for (s, d) in rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<4>().0)
+        {
+            *d = [s[0], s[1], s[2], 255];
         }
         // Rows the RGB kernel could not read stay zero; keep them opaque.
-        for d in out.chunks_exact_mut(4).skip(rgb.len() / 3) {
+        for d in out.as_chunks_mut::<4>().0.iter_mut().skip(rgb.len() / 3) {
             d[3] = 255;
         }
         out
@@ -742,13 +746,18 @@ impl IcerImage {
                     };
                     let dst = &mut out[y * w * 3..(y + 1) * w * 3];
                     if self.format == PixelFormat::Gray8 {
-                        for (s, d) in src.iter().zip(dst.chunks_exact_mut(3)) {
+                        for (s, d) in src.iter().zip(dst.as_chunks_mut::<3>().0) {
                             let v = scale_to_u8(*s as u32, max);
                             d.fill(v);
                         }
                     } else {
-                        for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(3)) {
-                            let v = scale_to_u8(u16::from_le_bytes([s[0], s[1]]) as u32, max);
+                        for (s, d) in src
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .zip(dst.as_chunks_mut::<3>().0)
+                        {
+                            let v = scale_to_u8(u16::from_le_bytes(*s) as u32, max);
                             d.fill(v);
                         }
                     }
@@ -767,10 +776,8 @@ impl IcerImage {
                         break;
                     };
                     let dst = &mut out[y * w * 3..(y + 1) * w * 3];
-                    for (x, d) in dst.chunks_exact_mut(3).enumerate() {
-                        d[0] = r[x];
-                        d[1] = g[x];
-                        d[2] = b[x];
+                    for (x, d) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                        *d = [r[x], g[x], b[x]];
                     }
                 }
             }
@@ -788,11 +795,8 @@ impl IcerImage {
                         break;
                     };
                     let dst = &mut out[y * w * 3..(y + 1) * w * 3];
-                    for (x, d) in dst.chunks_exact_mut(3).enumerate() {
-                        let [r, g, b] = kernel.rgb(yp[x], cb[x], cr[x]);
-                        d[0] = r;
-                        d[1] = g;
-                        d[2] = b;
+                    for (x, d) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                        *d = kernel.rgb(yp[x], cb[x], cr[x]);
                     }
                 }
             }
@@ -1062,23 +1066,27 @@ mod tests {
     #[test]
     fn new_validates_geometry_and_planes() {
         assert!(IcerImage::new(0, 1, PixelFormat::Gray8, vec![Plane::new(0, vec![])]).is_err());
-        assert!(IcerImage::new(
-            70000,
-            1,
-            PixelFormat::Gray8,
-            vec![Plane::new(70000, vec![])]
-        )
-        .is_err());
+        assert!(
+            IcerImage::new(
+                70000,
+                1,
+                PixelFormat::Gray8,
+                vec![Plane::new(70000, vec![])]
+            )
+            .is_err()
+        );
         // Short plane.
         assert!(IcerImage::new(4, 2, PixelFormat::Gray8, vec![Plane::new(4, vec![0; 7])]).is_err());
         // Stride below row size.
-        assert!(IcerImage::new(
-            4,
-            2,
-            PixelFormat::Gray16Le,
-            vec![Plane::new(4, vec![0; 16])]
-        )
-        .is_err());
+        assert!(
+            IcerImage::new(
+                4,
+                2,
+                PixelFormat::Gray16Le,
+                vec![Plane::new(4, vec![0; 16])]
+            )
+            .is_err()
+        );
         // Wrong plane count.
         assert!(IcerImage::new(2, 2, PixelFormat::Gbrp8, vec![Plane::new(2, vec![0; 4])]).is_err());
         // Last row may omit padding.
@@ -1094,12 +1102,16 @@ mod tests {
         assert!(g16.clone().with_bit_depth(8).is_err());
         assert!(g16.clone().with_bit_depth(17).is_err());
         assert_eq!(g16.with_bit_depth(12).unwrap().bit_depth, 12);
-        assert!(IcerImage::zeros(2, 2, PixelFormat::Gray8)
-            .with_bit_depth(9)
-            .is_err());
-        assert!(IcerImage::zeros(2, 2, PixelFormat::Yuv444P)
-            .with_bit_depth(7)
-            .is_err());
+        assert!(
+            IcerImage::zeros(2, 2, PixelFormat::Gray8)
+                .with_bit_depth(9)
+                .is_err()
+        );
+        assert!(
+            IcerImage::zeros(2, 2, PixelFormat::Yuv444P)
+                .with_bit_depth(7)
+                .is_err()
+        );
         assert!(IcerImage::zeros_deep(2, 2, 8).is_err());
     }
 
@@ -1114,7 +1126,7 @@ mod tests {
         assert_eq!(rgb, [0, 0, 0, 0, 0, 0, 128, 128, 128, 255, 255, 255]);
         let rgba = img.to_rgba8();
         assert_eq!(rgba.len(), 16);
-        assert!(rgba.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
         // Out-of-range samples clamp instead of wrapping.
         img.set_sample(0, 0, 0, 0xFFFF);
         assert_eq!(&img.to_rgb8()[..3], &[255, 255, 255]);
@@ -1144,12 +1156,20 @@ mod tests {
         assert_eq!(img.to_rgb8(), rgb);
         assert!(img.as_bytes().is_none());
         let rgba: Vec<u8> = rgb
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2], 7])
             .collect();
         let img2 = IcerImage::from_rgba8(3, 2, rgba).unwrap();
         assert_eq!(img2.to_rgb8(), rgb);
-        assert!(img2.to_rgba8().chunks_exact(4).all(|p| p[3] == 255));
+        assert!(
+            img2.to_rgba8()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[3] == 255)
+        );
         assert!(IcerImage::from_rgb8(3, 2, vec![0; 17]).is_err());
         assert_eq!(img.into_raw().len(), 18);
     }
@@ -1166,7 +1186,7 @@ mod tests {
         assert_eq!(rgb[6], rgb[7]);
         assert_eq!(rgb[7], rgb[8]);
         assert_eq!(rgb[6], 128); // (126-16)*255/219 = 128.08
-                                 // Full range is the identity on the luma axis.
+        // Full range is the identity on the luma axis.
         let full = img
             .clone()
             .with_color(ColorInfo::yuv444p_default().with_range(ColorRange::Full));

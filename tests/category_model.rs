@@ -12,8 +12,8 @@
 //! so a divergence would corrupt the decode and fail the round-trips
 //! below.
 
-use oxideav_icer::context::{magnitude_context, MagnitudeContext, CATEGORY2_CONTEXT};
-use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
+use oxideav_icer::context::{CATEGORY2_CONTEXT, MagnitudeContext, magnitude_context};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode};
 
 /// The category -> context mapping is exactly the §III.B rule:
 /// cat 1 -> 9 (no H/V significant neighbour) or 10; cat 2 -> 11; cat 3+

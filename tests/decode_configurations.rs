@@ -19,7 +19,7 @@
 //! fixed configs) with a systematic matrix, and `truncation_fidelity.rs`
 //! (one fixture) with progressive monotonicity across the whole matrix.
 
-use oxideav_icer::{decode, encode, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode};
 
 fn ramp(w: u32, h: u32) -> IcerImage {
     let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);

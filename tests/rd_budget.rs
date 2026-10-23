@@ -20,7 +20,7 @@
 //! 256×256 gradient fixture used by the round-4 quota tests.
 
 use oxideav_icer::{
-    decode, encode, subband_weight_map, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, subband_weight_map,
 };
 
 /// Build a 256×256 8-bit gray gradient image with both horizontal and

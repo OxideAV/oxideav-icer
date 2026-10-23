@@ -10,8 +10,8 @@
 //! input can never overflow the `i32` coefficient words.
 
 use oxideav_icer::{
-    decode, decode_with, encode, info, parse_icer_lenient, psnr_db, DecodeOptions, EncodeOptions,
-    IcerImage, IcerPixelFormat, WaveletFilter,
+    DecodeOptions, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, decode_with,
+    encode, info, parse_icer_lenient, psnr_db,
 };
 
 const ALL_FILTERS: [WaveletFilter; 7] = [

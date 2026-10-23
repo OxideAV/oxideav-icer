@@ -231,7 +231,7 @@ pub fn parse_container(bytes: &[u8]) -> Result<ParsedContainer> {
         other => {
             return Err(IcerError::invalid(format!(
                 "unknown plane-container format tag {other}"
-            )))
+            )));
         }
     };
     let expected_n = format.plane_count();

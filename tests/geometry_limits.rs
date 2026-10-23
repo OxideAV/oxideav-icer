@@ -15,7 +15,7 @@
 //! mechanism the `decode_segment` fuzz harness now uses so a single
 //! crafted header cannot dominate a fuzzing run's wall-clock budget.
 
-use oxideav_icer::{decode_with, parse_icer_lenient_with, DecodeOptions, IcerError};
+use oxideav_icer::{DecodeOptions, IcerError, decode_with, parse_icer_lenient_with};
 use std::time::Instant;
 
 /// Build a 12-byte compressed-segment header declaring `width × height`,
@@ -28,7 +28,7 @@ fn giant_header(width: u16, height: u16, levels: u8, bit_planes: u8) -> Vec<u8> 
     h[3..5].copy_from_slice(&width.to_be_bytes());
     h[5..7].copy_from_slice(&height.to_be_bytes());
     h[7] = bit_planes << 2; // bit_plane_count in the high 6 bits
-                            // bytes 8..10 segment_length = 0, bytes 10..12 segment_index = 0
+    // bytes 8..10 segment_length = 0, bytes 10..12 segment_index = 0
     h
 }
 

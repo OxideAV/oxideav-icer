@@ -1,7 +1,7 @@
 //! End-to-end round-trip cover for the round-1 uncompressed
 //! (IPN 42-155 §III.D) encode → decode pipeline.
 
-use oxideav_icer::{decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, decode, encode, info};
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {
     let mut img = IcerImage::zeros(w, h, IcerPixelFormat::Gray8);

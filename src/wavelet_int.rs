@@ -310,7 +310,7 @@ fn predictor(
     d: &[i64],
     r: &[i64],
 ) -> i64 {
-    let n_even = n % 2 == 0;
+    let n_even = n.is_multiple_of(2);
     if n_idx == 0 {
         // floor((1/4) r[1]) = floor(r[1] / 4).
         floor_div(r[1], 4)
@@ -1033,11 +1033,7 @@ mod tests {
                 let mut buf12: Vec<i32> = (0..w * h)
                     .map(|i| {
                         let (x, y) = (i % w, i / w);
-                        if (x ^ y) & 1 == 0 {
-                            -2048
-                        } else {
-                            2047
-                        }
+                        if (x ^ y) & 1 == 0 { -2048 } else { 2047 }
                     })
                     .collect();
                 forward_2d_dyadic(&mut buf12, w, h, levels, f);
@@ -1050,11 +1046,7 @@ mod tests {
                 let mut buf16: Vec<i32> = (0..w * h)
                     .map(|i| {
                         let (x, y) = (i % w, i / w);
-                        if (x ^ y) & 1 == 0 {
-                            -32768
-                        } else {
-                            32767
-                        }
+                        if (x ^ y) & 1 == 0 { -32768 } else { 32767 }
                     })
                     .collect();
                 forward_2d_dyadic(&mut buf16, w, h, levels, f);

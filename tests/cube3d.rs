@@ -7,8 +7,8 @@
 //! the decoder must survive arbitrary corruption of a valid stream.
 
 use oxideav_icer::{
-    encode, encode_icer3d, parse_icer3d, CubeEncodeOptions, EncodeOptions, IcerCube, IcerImage,
-    IcerPixelFormat,
+    CubeEncodeOptions, EncodeOptions, IcerCube, IcerImage, IcerPixelFormat, encode, encode_icer3d,
+    parse_icer3d,
 };
 
 /// A synthetic scene with strong inter-band correlation: every band is

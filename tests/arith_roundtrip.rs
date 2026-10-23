@@ -3,8 +3,8 @@
 
 use oxideav_icer::arith::{ArithDecoder, ArithEncoder};
 use oxideav_icer::context::{
-    magnitude_context, sign_context, significance_context, ContextModel, MagnitudeContext,
-    CONTEXT_COUNT,
+    CONTEXT_COUNT, ContextModel, MagnitudeContext, magnitude_context, sign_context,
+    significance_context,
 };
 
 fn deterministic_bits(n: usize, seed: u64) -> Vec<u8> {

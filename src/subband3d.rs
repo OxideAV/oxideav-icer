@@ -210,7 +210,7 @@ pub fn classify_cube_position(x: usize, y: usize, lambda: usize, ts: u8, tl: u8)
         crate::priority::classify_position(x, y, ts)
     };
     let n = spectral_depth_for(spatial, spatial_level, tl);
-    let (spectral_high, spectral_level) = if n == 0 || lambda % (1usize << n) == 0 {
+    let (spectral_high, spectral_level) = if n == 0 || lambda.is_multiple_of(1usize << n) {
         (false, n)
     } else {
         let m = lambda.trailing_zeros() as u8 + 1;

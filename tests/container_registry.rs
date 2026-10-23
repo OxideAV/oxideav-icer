@@ -14,10 +14,10 @@ use oxideav_core::{
     RuntimeContext, StreamInfo, TimeBase, VideoFrame,
 };
 use oxideav_icer::container::{
-    probe, PROBE_SCORE_CONTAINER_WALKED, PROBE_SCORE_SEGMENTS_WALKED, PROBE_SCORE_WITH_EXTENSION,
+    PROBE_SCORE_CONTAINER_WALKED, PROBE_SCORE_SEGMENTS_WALKED, PROBE_SCORE_WITH_EXTENSION, probe,
 };
 use oxideav_icer::registry::to_core_pixel_format;
-use oxideav_icer::{EncodeOptions, Frame, IcerImage, IcerPixelFormat, StreamKind, CODEC_ID_STR};
+use oxideav_icer::{CODEC_ID_STR, EncodeOptions, Frame, IcerImage, IcerPixelFormat, StreamKind};
 
 const CONTAINER: &str = "icer";
 
@@ -360,14 +360,16 @@ fn probe_rejects_foreign_files() {
             0,
             "{ext} sample must not score as ICER"
         );
-        assert!(ctx
-            .containers
-            .probe_input(&mut Cursor::new(&bytes), Some(ext))
-            .is_err());
-        assert!(ctx
-            .containers
-            .probe_input(&mut Cursor::new(&bytes), None)
-            .is_err());
+        assert!(
+            ctx.containers
+                .probe_input(&mut Cursor::new(&bytes), Some(ext))
+                .is_err()
+        );
+        assert!(
+            ctx.containers
+                .probe_input(&mut Cursor::new(&bytes), None)
+                .is_err()
+        );
     }
 }
 
@@ -644,34 +646,40 @@ fn mux_rejects_bad_streams_packets_and_mismatched_bands() {
     };
     let sink = || Box::new(Cursor::new(Vec::<u8>::new()));
     assert!(ctx.containers.open_muxer(CONTAINER, sink(), &[]).is_err());
-    assert!(ctx
-        .containers
-        .open_muxer(CONTAINER, sink(), &[video.clone(), video.clone()])
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_muxer(CONTAINER, sink(), &[video.clone(), video.clone()])
+            .is_err()
+    );
     let audio = StreamInfo {
         params: CodecParameters::audio(CodecId::new("pcm")),
         ..video.clone()
     };
-    assert!(ctx
-        .containers
-        .open_muxer(CONTAINER, sink(), &[audio])
-        .is_err());
+    assert!(
+        ctx.containers
+            .open_muxer(CONTAINER, sink(), &[audio])
+            .is_err()
+    );
 
     let mut muxer = ctx
         .containers
         .open_muxer(CONTAINER, sink(), std::slice::from_ref(&video))
         .unwrap();
     muxer.write_header().unwrap();
-    assert!(muxer
-        .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
-        .is_err());
-    assert!(muxer
-        .write_packet(&Packet::new(
-            0,
-            TimeBase::new(1, 1),
-            b"\0\0\0\0\0\0\0\0\0\0\0\0\0".to_vec()
-        ))
-        .is_err());
+    assert!(
+        muxer
+            .write_packet(&Packet::new(0, TimeBase::new(1, 1), Vec::new()))
+            .is_err()
+    );
+    assert!(
+        muxer
+            .write_packet(&Packet::new(
+                0,
+                TimeBase::new(1, 1),
+                b"\0\0\0\0\0\0\0\0\0\0\0\0\0".to_vec()
+            ))
+            .is_err()
+    );
     assert!(muxer.write_trailer().is_err(), "no packet, no file");
 
     // Bands of different geometry cannot form a cube.
@@ -696,10 +704,11 @@ fn mux_rejects_bad_streams_packets_and_mismatched_bands() {
 #[test]
 fn register_installs_codec_and_container() {
     let ctx = ctx();
-    assert!(ctx
-        .codecs
-        .decoder_ids()
-        .any(|c| *c == CodecId::new(CODEC_ID_STR)));
+    assert!(
+        ctx.codecs
+            .decoder_ids()
+            .any(|c| *c == CodecId::new(CODEC_ID_STR))
+    );
     assert!(ctx.containers.demuxer_names().any(|n| n == CONTAINER));
     assert!(ctx.containers.muxer_names().any(|n| n == CONTAINER));
     assert_eq!(

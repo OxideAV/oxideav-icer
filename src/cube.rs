@@ -83,7 +83,7 @@
 //! ```
 
 use crate::bitplane3d::{
-    decode_cube_bitplanes_into, encode_cube_bitplanes, CubeGeometry, CubePacket,
+    CubeGeometry, CubePacket, decode_cube_bitplanes_into, encode_cube_bitplanes,
 };
 use crate::entropy::EntropyKind;
 use crate::error::{IcerError, Result};
@@ -92,7 +92,7 @@ use crate::image::{IcerImage, IcerPixelFormat};
 #[allow(deprecated)]
 use crate::options::DecodeLimits;
 use crate::options::DecodeOptions;
-use crate::partition::{ll_dimensions, partition, SegmentRect};
+use crate::partition::{SegmentRect, ll_dimensions, partition};
 use crate::subband3d::stage_counts;
 use crate::wavelet3d::{forward_3d, inverse_3d};
 
@@ -171,8 +171,8 @@ impl IcerCube {
                 *d = *s as u8;
             }
         } else {
-            for (d, s) in plane.data.chunks_exact_mut(2).zip(src) {
-                d.copy_from_slice(&s.to_le_bytes());
+            for (d, s) in plane.data.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                *d = s.to_le_bytes();
             }
         }
         img.with_bit_depth(self.bit_depth)
@@ -865,13 +865,13 @@ pub(crate) fn parse_cube_header<'a>(
         width as u64 * strip_h as u64 * bands as u64
     };
     opts.check_width_height(width as u32, height as u32)?;
-    if let Some(m) = opts.max_pixels_per_segment {
-        if per_seg > m {
-            return Err(IcerError::limit(format!(
-                "cube segment of {per_seg} samples ({width}x{strip_h}x{bands}) exceeds \
+    if let Some(m) = opts.max_pixels_per_segment
+        && per_seg > m
+    {
+        return Err(IcerError::limit(format!(
+            "cube segment of {per_seg} samples ({width}x{strip_h}x{bands}) exceeds \
                  per-segment cap of {m} (see DecodeOptions::max_pixels_per_segment)"
-            )));
-        }
+        )));
     }
     opts.check_total_pixels(total, "cube")?;
     // `max_bytes` bounds the planned peak working set: the band frames

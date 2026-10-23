@@ -34,12 +34,12 @@
 
 use crate::context::ContextModel;
 use crate::context3d::{
-    category0_context, category1_context, category2_context, new_model,
-    sign_prediction_and_context, NeighbourSign,
+    NeighbourSign, category0_context, category1_context, category2_context, new_model,
+    sign_prediction_and_context,
 };
 use crate::entropy::{BitSink, BitSource, EntropyKind};
 use crate::error::Result;
-use crate::subband3d::{cube_schedule, enumerate_subbands, stage_counts, Subband3d};
+use crate::subband3d::{Subband3d, cube_schedule, enumerate_subbands, stage_counts};
 
 /// Fixed probability for uncoded (category 3) bits: probability of `1`
 /// = 1/2, no model adaptation.

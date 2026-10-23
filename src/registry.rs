@@ -27,17 +27,17 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    frame::VideoPlane, CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry,
-    ContainerRegistry, Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, RuntimeContext,
-    TimeBase, VideoFrame,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
+    Decoder, Encoder, Error, Frame, Packet, PixelFormat, Result, RuntimeContext, TimeBase,
+    VideoFrame, frame::VideoPlane,
 };
 
+use crate::CODEC_ID_STR;
 use crate::api::decode_all_with;
-use crate::encoder::{encode_image, EncodeOptions};
+use crate::encoder::{EncodeOptions, encode_image};
 use crate::error::IcerError;
 use crate::image::{IcerImage, IcerPixelFormat, Plane};
 use crate::options::DecodeOptions;
-use crate::CODEC_ID_STR;
 
 impl From<IcerError> for Error {
     fn from(e: IcerError) -> Self {
@@ -86,7 +86,7 @@ pub fn from_core_pixel_format(f: PixelFormat) -> crate::Result<(IcerPixelFormat,
             return Err(IcerError::unsupported(format!(
                 "icer: pixel format {other:?} is not an ICER layout \
                  (Gray8 / Gray10Le / Gray12Le / Gray16Le / Yuv444P / Gbrp8)"
-            )))
+            )));
         }
     })
 }
@@ -183,7 +183,7 @@ impl IcerImage {
                 n => {
                     return Err(IcerError::unsupported(format!(
                         "icer: {n}-plane frame without a pixel_format (1 = Gray8, 3 = Yuv444P)"
-                    )))
+                    )));
                 }
             },
         };

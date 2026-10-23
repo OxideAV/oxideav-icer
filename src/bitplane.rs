@@ -54,15 +54,15 @@
 
 use crate::arith::{ArithDecoder, ArithEncoder};
 use crate::context::{
-    magnitude_context, neighbour_counts, sign_context, sign_context_subband, sign_prediction_flip,
-    sign_prediction_flip_subband, significance_context, significance_context_subband, ContextModel,
-    MagnitudeContext, CONTEXT_COUNT, UNCODED_P1,
+    CONTEXT_COUNT, ContextModel, MagnitudeContext, UNCODED_P1, magnitude_context, neighbour_counts,
+    sign_context, sign_context_subband, sign_prediction_flip, sign_prediction_flip_subband,
+    significance_context, significance_context_subband,
 };
 use crate::entropy::{BitSink, BitSource};
 use crate::error::{IcerError, Result};
 use crate::priority::{
-    classify_position, packet_schedule, subband_lattice, subband_stride, SubbandBitPlane,
-    SubbandType,
+    SubbandBitPlane, SubbandType, classify_position, packet_schedule, subband_lattice,
+    subband_stride,
 };
 
 /// Height of each scan stripe in rows. IPN 42-155 §III.B uses 4 rows.
@@ -247,15 +247,15 @@ impl ScanFilter<'_> {
     /// is part of this scan.
     #[inline]
     fn visits(&self, i: usize, bp: usize) -> bool {
-        if let Some((map, seg)) = self.segment {
-            if map[i] != seg {
-                return false;
-            }
+        if let Some((map, seg)) = self.segment
+            && map[i] != seg
+        {
+            return false;
         }
-        if let Some(skip) = self.skip {
-            if (bp as u32) < skip[i] as u32 {
-                return false;
-            }
+        if let Some(skip) = self.skip
+            && (bp as u32) < skip[i] as u32
+        {
+            return false;
         }
         true
     }
@@ -284,28 +284,28 @@ impl ScanFilter<'_> {
     }
 
     fn validate(&self, n: usize) -> Result<()> {
-        if let Some((map, _)) = self.segment {
-            if map.len() != n {
-                return Err(IcerError::invalid(format!(
-                    "segment map length {} != coeff count {n}",
-                    map.len()
-                )));
-            }
+        if let Some((map, _)) = self.segment
+            && map.len() != n
+        {
+            return Err(IcerError::invalid(format!(
+                "segment map length {} != coeff count {n}",
+                map.len()
+            )));
         }
-        if let Some(skip) = self.skip {
-            if skip.len() != n {
-                return Err(IcerError::invalid(format!(
-                    "skip map length {} != coeff count {n}",
-                    skip.len()
-                )));
-            }
+        if let Some(skip) = self.skip
+            && skip.len() != n
+        {
+            return Err(IcerError::invalid(format!(
+                "skip map length {} != coeff count {n}",
+                skip.len()
+            )));
         }
-        if let Some((x0, x1, y0, y1)) = self.window {
-            if x0 > x1 || y0 > y1 {
-                return Err(IcerError::invalid(format!(
-                    "inverted scan window ({x0}, {x1}, {y0}, {y1})"
-                )));
-            }
+        if let Some((x0, x1, y0, y1)) = self.window
+            && (x0 > x1 || y0 > y1)
+        {
+            return Err(IcerError::invalid(format!(
+                "inverted scan window ({x0}, {x1}, {y0}, {y1})"
+            )));
         }
         Ok(())
     }
@@ -486,14 +486,14 @@ fn encode_bitplanes_inner(
     let n = input.coeffs.len();
     let q = input.q as usize;
     filter.validate(n)?;
-    if let Some(w) = weights {
-        if w.len() != n {
-            return Err(IcerError::invalid(format!(
-                "weight map length {} != coeff count {}",
-                w.len(),
-                n
-            )));
-        }
+    if let Some(w) = weights
+        && w.len() != n
+    {
+        return Err(IcerError::invalid(format!(
+            "weight map length {} != coeff count {}",
+            w.len(),
+            n
+        )));
     }
 
     let mut significant = vec![false; n];
@@ -1839,11 +1839,7 @@ pub fn decode_bitplanes(bytes: &[u8], width: usize, height: usize, q: u8) -> Res
         .zip(sign.iter())
         .map(|(&m, &s)| {
             let v = m as i32;
-            if s {
-                -v
-            } else {
-                v
-            }
+            if s { -v } else { v }
         })
         .collect();
     Ok(out)

@@ -9,8 +9,8 @@
 //! encoded.
 
 use oxideav_icer::{
-    decode, encode, info, ll_dimensions, parse_icer_lenient, partition, EncodeOptions, IcerImage,
-    IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, info, ll_dimensions,
+    parse_icer_lenient, partition,
 };
 
 /// Deterministic textured Gray8 fixture.

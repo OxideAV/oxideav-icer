@@ -8,8 +8,8 @@
 //! end-to-end behaviour and confirm the Gray8 wire form is unchanged.
 
 use oxideav_icer::{
-    decode, encode, info, is_container, parse_icer_lenient, EncodeOptions, IcerImage,
-    IcerPixelFormat,
+    EncodeOptions, IcerImage, IcerPixelFormat, decode, encode, info, is_container,
+    parse_icer_lenient,
 };
 
 /// Three planes with distinct, non-trivial content so the test would

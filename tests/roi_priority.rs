@@ -19,7 +19,7 @@
 //!   * Invalid priority vectors (wrong length, out-of-range entry,
 //!     duplicate rank) are rejected at encode time.
 
-use oxideav_icer::{decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, decode, encode, info};
 
 /// Build a 256x128 8-bit gray image whose top, middle, and bottom
 /// strips have distinctive content. The middle strip carries a

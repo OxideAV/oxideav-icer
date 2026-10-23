@@ -21,10 +21,10 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use oxideav_icer::{
-    decode, decode_all, decode_all_with, decode_with, encode, encode_icer3d, info, info_with,
-    parse_icer3d_lenient_with, parse_icer3d_with, parse_icer_lenient, parse_icer_lenient_with,
     CubeEncodeOptions, DecodeOptions, EncodeOptions, IcerCube, IcerError, IcerImage,
-    IcerPixelFormat, SegmentHeader, WaveletFilter,
+    IcerPixelFormat, SegmentHeader, WaveletFilter, decode, decode_all, decode_all_with,
+    decode_with, encode, encode_icer3d, info, info_with, parse_icer_lenient,
+    parse_icer_lenient_with, parse_icer3d_lenient_with, parse_icer3d_with,
 };
 
 // ---- counting allocator ----------------------------------------------------
@@ -43,30 +43,38 @@ fn track(size: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc(layout);
-        if !p.is_null() {
-            track(layout.size());
+        unsafe {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                track(layout.size());
+            }
+            p
         }
-        p
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = System.alloc_zeroed(layout);
-        if !p.is_null() {
-            track(layout.size());
+        unsafe {
+            let p = System.alloc_zeroed(layout);
+            if !p.is_null() {
+                track(layout.size());
+            }
+            p
         }
-        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        LIVE.fetch_sub(layout.size(), SeqCst);
+        unsafe {
+            System.dealloc(ptr, layout);
+            LIVE.fetch_sub(layout.size(), SeqCst);
+        }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = System.realloc(ptr, layout, new_size);
-        if !p.is_null() {
-            LIVE.fetch_sub(layout.size(), SeqCst);
-            track(new_size);
+        unsafe {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                LIVE.fetch_sub(layout.size(), SeqCst);
+                track(new_size);
+            }
+            p
         }
-        p
     }
 }
 

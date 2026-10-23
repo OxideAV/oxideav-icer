@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - **Bounded decoder memory.** `DecodeOptions::max_bytes` now bounds the
   decoder's *planned peak working set* — the decoded planes plus the
   largest per-segment coefficient buffer and coder state — computed

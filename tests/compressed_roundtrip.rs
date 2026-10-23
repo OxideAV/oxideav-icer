@@ -2,7 +2,7 @@
 //! decode pipeline plus the multi-segment demuxer.
 
 use oxideav_icer::{
-    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, info,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {

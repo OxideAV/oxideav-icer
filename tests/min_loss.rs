@@ -7,7 +7,7 @@
 //! allowing); if all but `k` planes of a subband are encoded its pixels
 //! are in effect quantised with step `2^k` (§VI.A / §III.A).
 
-use oxideav_icer::{decode, encode, info, walk_segment, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, decode, encode, info, walk_segment};
 
 fn textured(w: usize, h: usize, seed: u64) -> IcerImage {
     let mut img = IcerImage::zeros(w as u32, h as u32, IcerPixelFormat::Gray8);

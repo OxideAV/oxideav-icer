@@ -17,7 +17,7 @@
 //! misallocation these tests would fail against loses 9-16 dB at
 //! mid-range budgets on the fixtures below.
 
-use oxideav_icer::{decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat};
+use oxideav_icer::{EncodeOptions, IcerImage, IcerPixelFormat, decode, encode, info};
 
 /// Deterministic textured Gray8 fixture (same generator as the §V.B
 /// transform-segmentation suite).

@@ -20,11 +20,11 @@
 use std::io::{Read, Write};
 
 use crate::cube::{
-    decode_cube_frames, encode_icer3d, is_cube, parse_cube_header, CubeEncodeOptions, IcerCube,
+    CubeEncodeOptions, IcerCube, decode_cube_frames, encode_icer3d, is_cube, parse_cube_header,
 };
 
 use crate::decoder::{decode_image, walk_stream};
-use crate::encoder::{encode_image, EncodeOptions};
+use crate::encoder::{EncodeOptions, encode_image};
 use crate::error::{IcerError, Result};
 use crate::header::SegmentHeader;
 use crate::image::{
@@ -396,15 +396,19 @@ mod tests {
             assert_eq!((back.width, back.height), (6, 5));
             assert_eq!(back.as_bytes(), &rgb[..]);
             let rgba: Vec<u8> = rgb
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 3])
                 .collect();
             let bytes = encode_rgba8(6, 5, &rgba, &opts).unwrap();
             let back = decode_rgba8(&bytes).unwrap();
-            assert!(back.data.chunks_exact(4).all(|p| p[3] == 255));
+            assert!(back.data.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             assert_eq!(
                 back.into_raw()
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|p| [p[0], p[1], p[2]])
                     .collect::<Vec<_>>(),
                 rgb

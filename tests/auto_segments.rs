@@ -11,8 +11,8 @@
 //! loss-tolerant truncated-stream path.
 
 use oxideav_icer::{
-    decode, encode, parse_icer_lenient, recommend_segment_count, walk_segment, ChannelReliability,
-    EncodeOptions, IcerError, IcerImage, IcerPixelFormat,
+    ChannelReliability, EncodeOptions, IcerError, IcerImage, IcerPixelFormat, decode, encode,
+    parse_icer_lenient, recommend_segment_count, walk_segment,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {

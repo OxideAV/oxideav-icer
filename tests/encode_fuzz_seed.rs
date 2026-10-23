@@ -17,7 +17,7 @@
 //! (1x1, 1x128, 128x1).
 
 use oxideav_icer::{
-    decode, encode, parse_icer_lenient, EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter,
+    EncodeOptions, IcerImage, IcerPixelFormat, WaveletFilter, decode, encode, parse_icer_lenient,
 };
 
 const MAX_DIM: u32 = 128;
@@ -227,7 +227,7 @@ fn seeds() -> Vec<Vec<u8>> {
     // 1. Tiny 16x16 uncompressed, default options.
     out.push({
         let mut v = vec![15, 15, 0, 0, 0, 0, 0, 0];
-        v.extend(std::iter::repeat(0x55).take(256));
+        v.extend(std::iter::repeat_n(0x55, 256));
         v
     });
 

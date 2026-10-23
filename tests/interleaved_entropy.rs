@@ -3,7 +3,7 @@
 //! via `EncodeOptions::with_interleaved_entropy`).
 
 use oxideav_icer::{
-    decode, encode, info, EncodeOptions, IcerImage, IcerPixelFormat, SegmentHeader,
+    EncodeOptions, IcerImage, IcerPixelFormat, SegmentHeader, decode, encode, info,
 };
 
 fn ramp_image(w: u32, h: u32) -> IcerImage {

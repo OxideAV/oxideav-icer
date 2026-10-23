@@ -11,8 +11,8 @@
 //! that behaviour.
 
 use oxideav_icer::{
-    decode, encode, parse_icer_lenient, parse_icer_lenient_with, DecodeOptions, EncodeOptions,
-    IcerError, IcerImage, IcerPixelFormat, SegmentHeader, WaveletFilter,
+    DecodeOptions, EncodeOptions, IcerError, IcerImage, IcerPixelFormat, SegmentHeader,
+    WaveletFilter, decode, encode, parse_icer_lenient, parse_icer_lenient_with,
 };
 
 fn fill<F>(w: u32, h: u32, mut f: F) -> IcerImage

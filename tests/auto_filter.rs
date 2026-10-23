@@ -10,8 +10,8 @@
 //!      than the worst candidate it considered.
 
 use oxideav_icer::{
-    analyze, decode, encode, pick_filter_by_rate_distortion, recommend_filter, EncodeOptions,
-    IcerImage, IcerPixelFormat, ImageStats, WaveletFilter, DEFAULT_RD_CANDIDATES,
+    DEFAULT_RD_CANDIDATES, EncodeOptions, IcerImage, IcerPixelFormat, ImageStats, WaveletFilter,
+    analyze, decode, encode, pick_filter_by_rate_distortion, recommend_filter,
 };
 
 fn flat_image(w: u32, h: u32, value: u8) -> IcerImage {
