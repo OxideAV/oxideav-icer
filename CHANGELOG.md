@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-icer/compare/v0.0.6...v0.0.7) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+- bound the decoder's memory — plan the working set from the headers, shrink the footprint 2–10×
+
 ### Changed
 
 - edition 2024, MSRV 1.95
