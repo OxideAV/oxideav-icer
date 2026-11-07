@@ -116,6 +116,7 @@ const PACKET_OVERHEAD: usize = 5;
 /// (`samples[λ * width * height + y * width + x]`), each sample
 /// `< 2^bit_depth`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IcerCube {
     /// Spatial width in samples (1..=65535).
     pub width: u32,
@@ -131,6 +132,19 @@ pub struct IcerCube {
 }
 
 impl IcerCube {
+    /// A cube over caller-supplied band-major `samples`
+    /// (`width * height * bands` entries, each `< 2^bit_depth`). The
+    /// geometry is validated where the cube is consumed.
+    pub fn new(width: u32, height: u32, bands: u32, bit_depth: u8, samples: Vec<u16>) -> Self {
+        Self {
+            width,
+            height,
+            bands,
+            bit_depth,
+            samples,
+        }
+    }
+
     /// An all-zero cube of the given geometry.
     pub fn zeros(width: u32, height: u32, bands: u32, bit_depth: u8) -> Self {
         Self {
@@ -265,6 +279,7 @@ impl IcerCube {
 
 /// Encoder options for the ICER-3D cube pipeline.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CubeEncodeOptions {
     /// Reversible integer wavelet filter (IPN 42-155 §II.A Table 1;
     /// IPN 42-164 uses filter A for its examples and extends the
@@ -691,6 +706,7 @@ pub fn parse_icer3d_with_limits(bytes: &[u8], limits: &DecodeLimits) -> Result<I
 /// Report of a loss-tolerant ICER-3D decode (see
 /// [`parse_icer3d_lenient`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LenientCubeDecode {
     /// The reconstructed cube. Regions whose data never arrived
     /// reconstruct from whatever did: a segment whose packets were cut

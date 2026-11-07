@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on the `ChannelReliability` and `EntropyKind` enums and on the `ImageStats`, `DistortionReport`, `IcerCube`, `CubeEncodeOptions`, `LenientCubeDecode`, `LenientDecode` and `EncodedPacket` records. Build a cube with `IcerCube::new` / `IcerCube::zeros` and options with `Default` plus the `with_*` builders. `WaveletFilter`, `BitPlanePass`, `SubbandType` and the segment / packet header and partition records stay exhaustive: the ICER format fixes them.
+- `#[doc(hidden)]` on the internal `arith`, `bitplane3d`, `context3d`, `subband3d`, `wavelet` and `container` modules.
+
+### Added
+
+- `IcerCube::new(width, height, bands, bit_depth, samples)`.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-icer/compare/v0.0.6...v0.0.7) - 2026-10-23
 
 ### Other

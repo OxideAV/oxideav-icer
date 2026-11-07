@@ -63,6 +63,7 @@ fn peak_value(image: &IcerImage) -> f64 {
 /// One-pass image statistics. Captures the metrics the filter-selection
 /// heuristic [`recommend_filter`] consumes.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct ImageStats {
     /// Mean pixel value (0..=255) of the first plane.
     pub mean: f32,
@@ -221,6 +222,7 @@ pub fn recommend_filter(stats: &ImageStats) -> WaveletFilter {
 /// to use a larger number of segments for larger images, larger
 /// numbers of compressed bytes, and less reliable channels."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChannelReliability {
     /// Packet losses are rare. §V.C: "If packet losses are rare or
     /// when compressing a small image, one might reasonably set the
@@ -469,6 +471,7 @@ pub fn psnr_db(original: &IcerImage, decoded: &IcerImage) -> f32 {
 /// * `psnr_db` -- peak signal-to-noise ratio in dB, identical to
 ///   [`psnr_db`] (`f32::INFINITY` when the images are bit-identical).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct DistortionReport {
     /// Mean squared error over the first plane.
     pub mse: f64,

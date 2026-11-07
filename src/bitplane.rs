@@ -358,6 +358,7 @@ impl BitPlaneInput<'_> {
 /// One encoded packet body: the arithmetic-coded bytes for a single
 /// pass of a single bit-plane.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedPacket {
     /// Bit-plane index (0 = MSB, Q-1 = LSB).
     pub bit_plane: u8,

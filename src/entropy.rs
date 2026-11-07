@@ -75,6 +75,7 @@ impl BitSource for IxecDecoder<'_> {
 /// is the crate's established wire form; the interleaved coder is the
 /// spec-exact §IV path being brought up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EntropyKind {
     /// Witten-Neal-Cleary binary arithmetic coder.
     Arithmetic,

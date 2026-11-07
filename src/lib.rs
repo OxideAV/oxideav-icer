@@ -125,13 +125,17 @@
 
 pub mod analyze;
 pub mod api;
+#[doc(hidden)]
 pub mod arith;
 pub mod bitplane;
+#[doc(hidden)]
 pub mod bitplane3d;
 pub(crate) mod budget;
 #[cfg(feature = "registry")]
+#[doc(hidden)]
 pub mod container;
 pub mod context;
+#[doc(hidden)]
 pub mod context3d;
 pub mod cube;
 pub mod decoder;
@@ -147,7 +151,9 @@ pub mod plane_container;
 pub mod priority;
 #[cfg(feature = "registry")]
 pub mod registry;
+#[doc(hidden)]
 pub mod subband3d;
+#[doc(hidden)]
 pub mod wavelet;
 pub mod wavelet3d;
 pub mod wavelet_int;

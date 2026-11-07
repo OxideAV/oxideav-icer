@@ -871,6 +871,7 @@ fn decode_compressed_segment_into(
 /// `IcerError::invalid("non-contiguous segment indices: ...")`; the
 /// lenient API accepts them and surfaces the gap on the report instead.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LenientDecode {
     /// Decoded image. Missing strips are filled with 128 (level-shifted
     /// zero, matching the round-6 ROI-priority placeholder semantic
