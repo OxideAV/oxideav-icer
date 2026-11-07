@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-icer/compare/v0.0.7...v0.0.8) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive result/option records + growable enums, hide kernels
+
 ### Changed
 
 - `#[non_exhaustive]` on the `ChannelReliability` and `EntropyKind` enums and on the `ImageStats`, `DistortionReport`, `IcerCube`, `CubeEncodeOptions`, `LenientCubeDecode`, `LenientDecode` and `EncodedPacket` records. Build a cube with `IcerCube::new` / `IcerCube::zeros` and options with `Default` plus the `with_*` builders. `WaveletFilter`, `BitPlanePass`, `SubbandType` and the segment / packet header and partition records stay exhaustive: the ICER format fixes them.
